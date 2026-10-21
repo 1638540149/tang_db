@@ -113,22 +113,78 @@ tang_db/
 
 借了外力,这个项目就没有存在意义了。
 
+## 快速开始
+
+### 环境要求
+
+- Go 1.27+(Windows: 装在 `C:\Program Files\Go`)
+- Java 17 + Maven 3.9+
+- Windows 上执行构建命令请在 git-bash 中;**Maven 必须用 `mvn.cmd`**(POSIX 版 `mvn` 在本机不可用)
+
+### 启动(开两个终端)
+
+终端 A —— 起数据层:
+
+```bash
+./scripts/start-be.sh --data-dir=./data/BE --port=9100 --memtable-size=64MB
+# === Building BE ===
+# === Starting BE ===
+# 2026-10-21 ... INFO 正在启动 tang_db BE version=P1-0.1.0 data_dir=./data/BE port=9100
+# 2026-10-21 ... INFO 恢复完成 segments_loaded=0 wal_replayed=0
+# 2026-10-21 ... INFO BE 已就绪 listen=127.0.0.1:9100
+```
+
+终端 B —— 起客户端:
+
+```bash
+./scripts/start-fe.sh --be-port=9100
+# tangdb> put name wangyu
+# OK
+# tangdb> get name
+# wangyu
+# tangdb> get no-such-key
+# 错误:键不存在
+```
+
+### 最强的那个动作:强杀后重启,数据还在
+
+```bash
+taskkill /F /IM be.exe      # 强杀,不给它正常退出的机会
+./scripts/start-be.sh --data-dir=./data/BE --port=9100
+# 恢复完成 segments_loaded=2 wal_replayed=37
+# 再 get,数据一条没少
+```
+
+### 崩溃测试(一键)
+
+```bash
+bash scripts/crash-test.sh                # 默认写入 1000 条随机 KV
+COUNT=5000 bash scripts/crash-test.sh     # 自定义条数
+```
+
+流程:写入 N 条 → 打印数据目录状态 → 强杀 BE → 重启 → 逐条校验 → 输出报告到 `tmp/crash-test/report.txt`。
+
+### 重新生成接口桩代码
+
+```bash
+bash scripts/gen-proto.sh
+```
+
 ## 状态
 
-**开发中** —— P1(基座)阶段。
+**P1(基座)已完成并通过独立验收。**
 
 已完成:
 
 - 仓库初始化、README、`.gitignore`
 - 项目结构骨架:`proto/` `be/` `fe/` `tools/` `scripts/`
-- 接口契约 `proto/tangdb.proto`(P1 范围:`Ping` / `Put` / `Get`)
-- `be/go.mod` 与 `fe/pom.xml` 的最小可用构建文件
+- 接口契约 `proto/tangdb.proto`(`Ping` / `Put` / `Get`)
+- **BE 最小可用 LSM**:WAL(CRC32C + fsync)、跳表 memtable、列式 segment、MANIFEST 原子版本管理
+- **崩溃恢复**:启动时载入 segment + 重放 WAL,尾部坏记录就地截断
+- **FE**:gRPC 客户端封装 + 命令行客户端
+- **崩溃测试**:1000 条随机 KV,强杀两个进程后重启逐条校验,**丢失 0 条**
 
-下一步(P1 实现):
-
-- FE → BE 跨语言链路打通(gRPC)
-- BE 最小可用 LSM:WAL + memtable + segment 刷盘 + MANIFEST
-- 崩溃恢复:`kill -9` 重启后已提交数据不丢
+下一步:**P2 · 表与 SQL** —— 引入元数据(存进 BE 自身系统表)、DDL/DML/条件查询、BE 注册与心跳上报。
 
 ---
 

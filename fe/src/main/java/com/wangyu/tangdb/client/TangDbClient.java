@@ -1,0 +1,247 @@
+package com.wangyu.tangdb.client;
+
+import com.google.protobuf.ByteString;
+import com.wangyu.tangdb.proto.GetRequest;
+import com.wangyu.tangdb.proto.GetResponse;
+import com.wangyu.tangdb.proto.PingRequest;
+import com.wangyu.tangdb.proto.PingResponse;
+import com.wangyu.tangdb.proto.PutRequest;
+import com.wangyu.tangdb.proto.PutResponse;
+import com.wangyu.tangdb.proto.StatusCode;
+import com.wangyu.tangdb.proto.TangDbGrpc;
+
+import io.grpc.ManagedChannel;
+import io.grpc.ManagedChannelBuilder;
+import io.grpc.Status;
+import io.grpc.StatusRuntimeException;
+
+import java.util.Optional;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * tang_db BE 的 gRPC 客户端封装。
+ *
+ * <p>只通过 {@code proto/tangdb.proto} 定义的接口与 BE 通信，不读写 BE 的任何数据文件。
+ * 所有失败都转换成带中文提示的 {@link ClientException}，调用方无需处理 gRPC 异常类型。</p>
+ */
+public class TangDbClient implements AutoCloseable {
+
+    /** 默认 BE 地址。 */
+    public static final String DEFAULT_HOST = "127.0.0.1";
+
+    /** 默认 gRPC 端口。 */
+    public static final int DEFAULT_PORT = 9100;
+
+    /** 单次 RPC 的截止时间，保证 BE 无响应时客户端不会无限挂起。 */
+    private static final long RPC_DEADLINE_SECONDS = 5L;
+
+    /** 关闭 channel 时等待在途 RPC 结束的时间。 */
+    private static final long SHUTDOWN_TIMEOUT_SECONDS = 5L;
+
+    private final String host;
+    private final int port;
+    private final ManagedChannel channel;
+    private final TangDbGrpc.TangDbBlockingStub stub;
+
+    /**
+     * 使用默认地址 {@code 127.0.0.1:9100} 创建客户端。
+     */
+    public TangDbClient() {
+        this(DEFAULT_HOST, DEFAULT_PORT);
+    }
+
+    /**
+     * 创建客户端并打开到 {@code host:port} 的 channel。
+     *
+     * @param host BE 主机名或 IP
+     * @param port BE gRPC 端口，取值 1..65535
+     */
+    public TangDbClient(String host, int port) {
+        this.host = normalizeHost(host);
+        this.port = validatePort(port);
+        this.channel = ManagedChannelBuilder.forAddress(this.host, this.port)
+                .usePlaintext()
+                .build();
+        this.stub = TangDbGrpc.newBlockingStub(channel);
+    }
+
+    /**
+     * 写入一个键值。
+     *
+     * @return 固定返回 {@code "OK"}（BE 仅在 WAL 已 fsync 后才返回 OK）
+     * @throws ClientException BE 返回非 OK 状态，或连接失败
+     */
+    public String put(String key, String value) throws ClientException {
+        if (key == null) {
+            throw new ClientException("key 不能为 null", "INVALID_ARGUMENT");
+        }
+        if (value == null) {
+            throw new ClientException("value 不能为 null", "INVALID_ARGUMENT");
+        }
+
+        PutResponse response;
+        try {
+            response = stubWithDeadline().put(PutRequest.newBuilder()
+                    .setKey(ByteString.copyFromUtf8(key))
+                    .setValue(ByteString.copyFromUtf8(value))
+                    .build());
+        } catch (StatusRuntimeException e) {
+            throw translate(e, host, port);
+        }
+
+        StatusCode status = response.getStatus();
+        if (status == StatusCode.OK) {
+            return "OK";
+        }
+        throw fromResponseStatus(status, response.getMessage());
+    }
+
+    /**
+     * 读取一个键值。
+     *
+     * @return 存在时返回对应 value（空字符串是合法值）
+     * @throws ClientException key 不存在时抛出 {@code errorCode=NOT_FOUND}、message=“键不存在”；
+     *                         其他状态或连接失败同样抛出本异常
+     */
+    public Optional<String> get(String key) throws ClientException {
+        if (key == null) {
+            throw new ClientException("key 不能为 null", "INVALID_ARGUMENT");
+        }
+
+        GetResponse response;
+        try {
+            response = stubWithDeadline().get(GetRequest.newBuilder()
+                    .setKey(ByteString.copyFromUtf8(key))
+                    .build());
+        } catch (StatusRuntimeException e) {
+            throw translate(e, host, port);
+        }
+
+        StatusCode status = response.getStatus();
+        if (status == StatusCode.OK) {
+            return Optional.of(response.getValue().toStringUtf8());
+        }
+        if (status == StatusCode.NOT_FOUND) {
+            throw new ClientException("键不存在", "NOT_FOUND");
+        }
+        throw fromResponseStatus(status, response.getMessage());
+    }
+
+    /**
+     * 探活，返回 BE 版本号。
+     *
+     * @throws ClientException 连接失败或 BE 返回错误
+     */
+    public String ping() throws ClientException {
+        try {
+            PingResponse response = stubWithDeadline().ping(PingRequest.getDefaultInstance());
+            return response.getVersion();
+        } catch (StatusRuntimeException e) {
+            throw translate(e, host, port);
+        }
+    }
+
+    /**
+     * @return 当前连接目标，形如 {@code 127.0.0.1:9100}
+     */
+    public String address() {
+        return host + ":" + port;
+    }
+
+    @Override
+    public void close() {
+        if (channel.isShutdown()) {
+            return;
+        }
+        channel.shutdown();
+        try {
+            if (!channel.awaitTermination(SHUTDOWN_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                channel.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            channel.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /**
+     * 每次 RPC 都重新计算截止时间，避免固定 deadline 在客户端长时间运行后失效。
+     */
+    private TangDbGrpc.TangDbBlockingStub stubWithDeadline() {
+        return stub.withDeadlineAfter(RPC_DEADLINE_SECONDS, TimeUnit.SECONDS);
+    }
+
+    /**
+     * 把 BE 返回的状态码转换成中文提示。
+     */
+    static String describeStatus(StatusCode status) {
+        if (status == null) {
+            return "未知状态";
+        }
+        switch (status) {
+            case OK:
+                return "成功";
+            case NOT_FOUND:
+                return "键不存在";
+            case INVALID_ARGUMENT:
+                return "参数无效";
+            case INTERNAL:
+                return "BE 内部错误";
+            case STATUS_UNSPECIFIED:
+                return "BE 未返回状态";
+            case UNRECOGNIZED:
+                return "无法识别的状态码";
+            default:
+                return "未知状态";
+        }
+    }
+
+    /**
+     * 把 gRPC 层的 {@link StatusRuntimeException} 转成面向用户的中文异常。
+     * 不把原始堆栈暴露给 CLI，只保留状态码与必要的描述。
+     */
+    static ClientException translate(StatusRuntimeException e, String host, int port) {
+        Status status = e.getStatus();
+        String address = host + ":" + port;
+        String detail = status.getDescription();
+
+        switch (status.getCode()) {
+            case UNAVAILABLE:
+                return new ClientException("无法连接 BE " + address, "UNAVAILABLE", e);
+            case DEADLINE_EXCEEDED:
+                return new ClientException("连接 BE " + address + " 超时", "DEADLINE_EXCEEDED", e);
+            case CANCELLED:
+                return new ClientException("请求已被取消", "CANCELLED", e);
+            case PERMISSION_DENIED:
+                return new ClientException("没有访问 BE " + address + " 的权限", "PERMISSION_DENIED", e);
+            default:
+                String message = "与 BE " + address + " 通信失败（" + status.getCode() + "）";
+                if (detail != null && !detail.isBlank()) {
+                    message += "：" + detail;
+                }
+                return new ClientException(message, status.getCode().name(), e);
+        }
+    }
+
+    private ClientException fromResponseStatus(StatusCode status, String detail) {
+        String message = describeStatus(status);
+        if (detail != null && !detail.isBlank()) {
+            message += "：" + detail;
+        }
+        return new ClientException(message, status == null ? "UNKNOWN" : status.name());
+    }
+
+    private static String normalizeHost(String host) {
+        if (host == null || host.isBlank()) {
+            return DEFAULT_HOST;
+        }
+        return host.trim();
+    }
+
+    private static int validatePort(int port) {
+        if (port < 1 || port > 65535) {
+            throw new IllegalArgumentException("端口无效：" + port + "（应为 1-65535）");
+        }
+        return port;
+    }
+}
