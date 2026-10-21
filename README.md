@@ -68,6 +68,43 @@ flowchart LR
 | 向量索引 | HNSW(分段式) |
 | 客户端接入 | 自实现 MySQL 协议 |
 
+## 项目结构
+
+```
+tang_db/
+├── proto/tangdb.proto          FE 与 BE 之间唯一的接口契约
+├── be/                         Go —— 数据层
+│   ├── go.mod
+│   ├── cmd/be/                 服务入口
+│   └── internal/
+│       ├── wal/                预写日志、批写、校验
+│       ├── memtable/           跳表、版本链
+│       ├── segment/            列式文件读写、编码压缩、zone map
+│       ├── compaction/         分层合并、GC 水位
+│       ├── manifest/           版本管理、原子切换
+│       ├── txn/                事务、MVCC、冲突检测
+│       ├── index/              主键 / 二级 / 唯一 / 分段 HNSW
+│       ├── exec/               向量化算子
+│       ├── ai/                 推理客户端、批量调度、缓存
+│       └── server/             gRPC 服务实现
+├── fe/                         Java —— 客户端层
+│   ├── pom.xml
+│   └── src/main/java/com/wangyu/tangdb/
+│       ├── protocol/           MySQL 协议
+│       ├── parser/             词法、语法、AST
+│       ├── catalog/            元数据
+│       ├── planner/            逻辑计划、优化器
+│       ├── execute/            计划切分与调度
+│       ├── txn/                事务协调、快照
+│       └── client/             gRPC 客户端封装
+├── tools/                      导入与基准工具
+│   ├── importer/               CSV 批量导入
+│   ├── bench-tpcc/             OLTP 基准
+│   ├── bench-tph/              OLAP 基准
+│   └── recall-check/           向量召回率校验
+└── scripts/                    启动、一键验收、崩溃测试
+```
+
 ## 设计原则
 
 **不借外力。** 存储引擎、执行引擎、优化器、向量索引、协议层,全部自己实现。以下这些以及它们的任何绑定,一律不引入:
@@ -78,7 +115,20 @@ flowchart LR
 
 ## 状态
 
-**开发中** —— P1(基座)阶段。代码尚未提交,README 先落地。
+**开发中** —— P1(基座)阶段。
+
+已完成:
+
+- 仓库初始化、README、`.gitignore`
+- 项目结构骨架:`proto/` `be/` `fe/` `tools/` `scripts/`
+- 接口契约 `proto/tangdb.proto`(P1 范围:`Ping` / `Put` / `Get`)
+- `be/go.mod` 与 `fe/pom.xml` 的最小可用构建文件
+
+下一步(P1 实现):
+
+- FE → BE 跨语言链路打通(gRPC)
+- BE 最小可用 LSM:WAL + memtable + segment 刷盘 + MANIFEST
+- 崩溃恢复:`kill -9` 重启后已提交数据不丢
 
 ---
 

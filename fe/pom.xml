@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>com.wangyu.tangdb</groupId>
+  <artifactId>tangdb-fe</artifactId>
+  <version>0.1.0-SNAPSHOT</version>
+  <packaging>jar</packaging>
+
+  <name>tang_db FE</name>
+  <description>tang_db 客户端层:SQL 解析、优化器、MySQL 协议、元数据</description>
+
+  <properties>
+    <maven.compiler.source>17</maven.compiler.source>
+    <maven.compiler.target>17</maven.compiler.target>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+  </properties>
+
+  <dependencies>
+    <!--
+      gRPC / protobuf 依赖在 P1 规约确认后加入:
+        io.grpc:grpc-netty-shaded
+        io.grpc:grpc-protobuf
+        io.grpc:grpc-stub
+        com.google.protobuf:protobuf-java
+      仅允许这些(FE 侧无存储相关依赖)。
+    -->
+  </dependencies>
+
+  <build>
+    <finalName>tangdb-fe</finalName>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.13.0</version>
+      </plugin>
+    </plugins>
+  </build>
+</project>
