@@ -19,6 +19,8 @@ class FeConfigTest {
         FeConfig cfg = FeConfig.defaults();
         assertEquals(TangDbClient.DEFAULT_HOST, cfg.beHost());
         assertEquals(TangDbClient.DEFAULT_PORT, cfg.bePort());
+        assertEquals(9091, cfg.heartbeatListenPort());
+        assertEquals(3, cfg.beOfflineCycles());
     }
 
     @Test
@@ -41,10 +43,14 @@ class FeConfigTest {
                 # tang_db FE 配置
                 be_host = 10.0.0.8
                 be_port = 9200
+                heartbeat_listen_port = 9191
+                be_offline_cycles = 5
                 """);
         FeConfig cfg = FeConfig.load(file.toString());
         assertEquals("10.0.0.8", cfg.beHost());
         assertEquals(9200, cfg.bePort());
+        assertEquals(9191, cfg.heartbeatListenPort());
+        assertEquals(5, cfg.beOfflineCycles());
     }
 
     @Test
@@ -63,6 +69,10 @@ class FeConfigTest {
         assertMessage("be_port = 70000", "be_port 无效");
         assertMessage("be_port = abc", "be_port 无效");
         assertMessage("be_host =   ", "的取值为空");
+        assertMessage("heartbeat_listen_port = 70000", "heartbeat_listen_port 无效");
+        assertMessage("heartbeat_listen_port = abc", "heartbeat_listen_port 无效");
+        assertMessage("be_offline_cycles = 0", "be_offline_cycles 无效");
+        assertMessage("be_offline_cycles = x", "be_offline_cycles 无效");
     }
 
     /** 命令行参数覆盖配置文件。 */

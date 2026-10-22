@@ -22,28 +22,51 @@ public final class FeConfig {
     /** 未显式指定 {@code --config} 时查找的配置文件路径。 */
     public static final String DEFAULT_PATH = "./config/fe.conf";
 
+    /** FE 心跳服务默认监听端口(P2 规约 K24)。 */
+    public static final int DEFAULT_HEARTBEAT_LISTEN_PORT = 9091;
+
+    /** 默认的判死周期数:连续 3 个心跳周期未收到即判不可用。 */
+    public static final int DEFAULT_BE_OFFLINE_CYCLES = 3;
+
     private final String beHost;
     private final int bePort;
+    private final int heartbeatListenPort;
+    private final int beOfflineCycles;
 
-    private FeConfig(String beHost, int bePort) {
+    private FeConfig(String beHost, int bePort, int heartbeatListenPort, int beOfflineCycles) {
         this.beHost = beHost;
         this.bePort = bePort;
+        this.heartbeatListenPort = heartbeatListenPort;
+        this.beOfflineCycles = beOfflineCycles;
     }
 
     /** 内置默认配置。 */
     public static FeConfig defaults() {
-        return new FeConfig(TangDbClient.DEFAULT_HOST, TangDbClient.DEFAULT_PORT);
+        return new FeConfig(TangDbClient.DEFAULT_HOST, TangDbClient.DEFAULT_PORT,
+                DEFAULT_HEARTBEAT_LISTEN_PORT, DEFAULT_BE_OFFLINE_CYCLES);
     }
 
     /** 直接用给定取值构造配置(供程序化使用与测试)。 */
     public static FeConfig of(String beHost, int bePort) {
+        return of(beHost, bePort, DEFAULT_HEARTBEAT_LISTEN_PORT, DEFAULT_BE_OFFLINE_CYCLES);
+    }
+
+    /** 直接用给定取值构造配置(含 P2 新增项)。 */
+    public static FeConfig of(String beHost, int bePort, int heartbeatListenPort, int beOfflineCycles) {
         if (beHost == null || beHost.isBlank()) {
             throw new IllegalArgumentException("be_host 不能为空");
         }
         if (bePort < 1 || bePort > 65535) {
             throw new IllegalArgumentException("be_port 无效: " + bePort + "（应为 1-65535）");
         }
-        return new FeConfig(beHost.trim(), bePort);
+        if (heartbeatListenPort < 1 || heartbeatListenPort > 65535) {
+            throw new IllegalArgumentException(
+                    "heartbeat_listen_port 无效: " + heartbeatListenPort + "（应为 1-65535）");
+        }
+        if (beOfflineCycles < 1) {
+            throw new IllegalArgumentException("be_offline_cycles 无效: " + beOfflineCycles + "（必须 >= 1）");
+        }
+        return new FeConfig(beHost.trim(), bePort, heartbeatListenPort, beOfflineCycles);
     }
 
     public String beHost() {
@@ -52,6 +75,16 @@ public final class FeConfig {
 
     public int bePort() {
         return bePort;
+    }
+
+    /** FE 心跳服务(gRPC)监听端口。 */
+    public int heartbeatListenPort() {
+        return heartbeatListenPort;
+    }
+
+    /** 超过多少个心跳周期未收到心跳即判 BE 不可用。 */
+    public int beOfflineCycles() {
+        return beOfflineCycles;
     }
 
     /**
@@ -84,6 +117,8 @@ public final class FeConfig {
 
         String host = TangDbClient.DEFAULT_HOST;
         int port = TangDbClient.DEFAULT_PORT;
+        int heartbeatPort = DEFAULT_HEARTBEAT_LISTEN_PORT;
+        int offlineCycles = DEFAULT_BE_OFFLINE_CYCLES;
 
         for (int i = 0; i < lines.size(); i++) {
             String line = lines.get(i);
@@ -111,13 +146,16 @@ public final class FeConfig {
 
             switch (key) {
                 case "be_host" -> host = requireNonBlank(value, path, i + 1);
-                case "be_port" -> port = parsePort(value, path, i + 1);
+                case "be_port" -> port = parseInt(key, value, path, i + 1, 1, 65535);
+                case "heartbeat_listen_port" ->
+                        heartbeatPort = parseInt(key, value, path, i + 1, 1, 65535);
+                case "be_offline_cycles" -> offlineCycles = parseInt(key, value, path, i + 1, 1, 1000);
                 default -> throw new IllegalArgumentException(
                         path + " 第 " + (i + 1) + " 行未知配置项: " + key);
             }
         }
 
-        return new FeConfig(host, port);
+        return new FeConfig(host, port, heartbeatPort, offlineCycles);
     }
 
     private static String requireNonBlank(String value, String path, int lineNo) {
@@ -127,16 +165,17 @@ public final class FeConfig {
         return value.trim();
     }
 
-    private static int parsePort(String raw, String path, int lineNo) {
+    private static int parseInt(String key, String raw, String path, int lineNo, int min, int max) {
         try {
-            int port = Integer.parseInt(raw.trim());
-            if (port < 1 || port > 65535) {
+            int value = Integer.parseInt(raw.trim());
+            if (value < min || value > max) {
                 throw new NumberFormatException("越界");
             }
-            return port;
+            return value;
         } catch (NumberFormatException e) {
             throw new IllegalArgumentException(
-                    path + " 第 " + lineNo + " 行 be_port 无效: " + raw + "（应为 1-65535）");
+                    path + " 第 " + lineNo + " 行 " + key + " 无效: " + raw
+                            + "（应为 " + min + "-" + max + "）");
         }
     }
 }

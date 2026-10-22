@@ -26,18 +26,18 @@ import (
 )
 
 const (
-	chunkRows   = 4096
-	magic       = "TANSEG01"
-	footerSize  = 8 + 4 + 8*8 + 8 + 4 // magic + version + 8 offsets/lens + totalRows + checksum
-	version     = 1
+	chunkRows  = 4096
+	magic      = "TANSEG01"
+	footerSize = 8 + 4 + 8*8 + 8 + 4 // magic + version + 8 offsets/lens + totalRows + checksum
+	version    = 1
 )
 
 var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 
 // Builder 将有序 KV 序列写入一个 segment 文件。
 type Builder struct {
-	path   string
-	rows   []kv
+	path string
+	rows []kv
 }
 
 type kv struct {
@@ -233,11 +233,11 @@ func writeFooter(f *os.File, footer *Footer) error {
 
 // Reader 打开一个 segment 文件进行读取。
 type Reader struct {
-	path      string
-	file      *os.File
-	footer    *Footer
-	index     []indexEntry
-	zoneMap   []zoneEntry
+	path    string
+	file    *os.File
+	footer  *Footer
+	index   []indexEntry
+	zoneMap []zoneEntry
 }
 
 type indexEntry struct {

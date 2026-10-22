@@ -23,19 +23,33 @@ const DefaultPath = "./config/be.conf"
 // DefaultMemTableSize 是 memtable 刷盘阈值的默认值(64MB)。
 const DefaultMemTableSize int64 = 64 * 1024 * 1024
 
+// 心跳相关默认值(见 P2 规约 FR-160)。
+const (
+	DefaultFeHost                   = "127.0.0.1"
+	DefaultFePort                   = 9091
+	DefaultHeartbeatIntervalSeconds = 3
+)
+
 // Config 是 BE 的启动配置。
 type Config struct {
 	DataDir      string // 数据目录:LSM 数据、WAL、segment、MANIFEST 都在这里
 	Port         int    // gRPC 监听端口
 	MemTableSize int64  // memtable 刷盘阈值(字节)
+
+	FeHost                   string // FE 心跳服务地址
+	FePort                   int    // FE 心跳服务端口
+	HeartbeatIntervalSeconds int    // 心跳间隔(秒)
 }
 
 // Default 返回内置默认配置。
 func Default() Config {
 	return Config{
-		DataDir:      "./data/BE",
-		Port:         9100,
-		MemTableSize: DefaultMemTableSize,
+		DataDir:                  "./data/BE",
+		Port:                     9100,
+		MemTableSize:             DefaultMemTableSize,
+		FeHost:                   DefaultFeHost,
+		FePort:                   DefaultFePort,
+		HeartbeatIntervalSeconds: DefaultHeartbeatIntervalSeconds,
 	}
 }
 
@@ -96,6 +110,20 @@ func Parse(r io.Reader) (Config, error) {
 				return Config{}, fmt.Errorf("第 %d 行 memtable_size 无效:%v", lineNo, err)
 			}
 			cfg.MemTableSize = size
+		case "fe_host":
+			cfg.FeHost = value
+		case "fe_port":
+			port, err := strconv.Atoi(value)
+			if err != nil || port < 1 || port > 65535 {
+				return Config{}, fmt.Errorf("第 %d 行 fe_port 无效:%q(应为 1-65535)", lineNo, value)
+			}
+			cfg.FePort = port
+		case "heartbeat_interval_seconds":
+			sec, err := strconv.Atoi(value)
+			if err != nil || sec < 1 || sec > 3600 {
+				return Config{}, fmt.Errorf("第 %d 行 heartbeat_interval_seconds 无效:%q(应为 1-3600)", lineNo, value)
+			}
+			cfg.HeartbeatIntervalSeconds = sec
 		default:
 			return Config{}, fmt.Errorf("第 %d 行未知配置项:%q", lineNo, key)
 		}

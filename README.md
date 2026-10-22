@@ -72,31 +72,38 @@ flowchart LR
 
 ```
 tang_db/
+├── config/                     两个进程的配置(一行一项 key = value)
+│   ├── be.conf                 数据层:data_dir / port / memtable_size / fe_host / fe_port / heartbeat_interval_seconds
+│   └── fe.conf                 客户端层:be_host / be_port / heartbeat_listen_port / be_offline_cycles
 ├── proto/tangdb.proto          FE 与 BE 之间唯一的接口契约
 ├── be/                         Go —— 数据层
 │   ├── go.mod
 │   ├── cmd/be/                 服务入口
 │   └── internal/
+│       ├── config/             配置文件解析(标准库手写,零第三方依赖)
 │       ├── wal/                预写日志、批写、校验
 │       ├── memtable/           跳表、版本链
 │       ├── segment/            列式文件读写、编码压缩、zone map
 │       ├── compaction/         分层合并、GC 水位
 │       ├── manifest/           版本管理、原子切换
+│       ├── store/              引擎主干:Put/Get/Scan、刷盘调度、WAL 回收
 │       ├── txn/                事务、MVCC、冲突检测
 │       ├── index/              主键 / 二级 / 唯一 / 分段 HNSW
-│       ├── exec/               向量化算子
+│       ├── exec/               向量化算子、范围扫描迭代器
 │       ├── ai/                 推理客户端、批量调度、缓存
-│       └── server/             gRPC 服务实现
+│       └── server/             gRPC 服务实现、心跳上报
 ├── fe/                         Java —— 客户端层
 │   ├── pom.xml
 │   └── src/main/java/com/wangyu/tangdb/
 │       ├── protocol/           MySQL 协议
 │       ├── parser/             词法、语法、AST
-│       ├── catalog/            元数据
+│       ├── catalog/            元数据(存进 BE 的系统表)
 │       ├── planner/            逻辑计划、优化器
 │       ├── execute/            计划切分与调度
+│       ├── storage/            key 保序编码、行值/墓碑编码
+│       ├── server/             FE 侧服务:BE 注册与心跳接收
 │       ├── txn/                事务协调、快照
-│       └── client/             gRPC 客户端封装
+│       └── client/             gRPC 客户端封装、CLI、配置文件加载
 ├── tools/                      导入与基准工具
 │   ├── importer/               CSV 批量导入
 │   ├── bench-tpcc/             OLTP 基准
@@ -166,6 +173,78 @@ config/
 # 错误:键不存在
 ```
 
+### 用 SQL:建表、写入、查询、改、删(P2)
+
+同一个 CLI,输入 SQL 以 `;` 结束(可跨多行)。下面这段取自实际运行的输出(为便于阅读,合并了几次会话):
+
+```sql
+tangdb> CREATE TABLE users (id BIGINT PRIMARY KEY, name VARCHAR(32), city VARCHAR(32), age INT);
+OK, 表 users 已创建(表 ID 16)
+
+tangdb> INSERT INTO users (id, name, city, age) VALUES (1, 'wangyu', '北京', 26);
+OK, 1 row affected
+
+tangdb> INSERT INTO users (id, name, city, age) VALUES (2, 'lisi', '北京', 20), (3, 'zhangsan', '上海', 30);
+OK, 2 rows affected
+
+tangdb> SELECT name, city FROM users WHERE city = '北京' AND age > 25;
++--------+------+
+| name   | city |
++--------+------+
+| wangyu | 北京 |
++--------+------+
+(1 row)
+
+tangdb> UPDATE users SET city = '上海' WHERE id = 1;
+OK, 1 row affected
+
+tangdb> DELETE FROM users WHERE id = 2;
+OK, 1 row affected
+
+tangdb> SELECT * FROM users WHERE id = 2;
++----+------+------+-----+
+| id | name | city | age |
++----+------+------+-----+
++----+------+------+-----+
+(0 rows)
+
+tangdb> SHOW TABLES;
++------------+----------+---------------------+
+| table_name | table_id | created_at          |
++------------+----------+---------------------+
+| users      | 16       | 2026-10-22T15:44:39 |
++------------+----------+---------------------+
+(1 row)
+
+tangdb> DESC users;
++--------+-------------+-------------+----------+
+| column | type        | primary_key | nullable |
++--------+-------------+-------------+----------+
+| id     | BIGINT      | YES         | NO       |
+| name   | VARCHAR(32) | NO          | YES      |
+| city   | VARCHAR(32) | NO          | YES      |
+| age    | INT         | NO          | YES      |
++--------+-------------+-------------+----------+
+(4 rows)
+
+tangdb> SHOW BACKENDS;
++--------------------------------------+----------------+----------+--------+---------------------+----------------+---------------+-----------+-----------+
+| be_id                                | endpoint       | version  | status | last_heartbeat      | memtable_bytes | segment_count | put_count | get_count |
++--------------------------------------+----------------+----------+--------+---------------------+----------------+---------------+-----------+-----------+
+| 46ea4a79-5017-446b-9baf-daeb7bd9b93c | 127.0.0.1:9200 | P2-0.1.0 | 可用   | 2026-10-22 15:52:45 | 0              | 1             | 17        | 17        |
++--------------------------------------+----------------+----------+--------+---------------------+----------------+---------------+-----------+-----------+
+(1 row)
+```
+
+元数据(表、列)存在**库里自己的系统表**里,不依赖任何外部数据库;重启 BE 与 FE 之后 `SHOW TABLES` / `DESC` 与数据都还在。
+
+P2 的 SQL 边界(一期一期加,别当成完整 SQL):
+
+- 支持:`CREATE / DROP / TRUNCATE TABLE`、`SHOW TABLES`、`DESC`、`INSERT`(多行)、`UPDATE`、`DELETE`、`SELECT 列/*/AS` + `WHERE`(`=` `<>` `<` `<=` `>` `>=`、`AND`/`OR`、`IN`)+ `LIMIT`
+- 不做(留给后面几期):JOIN、聚合、GROUP BY、子查询、ORDER BY、表达式与函数、二级索引
+- 主键:单列,类型限 `INT` / `BIGINT` / `VARCHAR` / `DATE`
+- 一条端到端功能测试:`bash scripts/p2-test.sh`(11 个场景,含强杀重启、心跳判死、跨内存/磁盘)
+
 ### 最强的那个动作:强杀后重启,数据还在
 
 ```bash
@@ -192,12 +271,25 @@ bash scripts/gen-proto.sh
 
 ## 状态
 
-**P1(基座)已完成并通过独立验收。**
+**P1(基座)已完成并通过独立验收。P2(表与 SQL)已实现完成并通过独立核验。**
+
+P2 核验口径(真实执行,不看实现方自述):
+
+- `bash scripts/p2-test.sh` —— 11 个场景 / 40 条断言全 PASS(含 4 个 ★:元数据重启不丢、心跳判死与自动恢复、跨内存/磁盘查询、强杀后零丢失)
+- `bash scripts/crash-test.sh` —— P1 回归:1000 条随机 KV,强杀重启后**丢失 0 条**
+- `cd be && go build ./... && go vet ./... && go test ./...` —— 全绿
+- `cd fe && mvn.cmd test` —— 105 个用例全绿
+
+已知缺口(记在 `specs/P2-table-and-sql.md` §11 待补充,未修):
+
+- `put` / `get` 裸命令被 SQL 取代(与 P1 规约 FR-028 冲突,待拍板)
+- BE 在 FE 重启后不会重新注册,`SHOW BACKENDS` 会一直为空
+- FE 心跳端口硬绑定,同时只能跑一个 FE/CLI
 
 已完成:
 
 - 仓库初始化、README、`.gitignore`
-- 项目结构骨架:`proto/` `be/` `fe/` `tools/` `scripts/`
+- 项目结构骨架:`config/` `proto/` `be/` `fe/` `tools/` `scripts/`
 - **配置**:两个进程的配置放进 `config/be.conf`、`config/fe.conf`,命令行参数可覆盖(2026-10-22 修订)
 - 接口契约 `proto/tangdb.proto`(`Ping` / `Put` / `Get`)
 - **BE 最小可用 LSM**:WAL(CRC32C + fsync)、跳表 memtable、列式 segment、MANIFEST 原子版本管理

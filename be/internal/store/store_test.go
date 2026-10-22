@@ -197,3 +197,62 @@ func TestManifestAndCurrent(t *testing.T) {
 		t.Fatalf("manifest missing: %v", err)
 	}
 }
+
+func TestScanAcrossMemoryAndSegments(t *testing.T) {
+	dir := t.TempDir()
+	// 1KB 阈值,保证前 100 条会被刷进 segment。
+	e, _, err := Open(dir, 1024)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer e.Close()
+
+	for i := 0; i < 100; i++ {
+		key := []byte(fmt.Sprintf("k%04d", i))
+		if err := e.Put(key, []byte("old")); err != nil {
+			t.Fatalf("put old %d: %v", i, err)
+		}
+	}
+	if err := e.ForceFlush(); err != nil {
+		t.Fatalf("force flush: %v", err)
+	}
+
+	// 覆盖一部分(新值在 memtable),再写一批只在内存里的 key。
+	for i := 0; i < 50; i++ {
+		if err := e.Put([]byte(fmt.Sprintf("k%04d", i)), []byte("new")); err != nil {
+			t.Fatalf("put new %d: %v", i, err)
+		}
+	}
+	for i := 100; i < 150; i++ {
+		if err := e.Put([]byte(fmt.Sprintf("k%04d", i)), []byte("mem")); err != nil {
+			t.Fatalf("put mem %d: %v", i, err)
+		}
+	}
+
+	sc := e.NewScanner([]byte("k0040"), []byte("k0110"), 0)
+	var got []string
+	for sc.Next() {
+		got = append(got, string(sc.Key())+"="+string(sc.Value()))
+	}
+	if err := sc.Err(); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if len(got) != 70 {
+		t.Fatalf("rows = %d, want 70", len(got))
+	}
+	if got[0] != "k0040=new" {
+		t.Fatalf("first = %s, want k0040=new", got[0])
+	}
+	if got[9] != "k0049=new" || got[10] != "k0050=old" {
+		t.Fatalf("memtable/segment 边界取值错误: %v", got[8:12])
+	}
+	if got[len(got)-1] != "k0109=mem" {
+		t.Fatalf("last = %s", got[len(got)-1])
+	}
+
+	// 空范围
+	sc = e.NewScanner([]byte("z"), []byte("zz"), 0)
+	if sc.Next() {
+		t.Fatal("空范围不应有结果")
+	}
+}

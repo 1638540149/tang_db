@@ -8,6 +8,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -17,7 +18,9 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
+	"github.com/1638540149/tang_db/be/internal/beid"
 	"github.com/1638540149/tang_db/be/internal/config"
 	"github.com/1638540149/tang_db/be/internal/server"
 	"github.com/1638540149/tang_db/be/internal/server/pb"
@@ -90,6 +93,12 @@ func run() error {
 		"wal_replayed", stats.WALReplayed,
 	)
 
+	// be_id:首次启动生成并持久化到 <data_dir>/be.id,重启不变。
+	identity, err := beid.LoadOrCreate(cfg.DataDir)
+	if err != nil {
+		return fmt.Errorf("初始化 be_id 失败: %w", err)
+	}
+
 	grpcServer := grpc.NewServer()
 	pb.RegisterTangDbServer(grpcServer, server.NewTangDbServer(engine))
 
@@ -102,7 +111,26 @@ func run() error {
 		return fmt.Errorf("监听 %s 失败: %w", addr, err)
 	}
 
-	slog.Info("BE 已就绪", "listen", addr, "data_dir", engine.DataDir(), "memtable_threshold", cfg.MemTableSize)
+	slog.Info("BE 已就绪", "listen", addr, "data_dir", engine.DataDir(),
+		"memtable_threshold", cfg.MemTableSize, "be_id", identity)
+
+	// 注册与心跳:独立 goroutine,失败只退避重试,不影响前台读写。
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	reporter, err := server.NewReporter(engine, server.ReporterConfig{
+		FeAddr:   fmt.Sprintf("%s:%d", cfg.FeHost, cfg.FePort),
+		Endpoint: addr,
+		BeID:     identity,
+		Version:  store.EngineVersion(),
+		Interval: time.Duration(cfg.HeartbeatIntervalSeconds) * time.Second,
+	})
+	if err != nil {
+		// 连 channel 都建不起来说明配置地址非法;心跳不是前台依赖,记日志继续跑。
+		slog.Warn("心跳客户端初始化失败,前台读写继续", "error", err)
+	} else {
+		defer func() { _ = reporter.Close() }()
+		reporter.Start(ctx)
+	}
 
 	// 优雅关闭
 	done := make(chan os.Signal, 1)
@@ -110,6 +138,7 @@ func run() error {
 	go func() {
 		<-done
 		slog.Info("正在关闭 BE...")
+		cancel()
 		grpcServer.GracefulStop()
 	}()
 

@@ -2,64 +2,19 @@ package com.wangyu.tangdb.client;
 
 import org.junit.jupiter.api.Test;
 
-import java.io.BufferedReader;
-import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
-import java.io.InputStreamReader;
 import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * 命令行解析与 CLI 启动参数的单元测试。
+ * CLI 支撑件(SqlBuffer / TableFormatter)与启动参数解析的单元测试。
  *
- * <p>不需要启动 BE,也不会发起除本机 channel 构建之外的网络调用。</p>
+ * <p>不需要启动 BE;不做网络调用。</p>
  */
 class ClientParseTest {
-
-    @Test
-    void putParsing() {
-        Cli.Command command = Cli.parseCommand("put name wangyu");
-        assertEquals(Cli.Type.PUT, command.type());
-        assertEquals("name", command.key());
-        assertEquals("wangyu", command.value());
-
-        Cli.Command spaced = Cli.parseCommand("  put  name   hello world  ");
-        assertEquals(Cli.Type.PUT, spaced.type());
-        assertEquals("name", spaced.key());
-        assertEquals("hello world", spaced.value());
-
-        Cli.Command upper = Cli.parseCommand("PUT k v");
-        assertEquals(Cli.Type.PUT, upper.type());
-    }
-
-    @Test
-    void getParsing() {
-        Cli.Command command = Cli.parseCommand("get name");
-        assertEquals(Cli.Type.GET, command.type());
-        assertEquals("name", command.key());
-        assertNull(command.value());
-    }
-
-    @Test
-    void simpleCommands() {
-        assertEquals(Cli.Type.PING, Cli.parseCommand("ping").type());
-        assertEquals(Cli.Type.EXIT, Cli.parseCommand("exit").type());
-        assertEquals(Cli.Type.EMPTY, Cli.parseCommand("").type());
-        assertEquals(Cli.Type.EMPTY, Cli.parseCommand("   ").type());
-        assertEquals(Cli.Type.EMPTY, Cli.parseCommand(null).type());
-    }
-
-    @Test
-    void invalidCommands() {
-        expectCommandError("put name", "用法: put <key> <value>");
-        expectCommandError("get", "用法: get <key>");
-        expectCommandError("get a b", "用法: get <key>");
-        expectCommandError("ping now", "ping 命令不接受参数");
-        expectCommandError("exit now", "exit 命令不接受参数");
-        expectCommandError("foo", "未知命令: foo");
-    }
 
     @Test
     void parseArgs() {
@@ -89,14 +44,17 @@ class ClientParseTest {
         expectArgsError(new String[]{"--be-port", "70000"}, "端口无效: 70000");
         expectArgsError(new String[]{"--be-host"}, "参数 --be-host 缺少取值");
         expectArgsError(new String[]{"--bad-flag"}, "未知启动参数: --bad-flag");
+    }
 
+    @Test
+    void badArgsExitBeforeTouchingNetwork() {
         ByteArrayOutputStream outBytes = new ByteArrayOutputStream();
         ByteArrayOutputStream errBytes = new ByteArrayOutputStream();
         int code = Cli.run(
                 new String[]{"--bad-flag"},
-                readerFor(""),
-                printStream(outBytes),
-                printStream(errBytes));
+                new java.io.BufferedReader(new java.io.StringReader("")),
+                new PrintStream(outBytes, true, StandardCharsets.UTF_8),
+                new PrintStream(errBytes, true, StandardCharsets.UTF_8));
 
         assertEquals(2, code);
         String err = errBytes.toString(StandardCharsets.UTF_8);
@@ -104,46 +62,94 @@ class ClientParseTest {
         assertNoStackTrace(err);
     }
 
+    // ------------------------------------------------------------ SqlBuffer
+
     @Test
-    void cliLoopWithoutNetwork() {
-        ByteArrayOutputStream outBytes = new ByteArrayOutputStream();
-        ByteArrayOutputStream errBytes = new ByteArrayOutputStream();
-
-        int code = Cli.run(
-                new String[0],
-                readerFor("put name\nexit\n"),
-                printStream(outBytes),
-                printStream(errBytes));
-
-        String out = outBytes.toString(StandardCharsets.UTF_8);
-        String err = errBytes.toString(StandardCharsets.UTF_8);
-        assertEquals(0, code);
-        assertTrue(err.contains("用法: put <key> <value>"));
-        assertNoStackTrace(out);
-        assertNoStackTrace(err);
+    void splitsMultipleStatements() {
+        SqlBuffer buffer = new SqlBuffer();
+        List<String> statements = buffer.append("SELECT * FROM t; SELECT 1 FROM t;");
+        assertEquals(2, statements.size());
+        assertEquals("SELECT * FROM t", statements.get(0));
+        assertEquals("SELECT 1 FROM t", statements.get(1));
+        assertFalse(buffer.hasPending());
     }
 
     @Test
-    void cliExit() {
-        ByteArrayOutputStream outBytes = new ByteArrayOutputStream();
-        ByteArrayOutputStream errBytes = new ByteArrayOutputStream();
+    void semicolonInsideStringDoesNotSplit() {
+        SqlBuffer buffer = new SqlBuffer();
+        assertTrue(buffer.append("SELECT * FROM t WHERE name = 'a;b'").isEmpty());
+        assertTrue(buffer.hasPending());
 
-        int code = Cli.run(
-                new String[0],
-                readerFor("exit\n"),
-                printStream(outBytes),
-                printStream(errBytes));
-
-        String out = outBytes.toString(StandardCharsets.UTF_8);
-        assertEquals(0, code);
-        assertTrue(out.contains("再见"));
-        assertNoStackTrace(errBytes.toString(StandardCharsets.UTF_8));
+        List<String> statements = buffer.append(";");
+        assertEquals(1, statements.size());
+        assertEquals("SELECT * FROM t WHERE name = 'a;b'", statements.get(0));
     }
 
-    private void expectCommandError(String line, String expectedPrefix) {
-        IllegalArgumentException e = assertThrows(IllegalArgumentException.class, () -> Cli.parseCommand(line));
-        assertNotNull(e.getMessage());
-        assertTrue(e.getMessage().startsWith(expectedPrefix), "actual: " + e.getMessage());
+    @Test
+    void escapedQuoteInsideString() {
+        SqlBuffer buffer = new SqlBuffer();
+        List<String> statements = buffer.append("SELECT * FROM t WHERE name = 'it''s; ok';");
+        assertEquals(1, statements.size());
+        assertEquals("SELECT * FROM t WHERE name = 'it''s; ok'", statements.get(0));
+    }
+
+    @Test
+    void multilineStatementIsJoined() {
+        SqlBuffer buffer = new SqlBuffer();
+        assertTrue(buffer.append("CREATE TABLE users (").isEmpty());
+        assertTrue(buffer.append("  id BIGINT PRIMARY KEY,").isEmpty());
+        List<String> statements = buffer.append("  name VARCHAR(32));");
+        assertEquals(1, statements.size());
+        assertTrue(statements.get(0).startsWith("CREATE TABLE users ("));
+        assertTrue(statements.get(0).endsWith("name VARCHAR(32))"));
+    }
+
+    @Test
+    void lineCommentIsIgnored() {
+        SqlBuffer buffer = new SqlBuffer();
+        List<String> statements = buffer.append("SELECT * FROM t -- 只看表 t");
+        assertTrue(statements.isEmpty());
+        statements = buffer.append(";");
+        assertEquals(1, statements.size());
+        assertEquals("SELECT * FROM t", statements.get(0));
+    }
+
+    @Test
+    void emptyStatementsAreIgnored() {
+        SqlBuffer buffer = new SqlBuffer();
+        assertTrue(buffer.append(";").isEmpty());
+        assertTrue(buffer.append("  ;  ; ").isEmpty());
+        assertTrue(buffer.append("").isEmpty());
+    }
+
+    // ------------------------------------------------------------ TableFormatter
+
+    @Test
+    void formatsTableWithRowCount() {
+        String text = TableFormatter.format(
+                List.of("id", "name"),
+                List.<Object[]>of(new Object[]{1, "wangyu"}, new Object[]{2, null}));
+        assertTrue(text.contains("| id | name   |"), text);
+        assertTrue(text.contains("| 1  | wangyu |"), text);
+        assertTrue(text.contains("| 2  | NULL   |"), text);
+        assertTrue(text.trim().endsWith("(2 rows)"), text);
+    }
+
+    @Test
+    void emptyResultPrintsZeroRows() {
+        String text = TableFormatter.format(List.of("id"), List.of());
+        assertTrue(text.trim().endsWith("(0 rows)"), text);
+        assertTrue(text.contains("+----+"), text);
+    }
+
+    @Test
+    void cjkCountsAsDoubleWidth() {
+        assertEquals(4, TableFormatter.displayWidth("北京"));
+        assertEquals(2, TableFormatter.displayWidth("ab"));
+        String text = TableFormatter.format(List.of("城市"), List.<Object[]>of(new Object[]{"北京"}));
+        // 表头(2 字 = 4 宽)与值(4 宽)对齐,两侧各留一个空格
+        assertTrue(text.contains("| 城市 |"), text);
+        assertTrue(text.contains("| 北京 |"), text);
     }
 
     private void expectArgsError(String[] args, String expectedPrefix) {
@@ -155,15 +161,5 @@ class ClientParseTest {
     private void assertNoStackTrace(String output) {
         assertFalse(output.contains("\tat "), "output contains stack trace: " + output);
         assertFalse(output.contains("Exception in thread"), "output contains uncaught exception: " + output);
-    }
-
-    private BufferedReader readerFor(String text) {
-        return new BufferedReader(new InputStreamReader(
-                new ByteArrayInputStream(text.getBytes(StandardCharsets.UTF_8)),
-                StandardCharsets.UTF_8));
-    }
-
-    private PrintStream printStream(ByteArrayOutputStream bytes) {
-        return new PrintStream(bytes, true, StandardCharsets.UTF_8);
     }
 }

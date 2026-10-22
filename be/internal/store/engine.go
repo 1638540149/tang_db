@@ -9,7 +9,10 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
+	"time"
 
+	"github.com/1638540149/tang_db/be/internal/exec"
 	"github.com/1638540149/tang_db/be/internal/manifest"
 	"github.com/1638540149/tang_db/be/internal/memtable"
 	"github.com/1638540149/tang_db/be/internal/segment"
@@ -19,7 +22,7 @@ import (
 const (
 	defaultMemtableSize = 64 * 1024 * 1024
 	maxImmutableTables  = 2
-	version             = "P1-0.1.0"
+	version             = "P2-0.1.0"
 )
 
 // Stats 汇总恢复与运行统计。
@@ -30,11 +33,11 @@ type Stats struct {
 
 // Engine 是 P1 的 LSM 存储引擎。
 type Engine struct {
-	dataDir   string
-	walDir    string
-	sstDir    string
-	manifest  *manifest.Registry
-	state     *manifest.Manifest
+	dataDir  string
+	walDir   string
+	sstDir   string
+	manifest *manifest.Registry
+	state    *manifest.Manifest
 
 	mu        sync.RWMutex
 	mem       *memtable.MemTable
@@ -48,6 +51,15 @@ type Engine struct {
 	closeCh   chan struct{}
 	wg        sync.WaitGroup
 	closed    bool
+
+	// 运行统计,供心跳上报。全部是原子量,读统计不阻塞前台读写。
+	putCount       atomic.Uint64
+	getCount       atomic.Uint64
+	scanCount      atomic.Uint64
+	putErrCount    atomic.Uint64
+	getErrCount    atomic.Uint64
+	scanErrCount   atomic.Uint64
+	lastFsyncMilli atomic.Int64
 }
 
 // Open 打开或创建存储引擎,执行恢复流程。
@@ -176,6 +188,15 @@ func (e *Engine) Close() error {
 
 // Put 的写入顺序:① WAL 追加 → ② fsync → ③ memtable → ④ 返回 OK。
 func (e *Engine) Put(key, value []byte) error {
+	e.putCount.Add(1)
+	if err := e.put(key, value); err != nil {
+		e.putErrCount.Add(1)
+		return err
+	}
+	return nil
+}
+
+func (e *Engine) put(key, value []byte) error {
 	if len(key) == 0 {
 		return errors.New("store: empty key")
 	}
@@ -195,6 +216,7 @@ func (e *Engine) Put(key, value []byte) error {
 	if err := walFile.Append(key, value); err != nil {
 		return fmt.Errorf("store: wal append: %w", err)
 	}
+	e.lastFsyncMilli.Store(time.Now().UnixMilli())
 
 	// ③:再写 memtable。
 	e.mu.Lock()
@@ -215,6 +237,15 @@ func (e *Engine) Put(key, value []byte) error {
 
 // Get 的查找顺序:MemTable → Immutable MemTable → Segment(新到旧)。
 func (e *Engine) Get(key []byte) ([]byte, bool, error) {
+	e.getCount.Add(1)
+	v, ok, err := e.get(key)
+	if err != nil {
+		e.getErrCount.Add(1)
+	}
+	return v, ok, err
+}
+
+func (e *Engine) get(key []byte) ([]byte, bool, error) {
 	e.mu.RLock()
 	mem := e.mem
 	imm := make([]*memtable.MemTable, len(e.imm))
@@ -400,6 +431,103 @@ func (e *Engine) ForceFlush() error {
 	}
 	e.mu.Unlock()
 	return nil
+}
+
+// NewScanner 创建覆盖 [start, end) 的流式扫描器。
+//
+// 数据源按"新 → 旧"排列:memtable、不可变表(新到旧)、segment(新到旧)。
+// 返回的扫描器只在内存里保留每个源的一条当前记录,不会把范围整体读入内存。
+func (e *Engine) NewScanner(start, end []byte, limit int) *exec.Scanner {
+	e.scanCount.Add(1)
+
+	e.mu.RLock()
+	mem := e.mem
+	imm := make([]*memtable.MemTable, len(e.imm))
+	copy(imm, e.imm)
+	segs := make([]*segment.Reader, len(e.segments))
+	copy(segs, e.segments)
+	e.mu.RUnlock()
+
+	cursors := make([]exec.Cursor, 0, 1+len(imm)+len(segs))
+	cursors = append(cursors, exec.NewMemCursor(mem))
+	for i := len(imm) - 1; i >= 0; i-- {
+		cursors = append(cursors, exec.NewMemCursor(imm[i]))
+	}
+	for _, seg := range segs {
+		cursors = append(cursors, exec.NewSegmentCursor(seg))
+	}
+	return exec.NewScanner(cursors, start, end, limit)
+}
+
+// RecordScanError 记录一次扫描失败,供心跳上报。
+func (e *Engine) RecordScanError() { e.scanErrCount.Add(1) }
+
+// Status 是心跳用的运行状态快照。
+type Status struct {
+	DataDir            string
+	MemTableBytes      int64
+	ImmutableCount     int
+	SegmentCount       int
+	SegmentBytes       uint64
+	WALBytes           uint64
+	PutCount           uint64
+	GetCount           uint64
+	ScanCount          uint64
+	PutErrCount        uint64
+	GetErrCount        uint64
+	ScanErrCount       uint64
+	LastFsyncUnixMilli int64
+	DiskTotalBytes     uint64
+	DiskAvailableBytes uint64
+}
+
+// Status 采集当前状态。目录大小的统计是尽力而为的,失败按 0 处理,
+// 绝不让统计影响前台读写。
+func (e *Engine) Status() Status {
+	e.mu.RLock()
+	memBytes := e.mem.ApproximateSize()
+	immCount := len(e.imm)
+	segCount := len(e.segments)
+	dataDir := e.dataDir
+	e.mu.RUnlock()
+
+	st := Status{
+		DataDir:            dataDir,
+		MemTableBytes:      memBytes,
+		ImmutableCount:     immCount,
+		SegmentCount:       segCount,
+		PutCount:           e.putCount.Load(),
+		GetCount:           e.getCount.Load(),
+		ScanCount:          e.scanCount.Load(),
+		PutErrCount:        e.putErrCount.Load(),
+		GetErrCount:        e.getErrCount.Load(),
+		ScanErrCount:       e.scanErrCount.Load(),
+		LastFsyncUnixMilli: e.lastFsyncMilli.Load(),
+		SegmentBytes:       dirSize(e.sstDir),
+		WALBytes:           dirSize(e.walDir),
+	}
+	st.DiskTotalBytes, st.DiskAvailableBytes = diskUsage(dataDir)
+	return st
+}
+
+// dirSize 统计目录下普通文件的总字节数;目录不存在返回 0。
+func dirSize(dir string) uint64 {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0
+	}
+	var total uint64
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		total += uint64(info.Size())
+	}
+	return total
 }
 
 // WalName 暴露给外部测试使用。

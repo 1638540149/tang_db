@@ -7,14 +7,22 @@ import com.wangyu.tangdb.proto.PingRequest;
 import com.wangyu.tangdb.proto.PingResponse;
 import com.wangyu.tangdb.proto.PutRequest;
 import com.wangyu.tangdb.proto.PutResponse;
+import com.wangyu.tangdb.proto.RowBatch;
+import com.wangyu.tangdb.proto.ScanRequest;
 import com.wangyu.tangdb.proto.StatusCode;
 import com.wangyu.tangdb.proto.TangDbGrpc;
+import com.wangyu.tangdb.storage.KeyValue;
+import com.wangyu.tangdb.storage.KvStore;
+import com.wangyu.tangdb.storage.StoreException;
 
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
 
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 
@@ -24,7 +32,7 @@ import java.util.concurrent.TimeUnit;
  * <p>只通过 {@code proto/tangdb.proto} 定义的接口与 BE 通信，不读写 BE 的任何数据文件。
  * 所有失败都转换成带中文提示的 {@link ClientException}，调用方无需处理 gRPC 异常类型。</p>
  */
-public class TangDbClient implements AutoCloseable {
+public class TangDbClient implements AutoCloseable, KvStore {
 
     /** 默认 BE 地址。 */
     public static final String DEFAULT_HOST = "127.0.0.1";
@@ -34,6 +42,9 @@ public class TangDbClient implements AutoCloseable {
 
     /** 单次 RPC 的截止时间，保证 BE 无响应时客户端不会无限挂起。 */
     private static final long RPC_DEADLINE_SECONDS = 5L;
+
+    /** 扫描可能返回大量数据,给它比点操作更宽的截止时间。 */
+    private static final long SCAN_DEADLINE_SECONDS = 60L;
 
     /** 关闭 channel 时等待在途 RPC 结束的时间。 */
     private static final long SHUTDOWN_TIMEOUT_SECONDS = 5L;
@@ -127,6 +138,115 @@ public class TangDbClient implements AutoCloseable {
         throw fromResponseStatus(status, response.getMessage());
     }
 
+    // ------------------------------------------------------------ 原始 KV 接口(KvStore)
+
+    /**
+     * 读取原始 key;不存在返回 null。
+     */
+    public byte[] getRaw(byte[] key) throws ClientException {
+        if (key == null || key.length == 0) {
+            throw new ClientException("key 不能为空", "INVALID_ARGUMENT");
+        }
+        GetResponse response;
+        try {
+            response = stubWithDeadline().get(GetRequest.newBuilder()
+                    .setKey(ByteString.copyFrom(key))
+                    .build());
+        } catch (StatusRuntimeException e) {
+            throw translate(e, host, port);
+        }
+        if (response.getStatus() == StatusCode.OK) {
+            return response.getValue().toByteArray();
+        }
+        if (response.getStatus() == StatusCode.NOT_FOUND) {
+            return null;
+        }
+        throw fromResponseStatus(response.getStatus(), response.getMessage());
+    }
+
+    /** 写入原始 key/value。返回即代表 BE 已完成 WAL fsync。 */
+    public void putRaw(byte[] key, byte[] value) throws ClientException {
+        if (key == null || key.length == 0) {
+            throw new ClientException("key 不能为空", "INVALID_ARGUMENT");
+        }
+        PutResponse response;
+        try {
+            response = stubWithDeadline().put(PutRequest.newBuilder()
+                    .setKey(ByteString.copyFrom(key))
+                    .setValue(ByteString.copyFrom(value == null ? new byte[0] : value))
+                    .build());
+        } catch (StatusRuntimeException e) {
+            throw translate(e, host, port);
+        }
+        if (response.getStatus() != StatusCode.OK) {
+            throw fromResponseStatus(response.getStatus(), response.getMessage());
+        }
+    }
+
+    /**
+     * 按 key 范围 [start, end) 流式扫描并收集结果。end 为空表示到末尾。
+     *
+     * <p>BE 的中途错误以 status != OK 的 RowBatch 结束,这里必须把它转成失败,
+     * 不能当成正常截断(规约 FR-106)。</p>
+     */
+    public List<KeyValue> scanRaw(byte[] start, byte[] end, int limit) throws ClientException {
+        List<KeyValue> rows = new ArrayList<>();
+        Iterator<RowBatch> iterator;
+        try {
+            iterator = stubWithDeadline(SCAN_DEADLINE_SECONDS).scan(ScanRequest.newBuilder()
+                    .setStartKey(start == null ? ByteString.EMPTY : ByteString.copyFrom(start))
+                    .setEndKey(end == null ? ByteString.EMPTY : ByteString.copyFrom(end))
+                    .setLimit(Math.max(limit, 0))
+                    .build());
+        } catch (StatusRuntimeException e) {
+            throw translate(e, host, port);
+        }
+
+        try {
+            while (iterator.hasNext()) {
+                RowBatch batch = iterator.next();
+                if (batch.getStatus() != StatusCode.OK) {
+                    String detail = batch.getMessage();
+                    throw new ClientException("BE 扫描失败"
+                            + (detail == null || detail.isBlank() ? "" : ": " + detail), "SCAN_FAILED");
+                }
+                for (com.wangyu.tangdb.proto.Kv kv : batch.getRowsList()) {
+                    rows.add(new KeyValue(kv.getKey().toByteArray(), kv.getValue().toByteArray()));
+                }
+            }
+        } catch (StatusRuntimeException e) {
+            throw translate(e, host, port);
+        }
+        return rows;
+    }
+
+    @Override
+    public byte[] get(byte[] key) {
+        try {
+            return getRaw(key);
+        } catch (ClientException e) {
+            throw new StoreException(e.getMessage(), e);
+        }
+    }
+
+    @Override
+    public void put(byte[] key, byte[] value) {
+        try {
+            putRaw(key, value);
+        } catch (ClientException e) {
+            throw new StoreException(e.getMessage(), e);
+        }
+    }
+
+    @Override
+    public List<KeyValue> scan(byte[] start, byte[] end, int limit) {
+        try {
+            return scanRaw(start, end, limit);
+        } catch (ClientException e) {
+            throw new StoreException(e.getMessage(), e);
+        }
+    }
+
     /**
      * 探活，返回 BE 版本号。
      *
@@ -168,7 +288,11 @@ public class TangDbClient implements AutoCloseable {
      * 每次 RPC 都重新计算截止时间，避免固定 deadline 在客户端长时间运行后失效。
      */
     private TangDbGrpc.TangDbBlockingStub stubWithDeadline() {
-        return stub.withDeadlineAfter(RPC_DEADLINE_SECONDS, TimeUnit.SECONDS);
+        return stubWithDeadline(RPC_DEADLINE_SECONDS);
+    }
+
+    private TangDbGrpc.TangDbBlockingStub stubWithDeadline(long seconds) {
+        return stub.withDeadlineAfter(seconds, TimeUnit.SECONDS);
     }
 
     /**

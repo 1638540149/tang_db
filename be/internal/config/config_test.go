@@ -13,6 +13,9 @@ func TestDefault(t *testing.T) {
 	if cfg.DataDir != "./data/BE" || cfg.Port != 9100 || cfg.MemTableSize != 64*1024*1024 {
 		t.Fatalf("内置默认值不对: %+v", cfg)
 	}
+	if cfg.FeHost != "127.0.0.1" || cfg.FePort != 9091 || cfg.HeartbeatIntervalSeconds != 3 {
+		t.Fatalf("心跳默认值不对: %+v", cfg)
+	}
 }
 
 func TestParseFullFile(t *testing.T) {
@@ -22,6 +25,9 @@ func TestParseFullFile(t *testing.T) {
 data_dir = ./data/test
 port = 9200
 memtable_size = 32KB
+fe_host = 10.0.0.2
+fe_port = 9191
+heartbeat_interval_seconds = 5
 `
 	cfg, err := Parse(strings.NewReader(src))
 	if err != nil {
@@ -35,6 +41,9 @@ memtable_size = 32KB
 	}
 	if cfg.MemTableSize != 32*1024 {
 		t.Errorf("memtable_size = %d", cfg.MemTableSize)
+	}
+	if cfg.FeHost != "10.0.0.2" || cfg.FePort != 9191 || cfg.HeartbeatIntervalSeconds != 5 {
+		t.Errorf("心跳配置 = %s:%d/%ds", cfg.FeHost, cfg.FePort, cfg.HeartbeatIntervalSeconds)
 	}
 }
 
@@ -54,13 +63,16 @@ func TestParseKeepsDefaultsForMissingKeys(t *testing.T) {
 
 func TestParseRejects(t *testing.T) {
 	cases := map[string]string{
-		"格式错误":      "data_dir ./data/BE",
-		"未知配置项":     "datadir = ./data/BE",
-		"取值为空":      "port = ",
-		"端口越界":      "port = 70000",
-		"端口非数字":     "port = abc",
-		"阈值非法":      "memtable_size = 12XB",
-		"阈值为零":      "memtable_size = 0",
+		"格式错误":    "data_dir ./data/BE",
+		"未知配置项":   "datadir = ./data/BE",
+		"取值为空":    "port = ",
+		"端口越界":    "port = 70000",
+		"端口非数字":   "port = abc",
+		"阈值非法":    "memtable_size = 12XB",
+		"阈值为零":    "memtable_size = 0",
+		"FE 端口越界": "fe_port = 0",
+		"心跳间隔为零":  "heartbeat_interval_seconds = 0",
+		"心跳间隔非数字": "heartbeat_interval_seconds = x",
 	}
 	for name, src := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -73,13 +85,13 @@ func TestParseRejects(t *testing.T) {
 
 func TestParseSize(t *testing.T) {
 	ok := map[string]int64{
-		"64MB":    64 * 1024 * 1024,
-		"1mb":     1024 * 1024,
-		"32KB":    32 * 1024,
-		"1GB":     1024 * 1024 * 1024,
-		"1024":    1024,
-		"2048B":   2048,
-		" 8MB ":   8 * 1024 * 1024,
+		"64MB":  64 * 1024 * 1024,
+		"1mb":   1024 * 1024,
+		"32KB":  32 * 1024,
+		"1GB":   1024 * 1024 * 1024,
+		"1024":  1024,
+		"2048B": 2048,
+		" 8MB ": 8 * 1024 * 1024,
 	}
 	for in, want := range ok {
 		got, err := ParseSize(in)

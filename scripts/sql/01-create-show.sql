@@ -1,0 +1,3 @@
+CREATE TABLE users (id BIGINT PRIMARY KEY, name VARCHAR(32), city VARCHAR(32), age INT);
+SHOW TABLES;
+DESC users;

@@ -7,21 +7,22 @@ package memtable
 import (
 	"bytes"
 	"math/rand"
+	"sort"
 	"sync"
 )
 
 const (
-	maxLevel    = 12
-	p           = 0.25
+	maxLevel = 12
+	p        = 0.25
 )
 
 // MemTable 是有序跳表实现的内存键值表。
 type MemTable struct {
-	mu       sync.RWMutex
-	head     *node
-	level    int
-	size     int64 // 估算的内存占用字节数
-	entries  int64 // KV 条数
+	mu      sync.RWMutex
+	head    *node
+	level   int
+	size    int64 // 估算的内存占用字节数
+	entries int64 // KV 条数
 }
 
 type node struct {
@@ -154,6 +155,14 @@ func (it *Iterator) Value() []byte {
 // First 移动到首元素。
 func (it *Iterator) First() {
 	it.pos = 0
+}
+
+// Seek 定位到第一个 key >= target 的位置。target 为空表示首元素。
+// 越界后 Valid() 返回 false。
+func (it *Iterator) Seek(target []byte) {
+	it.pos = sort.Search(len(it.nodes), func(i int) bool {
+		return bytes.Compare(it.nodes[i].key, target) >= 0
+	})
 }
 
 func randomLevel() int {

@@ -2,6 +2,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -12,6 +13,8 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
+
+const defaultBatchRows = 1024
 
 // TangDbServer 实现 proto/tangdb.proto 中定义的 gRPC 服务。
 type TangDbServer struct {
@@ -84,6 +87,69 @@ func (s *TangDbServer) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResp
 		Status: pb.StatusCode_OK,
 		Value:  value,
 	}, nil
+}
+
+// Scan 按 key 范围 [start_key, end_key) 有序流式返回。
+//
+// 每批最多 batch_rows 行(默认 1024);limit 为 0 表示不限。
+// 正常结束时客户端会收到流 EOF;扫描中途出错时最后一帧是 status != OK 的 RowBatch,
+// 客户端据此区分"正常结束"与"出错结束",BE 不会静默截断。
+func (s *TangDbServer) Scan(req *pb.ScanRequest, stream pb.TangDb_ScanServer) error {
+	batchRows := int(req.BatchRows)
+	if batchRows <= 0 {
+		batchRows = defaultBatchRows
+	}
+	limit := int(req.Limit)
+	if len(req.EndKey) > 0 && len(req.StartKey) > 0 &&
+		bytes.Compare(req.StartKey, req.EndKey) > 0 {
+		return stream.Send(&pb.RowBatch{
+			Status:  pb.StatusCode_INVALID_ARGUMENT,
+			Message: "扫描起点大于终点",
+		})
+	}
+
+	sc := s.engine.NewScanner(req.StartKey, req.EndKey, limit)
+	batch := make([]*pb.Kv, 0, batchRows)
+
+	send := func(status pb.StatusCode, message string) error {
+		if err := stream.Send(&pb.RowBatch{Status: status, Message: message, Rows: batch}); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	for sc.Next() {
+		if err := stream.Context().Err(); err != nil {
+			return err
+		}
+		batch = append(batch, &pb.Kv{
+			Key:   append([]byte(nil), sc.Key()...),
+			Value: append([]byte(nil), sc.Value()...),
+		})
+		if len(batch) >= batchRows {
+			if err := send(pb.StatusCode_OK, ""); err != nil {
+				return err
+			}
+			batch = make([]*pb.Kv, 0, batchRows)
+		}
+	}
+
+	if err := sc.Err(); err != nil {
+		s.engine.RecordScanError()
+		slog.Error("scan failed", "error", err)
+		// 已经读到的行先发出去(它们本身是正确的),再明确报错,不让客户端误以为扫描正常结束。
+		if len(batch) > 0 {
+			if err := send(pb.StatusCode_OK, ""); err != nil {
+				return err
+			}
+			batch = make([]*pb.Kv, 0, batchRows)
+		}
+		return send(pb.StatusCode_INTERNAL, "扫描失败: "+err.Error())
+	}
+	if len(batch) > 0 {
+		return send(pb.StatusCode_OK, "")
+	}
+	return nil
 }
 
 // mustEmbedUnimplementedTangDbServer 由生成的代码提供,这里不需要额外实现。

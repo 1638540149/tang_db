@@ -7,7 +7,7 @@
 //   - 本文件里不得出现任何"表名""列名""SQL"的概念
 //   - FE 传给 BE 的永远是 key/value 与算子描述
 //
-// 本文件当前只包含 P1(基座)所需的接口。后续期次的接口按规约逐步加入,
+// 本文件包含 P1(基座)与 P2(表与 SQL)所需的接口。后续期次的接口按规约逐步加入,
 // 不提前定义未实现的东西。
 
 syntax = "proto3";
@@ -61,6 +61,29 @@ message GetResponse {
   string     message = 3;
 }
 
+// ---------------------------------------------------------------- 范围扫描
+
+// 一条原始键值对。P2 起 FE 把编码后的行放进 value,BE 不解释其内容。
+message Kv {
+  bytes key   = 1;
+  bytes value = 2;
+}
+
+message ScanRequest {
+  bytes  start_key  = 1;   // 含
+  bytes  end_key    = 2;   // 不含;空 = 到末尾
+  uint32 limit      = 3;   // 0 = 不限
+  uint32 batch_rows = 4;   // 0 = 默认 1024
+}
+
+// 服务端流式返回的一批行。status 不是 OK 时表示扫描中途出错,
+// 客户端必须把它当作失败结束,不能当成正常截断。
+message RowBatch {
+  StatusCode  status  = 1;
+  string      message = 2;
+  repeated Kv rows    = 3;
+}
+
 // ---------------------------------------------------------------- 服务
 
 service TangDb {
@@ -73,4 +96,69 @@ service TangDb {
 
   // 读取一个键值。key 不存在返回 NOT_FOUND,而不是空值。
   rpc Get(GetRequest) returns (GetResponse);
+
+  // 按 key 范围有序流式扫描。范围语义 [start_key, end_key),end_key 为空表示到末尾。
+  // 同一 key 只出现一次(取最新值);limit 为 0 表示不限;batch_rows 为 0 表示默认 1024。
+  rpc Scan(ScanRequest) returns (stream RowBatch);
+}
+
+// ---------------------------------------------------------------- BE → FE:注册与心跳
+//
+// 注意方向:这两个 RPC 的服务端在 FE 进程,BE 是客户端。
+
+message RegisterBeRequest {
+  string be_id                      = 1;
+  string endpoint                   = 2;
+  string version                    = 3;
+  int64  start_time_unix_millis     = 4;
+  uint32 heartbeat_interval_seconds = 5;   // 供 FE 计算判死窗口
+}
+
+message RegisterBeResponse {
+  StatusCode status  = 1;
+  string     message = 2;
+}
+
+message HeartbeatRequest {
+  // 身份
+  string be_id                      = 1;
+  string endpoint                   = 2;
+  string version                    = 3;
+  int64  start_time_unix_millis     = 4;
+  uint32 heartbeat_interval_seconds = 5;
+
+  // 存储
+  string data_dir              = 10;
+  uint64 disk_total_bytes      = 11;
+  uint64 disk_available_bytes  = 12;
+
+  // 内存表
+  uint64 memtable_bytes           = 20;
+  uint32 immutable_memtable_count = 21;
+
+  // 磁盘文件
+  uint32 segment_count = 30;
+  uint64 segment_bytes = 31;
+  uint64 wal_bytes     = 32;
+
+  // 服务量
+  uint64 put_count        = 40;
+  uint64 get_count        = 41;
+  uint64 scan_count       = 42;
+  uint64 put_error_count  = 43;
+  uint64 get_error_count  = 44;
+  uint64 scan_error_count = 45;
+
+  // 持久性
+  int64 last_fsync_unix_millis = 50;
+}
+
+message HeartbeatResponse {
+  StatusCode status  = 1;
+  string     message = 2;
+}
+
+service TangDbFrontend {
+  rpc RegisterBe      (RegisterBeRequest) returns (RegisterBeResponse);
+  rpc ReportHeartbeat (HeartbeatRequest)  returns (HeartbeatResponse);
 }
