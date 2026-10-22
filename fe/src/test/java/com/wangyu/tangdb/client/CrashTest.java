@@ -62,12 +62,14 @@ public final class CrashTest {
     private static String[] extractClientArgs(String[] args) {
         List<String> list = new ArrayList<>();
         for (int i = 0; i < args.length; i++) {
-            if (args[i].equals("--be-host") || args[i].equals("--be-port")) {
+            if (args[i].equals("--be-host") || args[i].equals("--be-port")
+                    || args[i].equals("--config")) {
                 if (i + 1 < args.length) {
                     list.add(args[i]);
                     list.add(args[++i]);
                 }
-            } else if (args[i].startsWith("--be-host=") || args[i].startsWith("--be-port=")) {
+            } else if (args[i].startsWith("--be-host=") || args[i].startsWith("--be-port=")
+                    || args[i].startsWith("--config=")) {
                 list.add(args[i]);
             }
         }

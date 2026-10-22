@@ -63,15 +63,21 @@ class ClientParseTest {
 
     @Test
     void parseArgs() {
-        Cli.Config defaults = Cli.parseArgs(new String[0]);
+        Cli.Config defaults = Cli.parseArgs(new String[0], FeConfig.defaults());
         assertEquals("127.0.0.1", defaults.host());
         assertEquals(9100, defaults.port());
 
-        Cli.Config separate = Cli.parseArgs(new String[]{"--be-host", "10.0.0.8", "--be-port", "9200"});
+        Cli.Config fromConfigFile = Cli.parseArgs(new String[0], FeConfig.of("10.0.0.8", 9200));
+        assertEquals("10.0.0.8", fromConfigFile.host());
+        assertEquals(9200, fromConfigFile.port());
+
+        Cli.Config separate = Cli.parseArgs(
+                new String[]{"--be-host", "10.0.0.8", "--be-port", "9200"}, FeConfig.defaults());
         assertEquals("10.0.0.8", separate.host());
         assertEquals(9200, separate.port());
 
-        Cli.Config equals = Cli.parseArgs(new String[]{"--be-host=localhost", "--be-port=19100"});
+        Cli.Config equals = Cli.parseArgs(
+                new String[]{"--be-host=localhost", "--be-port=19100"}, FeConfig.defaults());
         assertEquals("localhost", equals.host());
         assertEquals(19100, equals.port());
     }

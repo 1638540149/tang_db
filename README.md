@@ -121,23 +121,43 @@ tang_db/
 - Java 17 + Maven 3.9+
 - Windows 上执行构建命令请在 git-bash 中;**Maven 必须用 `mvn.cmd`**(POSIX 版 `mvn` 在本机不可用)
 
+### 配置文件
+
+两个进程的配置都在 `config/` 下,与 `fe/`、`be/` 同级,各自一份:
+
+```
+config/
+├── be.conf     数据层:data_dir / port / memtable_size
+└── fe.conf     客户端层:be_host / be_port
+```
+
+格式是一行一项 `key = value`,`#` 开头为注释。取值优先级:**命令行参数 > 配置文件 > 内置默认值**。
+
+```bash
+./scripts/start-be.sh                      # 读 config/be.conf
+./scripts/start-be.sh --port=9200          # 临时换端口,不改文件
+./scripts/start-be.sh --config=其他/be.conf # 换一份配置(也可设 TANGDB_BE_CONFIG)
+```
+
+配置写错(未知项、格式错、取值非法)会**直接启动失败并指出第几行**,不会静默用默认值跑起来。
+
 ### 启动(开两个终端)
 
 终端 A —— 起数据层:
 
 ```bash
-./scripts/start-be.sh --data-dir=./data/BE --port=9100 --memtable-size=64MB
+./scripts/start-be.sh
 # === Building BE ===
-# === Starting BE ===
-# 2026-10-21 ... INFO 正在启动 tang_db BE version=P1-0.1.0 data_dir=./data/BE port=9100
-# 2026-10-21 ... INFO 恢复完成 segments_loaded=0 wal_replayed=0
-# 2026-10-21 ... INFO BE 已就绪 listen=127.0.0.1:9100
+# === Starting BE (config: ...\config\be.conf) ===
+# 2026-10-22 ... INFO 正在启动 tang_db BE version=P1-0.1.0 config=...\config\be.conf data_dir=./data/BE port=9100 memtable_size=67108864
+# 2026-10-22 ... INFO 恢复完成 segments_loaded=0 wal_replayed=0
+# 2026-10-22 ... INFO BE 已就绪 listen=127.0.0.1:9100
 ```
 
 终端 B —— 起客户端:
 
 ```bash
-./scripts/start-fe.sh --be-port=9100
+./scripts/start-fe.sh
 # tangdb> put name wangyu
 # OK
 # tangdb> get name
@@ -150,7 +170,7 @@ tang_db/
 
 ```bash
 taskkill /F /IM be.exe      # 强杀,不给它正常退出的机会
-./scripts/start-be.sh --data-dir=./data/BE --port=9100
+./scripts/start-be.sh
 # 恢复完成 segments_loaded=2 wal_replayed=37
 # 再 get,数据一条没少
 ```
@@ -178,6 +198,7 @@ bash scripts/gen-proto.sh
 
 - 仓库初始化、README、`.gitignore`
 - 项目结构骨架:`proto/` `be/` `fe/` `tools/` `scripts/`
+- **配置**:两个进程的配置放进 `config/be.conf`、`config/fe.conf`,命令行参数可覆盖(2026-10-22 修订)
 - 接口契约 `proto/tangdb.proto`(`Ping` / `Put` / `Get`)
 - **BE 最小可用 LSM**:WAL(CRC32C + fsync)、跳表 memtable、列式 segment、MANIFEST 原子版本管理
 - **崩溃恢复**:启动时载入 segment + 重放 WAL,尾部坏记录就地截断

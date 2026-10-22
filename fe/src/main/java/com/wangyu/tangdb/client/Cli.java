@@ -12,15 +12,17 @@ import java.util.Optional;
  * tang_db 交互式命令行客户端。
  *
  * <p>支持的命令：{@code put <key> <value>}、{@code get <key>}、{@code ping}、{@code exit}。
- * 启动参数：{@code --be-host <host>}、{@code --be-port <port>}，缺省为
- * {@code 127.0.0.1:9100}。</p>
+ * <p>启动参数：{@code --config <file>}、{@code --be-host <host>}、{@code --be-port <port>}
+ * （后两者覆盖配置文件）。配置来源见 {@link FeConfig}：命令行 &gt; config/fe.conf &gt; 内置默认，
+ * 内置缺省为 {@code 127.0.0.1:9100}。</p>
  *
  * <p>所有错误只输出中文提示，绝不向用户打印 Java 异常堆栈。</p>
  */
 public final class Cli {
 
     static final String USAGE =
-            "用法: java com.wangyu.tangdb.client.Cli [--be-host <host>] [--be-port <port>]\n"
+            "用法: java com.wangyu.tangdb.client.Cli [--config <file>] [--be-host <host>] [--be-port <port>]\n"
+            + "配置: 默认读 " + FeConfig.DEFAULT_PATH + ",命令行参数覆盖配置文件\n"
             + "命令: put <key> <value> | get <key> | ping | exit";
 
     private static final String PROMPT = "tangdb> ";
@@ -170,12 +172,21 @@ public final class Cli {
     }
 
     /**
-     * 解析启动参数，支持 {@code --be-host <host>} / {@code --be-port <port>}，
-     * 以及 {@code --be-host=<host>} / {@code --be-port=<port>} 两种写法。
+     * 解析启动参数并加载配置:先按 {@code --config}(缺省 {@link FeConfig#DEFAULT_PATH})
+     * 读配置文件,再让命令行参数覆盖它。
      */
     static Config parseArgs(String[] args) {
-        String host = TangDbClient.DEFAULT_HOST;
-        int port = TangDbClient.DEFAULT_PORT;
+        return parseArgs(args, FeConfig.load(findConfigPath(args)));
+    }
+
+    /**
+     * 在给定配置的基础上解析命令行参数(不做文件 IO,便于测试)。
+     * 支持 {@code --be-host <host>} / {@code --be-port <port>} 及其 {@code =} 写法,
+     * 以及 {@code --config <file>} / {@code --config=<file>}(此处只校验写法,文件已加载)。
+     */
+    static Config parseArgs(String[] args, FeConfig base) {
+        String host = base.beHost();
+        int port = base.bePort();
         if (args == null) {
             return new Config(host, port);
         }
@@ -194,11 +205,35 @@ public final class Cli {
                 port = parsePort(arg.substring("--be-port=".length()));
             } else if (arg.equals("--be-port")) {
                 port = parsePort(nextValue(args, ++i, "--be-port"));
+            } else if (arg.startsWith("--config=")) {
+                requireNonBlank(arg.substring("--config=".length()), "--config");
+            } else if (arg.equals("--config")) {
+                requireNonBlank(nextValue(args, ++i, "--config"), "--config");
             } else {
                 throw new IllegalArgumentException("未知启动参数: " + arg + "。\n" + USAGE);
             }
         }
         return new Config(host, port);
+    }
+
+    /** 找出 {@code --config} 的取值;未指定时返回默认配置文件路径。 */
+    private static String findConfigPath(String[] args) {
+        if (args == null) {
+            return FeConfig.DEFAULT_PATH;
+        }
+        for (int i = 0; i < args.length; i++) {
+            String arg = args[i];
+            if (arg == null) {
+                continue;
+            }
+            if (arg.startsWith("--config=")) {
+                return requireNonBlank(arg.substring("--config=".length()), "--config");
+            }
+            if (arg.equals("--config")) {
+                return requireNonBlank(nextValue(args, ++i, "--config"), "--config");
+            }
+        }
+        return FeConfig.DEFAULT_PATH;
     }
 
     private static String nextValue(String[] args, int index, String option) {

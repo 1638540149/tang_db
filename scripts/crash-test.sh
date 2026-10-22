@@ -13,11 +13,17 @@ TEST_DIR="${ROOT_DIR}/tmp/crash-test"
 KV_FILE="${TEST_DIR}/kv.txt"
 REPORT_FILE="${TEST_DIR}/report.txt"
 BE_EXE="${ROOT_DIR}/tmp/be.exe"
+# 传给原生 go build 的路径要用 Windows 形式,否则在某些 shell 里会被当相对路径
+BE_EXE_WIN="$(cygpath -w "${BE_EXE}")"
 
 # 测试参数
 COUNT=${COUNT:-1000}
 SEED=${SEED:-42}
 BE_PORT=${BE_PORT:-9100}
+
+# 配置文件(与手工启动时用的是同一套);下面的命令行参数会覆盖其中的取值
+BE_CONFIG="$(cygpath -w "${ROOT_DIR}/config/be.conf")"
+FE_CONFIG="$(cygpath -w "${ROOT_DIR}/config/fe.conf")"
 
 export PATH="/c/Program Files/Go/bin:$PATH"
 
@@ -41,7 +47,7 @@ wait_for_be() {
     local host="$1"
     local port="$2"
     for i in $(seq 1 60); do
-        if java -Dfile.encoding=UTF-8 -cp "${CP}" com.wangyu.tangdb.client.Cli --be-host="${host}" --be-port="${port}" <<<"ping" 2>/dev/null | grep -q "BE 版本"; then
+        if java -Dfile.encoding=UTF-8 -cp "${CP}" com.wangyu.tangdb.client.Cli --config="${FE_CONFIG}" --be-host="${host}" --be-port="${port}" <<<"ping" 2>/dev/null | grep -q "BE 版本"; then
             return 0
         fi
         sleep 1
@@ -55,7 +61,7 @@ kill_be
 # 构建 BE
 log "=== 构建 BE ==="
 cd "${BE_DIR}"
-go build -o "${BE_EXE}" ./cmd/be
+go build -o "${BE_EXE_WIN}" ./cmd/be
 log "BE 可执行文件: ${BE_EXE}"
 
 # 构建 FE
@@ -73,7 +79,7 @@ export CP
 
 # 启动 BE
 log "=== 启动 BE (端口 ${BE_PORT}) ==="
-"${BE_EXE}" --data-dir="$(cygpath -w "${DATA_DIR}")" --port="${BE_PORT}" --memtable-size=32KB >"${TEST_DIR}/be.log" 2>&1 &
+"${BE_EXE}" --config="${BE_CONFIG}" --data-dir="$(cygpath -w "${DATA_DIR}")" --port="${BE_PORT}" --memtable-size=32KB >"${TEST_DIR}/be.log" 2>&1 &
 BE_PID=$!
 if ! wait_for_be 127.0.0.1 "${BE_PORT}"; then
     log "BE 未在预期时间内就绪"
@@ -85,7 +91,7 @@ log "BE 已就绪, PID=${BE_PID}"
 
 # 写入随机 KV
 log "=== 写入 ${COUNT} 条随机 KV ==="
-java -Dfile.encoding=UTF-8 -cp "${CP}" com.wangyu.tangdb.client.CrashTest write "${COUNT}" "${SEED}" "${KV_FILE}" --be-port="${BE_PORT}"
+java -Dfile.encoding=UTF-8 -cp "${CP}" com.wangyu.tangdb.client.CrashTest write "${COUNT}" "${SEED}" "${KV_FILE}" --config="${FE_CONFIG}" --be-port="${BE_PORT}"
 
 log "=== 数据目录状态(崩溃前) ==="
 ls -la "${DATA_DIR}" | tee -a "${REPORT_FILE}"
@@ -99,7 +105,7 @@ wait "${BE_PID}" 2>/dev/null || true
 
 # 重启 BE
 log "=== 重启 BE ==="
-"${BE_EXE}" --data-dir="$(cygpath -w "${DATA_DIR}")" --port="${BE_PORT}" --memtable-size=32KB >"${TEST_DIR}/be-recovery.log" 2>&1 &
+"${BE_EXE}" --config="${BE_CONFIG}" --data-dir="$(cygpath -w "${DATA_DIR}")" --port="${BE_PORT}" --memtable-size=32KB >"${TEST_DIR}/be-recovery.log" 2>&1 &
 BE_PID=$!
 if ! wait_for_be 127.0.0.1 "${BE_PORT}"; then
     log "BE 恢复后未在预期时间内就绪"
@@ -111,7 +117,7 @@ log "BE 恢复完成, PID=${BE_PID}"
 
 # 校验
 log "=== 逐条校验 ${COUNT} 条 KV ==="
-if java -Dfile.encoding=UTF-8 -cp "${CP}" com.wangyu.tangdb.client.CrashTest verify "${KV_FILE}" --be-port="${BE_PORT}"; then
+if java -Dfile.encoding=UTF-8 -cp "${CP}" com.wangyu.tangdb.client.CrashTest verify "${KV_FILE}" --config="${FE_CONFIG}" --be-port="${BE_PORT}"; then
     log "=== 崩溃测试通过:丢失 0 条 ==="
 else
     log "=== 崩溃测试失败 ==="
