@@ -1,14 +1,21 @@
 // Package wal 实现预写日志(Write-Ahead Log)。
 //
-// 记录格式(小端序):
+// 记录格式(SPEC-P3 §5.3):
 //
-//	┌─────────┬──────┬─────────────┬─────────────────────────────────────┐
-//	│ CRC32C  │ Type │ PayloadLen  │ Payload                             │
-//	│ 4 bytes │ 1    │ 4 bytes     │ key_len(4) | key | value_len(4) | value│
-//	└─────────┴──────┴─────────────┴─────────────────────────────────────┘
+//	┌─────────┬──────┬─────────────┬──────────────────────────────────────────────┐
+//	│ CRC32C  │ Type │ PayloadLen  │ Payload                                      │
+//	│ 4 bytes │ 1    │ 4 bytes 小端 │ 见下                                          │
+//	└─────────┴──────┴─────────────┴──────────────────────────────────────────────┘
 //
-// CRC32C 覆盖 Type + PayloadLen + Payload。Type 目前仅使用 PUT=1,
-// BATCH=2 预留。记录之间无填充字节。
+//	Type = BATCH(2):commit_ts(8B 大端) | txn_id(8B 大端) | kvCount(4B 小端)
+//	                 | [klen(4B 小端) | k | vlen(4B 小端) | v] × kvCount
+//	Type = PUT(1):  key_len(4B 小端) | key | value_len(4B 小端) | value   (P1 老格式,只读兼容)
+//
+// CRC32C 覆盖 Type + PayloadLen + Payload。记录之间无填充字节。
+//
+// P3 起所有写入(Put 也不例外)都写成一条 BATCH 记录:一个事务的全部写入
+// 物理上连续,整条记录完整 + CRC 通过 = 该事务已提交。库中不存在第二个
+// "提交标记"(SPEC-P3 FR-313)。
 package wal
 
 import (
@@ -26,34 +33,45 @@ import (
 )
 
 const (
-	// TypePut 表示单条 Put 记录。
+	// TypePut 表示单条 Put 记录(P1 老格式)。P3 起只保留只读解析能力。
 	TypePut byte = 1
-	// TypeBatch 预留,供 P3 事务使用,P1 不实现。
+	// TypeBatch 表示一个事务的原子批记录(P3 起所有写入都用它)。
 	TypeBatch byte = 2
 
-	headerSize      = 4 + 1 + 4 // CRC + Type + PayloadLen
-	maxPayloadSize  = 1 << 31   // 约 2GB,与 32 位长度字段匹配
-	maxValueSize    = 1 << 20   // 1MB,与 P1 规约一致
+	headerSize     = 4 + 1 + 4 // CRC + Type + PayloadLen
+	batchHeadSize  = 8 + 8 + 4 // commit_ts + txn_id + kvCount
+	maxPayloadSize = 1 << 31   // 约 2GB,与 32 位长度字段匹配
+	maxValueSize   = 1 << 20   // 1MB,仅用于 P1 的 Put 语义
 )
 
 // castagnoli 表用于 CRC32C 校验。
 var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 
-// Record 表示一条 WAL 记录。
-type Record struct {
-	Type  byte
+// KV 是批记录里的一条完整键值对(key 已含版本段)。
+type KV struct {
 	Key   []byte
 	Value []byte
 }
 
+// Record 表示一条 WAL 记录。
+//
+// TypePut 记录只有一个 KV 且 CommitTS 为 0;TypeBatch 记录带 commit_ts / txn_id
+// 与多条 KV。
+type Record struct {
+	Type     byte
+	CommitTS uint64
+	TxnID    uint64
+	KVs      []KV
+}
+
 // WAL 提供追加写、fsync 与重放能力。
 type WAL struct {
-	dir      string
-	number   uint64
-	file     *os.File
-	writer   *bufWriter
-	mu       sync.Mutex
-	closed   bool
+	dir    string
+	number uint64
+	file   *os.File
+	writer *bufWriter
+	mu     sync.Mutex
+	closed bool
 }
 
 // bufWriter 在内存中缓冲少量数据,减少系统调用次数,但 fsync 前会刷新缓冲区。
@@ -95,9 +113,16 @@ func Open(dir string, number uint64) (*WAL, error) {
 		return nil, fmt.Errorf("create wal dir %s: %w", dir, err)
 	}
 	path := filepath.Join(dir, WalName(number))
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0640)
+	// 不用 O_APPEND:Windows 上 O_APPEND 只给 FILE_APPEND_DATA 权限,
+	// 随后对坏尾部做 Truncate 会被拒绝(Access is denied)。写入端由本结构体的
+	// 互斥锁串行化,打开后主动 seek 到文件末尾即可。
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0640)
 	if err != nil {
 		return nil, fmt.Errorf("open wal %s: %w", path, err)
+	}
+	if _, err := f.Seek(0, io.SeekEnd); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("seek wal %s to end: %w", path, err)
 	}
 	return &WAL{
 		dir:    dir,
@@ -110,7 +135,10 @@ func Open(dir string, number uint64) (*WAL, error) {
 // Number 返回当前 WAL 文件编号。
 func (w *WAL) Number() uint64 { return w.number }
 
-// Append 追加一条记录并执行 fsync。
+// Append 追加一条 P1 老格式记录并执行 fsync。
+//
+// P3 起引擎不再调用它(所有写入都走 AppendBatch);保留它是为了单独验证
+// TypePut 的只读解析兼容能力与老测试。
 func (w *WAL) Append(key, value []byte) error {
 	if len(key) == 0 {
 		return errors.New("wal: empty key")
@@ -118,7 +146,28 @@ func (w *WAL) Append(key, value []byte) error {
 	if len(value) > maxValueSize {
 		return fmt.Errorf("wal: value too large %d > %d", len(value), maxValueSize)
 	}
+	rec := &Record{Type: TypePut, KVs: []KV{{Key: key, Value: value}}}
+	return w.appendRecord(rec)
+}
 
+// AppendBatch 把整个事务作为一个 TypeBatch 记录一次追加,并执行一次 fsync。
+//
+// 返回 nil 即代表:这条批记录已完整落盘(CRC 覆盖类型、长度与载荷),
+// 进程被强杀后重放仍然能看到它 —— 这就是"已提交"的唯一判据。
+func (w *WAL) AppendBatch(commitTS, txnID uint64, kvs []KV) error {
+	if len(kvs) == 0 {
+		return errors.New("wal: empty batch")
+	}
+	for _, kv := range kvs {
+		if len(kv.Key) == 0 {
+			return errors.New("wal: empty key in batch")
+		}
+	}
+	rec := &Record{Type: TypeBatch, CommitTS: commitTS, TxnID: txnID, KVs: kvs}
+	return w.appendRecord(rec)
+}
+
+func (w *WAL) appendRecord(rec *Record) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -126,8 +175,7 @@ func (w *WAL) Append(key, value []byte) error {
 		return errors.New("wal: closed")
 	}
 
-	rec := Record{Type: TypePut, Key: key, Value: value}
-	buf, err := encodeRecord(&rec)
+	buf, err := encodeRecord(rec)
 	if err != nil {
 		return err
 	}
@@ -170,28 +218,74 @@ func (w *WAL) Sync() error {
 
 // encodeRecord 将记录编码为字节序列。
 func encodeRecord(r *Record) ([]byte, error) {
-	payloadLen := 4 + len(r.Key) + 4 + len(r.Value)
-	if payloadLen > maxPayloadSize {
-		return nil, fmt.Errorf("wal: payload too large %d", payloadLen)
+	var payload []byte
+	switch r.Type {
+	case TypePut:
+		if len(r.KVs) != 1 {
+			return nil, errors.New("wal: PUT record must have exactly one kv")
+		}
+		k, v := r.KVs[0].Key, r.KVs[0].Value
+		payloadLen := 4 + len(k) + 4 + len(v)
+		if payloadLen > maxPayloadSize {
+			return nil, fmt.Errorf("wal: payload too large %d", payloadLen)
+		}
+		payload = make([]byte, payloadLen)
+		off := 0
+		binary.LittleEndian.PutUint32(payload[off:], uint32(len(k)))
+		off += 4
+		copy(payload[off:], k)
+		off += len(k)
+		binary.LittleEndian.PutUint32(payload[off:], uint32(len(v)))
+		off += 4
+		copy(payload[off:], v)
+	case TypeBatch:
+		const countSize = 4
+		if len(r.KVs) == 0 {
+			return nil, errors.New("wal: empty batch")
+		}
+		payloadLen := batchHeadSize
+		for _, kv := range r.KVs {
+			if len(kv.Key) == 0 {
+				return nil, errors.New("wal: empty key in batch")
+			}
+			payloadLen += 4 + len(kv.Key) + 4 + len(kv.Value)
+			if payloadLen > maxPayloadSize {
+				return nil, fmt.Errorf("wal: payload too large %d", payloadLen)
+			}
+		}
+		payload = make([]byte, payloadLen)
+		binary.BigEndian.PutUint64(payload[0:8], r.CommitTS)
+		binary.BigEndian.PutUint64(payload[8:16], r.TxnID)
+		binary.LittleEndian.PutUint32(payload[16:20], uint32(len(r.KVs)))
+		off := batchHeadSize
+		for _, kv := range r.KVs {
+			binary.LittleEndian.PutUint32(payload[off:], uint32(len(kv.Key)))
+			off += 4
+			copy(payload[off:], kv.Key)
+			off += len(kv.Key)
+			binary.LittleEndian.PutUint32(payload[off:], uint32(len(kv.Value)))
+			off += 4
+			copy(payload[off:], kv.Value)
+			off += len(kv.Value)
+		}
+	default:
+		return nil, fmt.Errorf("wal: unknown record type %d", r.Type)
 	}
-	buf := make([]byte, headerSize+payloadLen)
-	buf[4] = r.Type
-	binary.LittleEndian.PutUint32(buf[4+1:], uint32(payloadLen))
-	off := headerSize
-	binary.LittleEndian.PutUint32(buf[off:], uint32(len(r.Key)))
-	off += 4
-	copy(buf[off:], r.Key)
-	off += len(r.Key)
-	binary.LittleEndian.PutUint32(buf[off:], uint32(len(r.Value)))
-	off += 4
-	copy(buf[off:], r.Value)
 
+	buf := make([]byte, headerSize+len(payload))
+	buf[4] = r.Type
+	binary.LittleEndian.PutUint32(buf[5:9], uint32(len(payload)))
+	copy(buf[headerSize:], payload)
 	crc := crc32.Checksum(buf[4:], castagnoli)
-	binary.LittleEndian.PutUint32(buf[0:], crc)
+	binary.LittleEndian.PutUint32(buf[0:4], crc)
 	return buf, nil
 }
 
-// Replay 逐条读取并回调 fn;遇到校验失败或不完整的记录时在此停止,不报错。
+// Replay 逐条读取并回调 fn;遇到记录不完整或 CRC 不符时在断点处**物理截断**
+// 文件(整条丢弃),不报错、服务照常启动(SPEC-P3 FR-315 / INV-2)。
+//
+// 截断是必须的:WAL 以 O_APPEND 打开,如果坏记录留在尾部,之后的新记录会排在
+// 它后面,下次重放又会在坏记录处停下,导致新数据"看起来没写进去"。
 func (w *WAL) Replay(fn func(r Record) error) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -199,18 +293,33 @@ func (w *WAL) Replay(fn func(r Record) error) error {
 	if _, err := w.file.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("wal: seek to start: %w", err)
 	}
-	return replayReader(w.file, fn)
+	validLen, err := replayReader(w.file, fn)
+	if err != nil {
+		return err
+	}
+	if err := w.file.Truncate(validLen); err != nil {
+		return fmt.Errorf("wal: truncate bad tail: %w", err)
+	}
+	if _, err := w.file.Seek(0, io.SeekEnd); err != nil {
+		return fmt.Errorf("wal: seek to end: %w", err)
+	}
+	if err := w.file.Sync(); err != nil {
+		return fmt.Errorf("wal: fsync after truncate: %w", err)
+	}
+	return nil
 }
 
-// replayReader 从 io.Reader 重放记录,校验失败时停止。
-func replayReader(r io.Reader, fn func(r Record) error) error {
+// replayReader 从 io.Reader 重放记录,返回"最后一条完整记录的结束偏移"。
+// 任何读不满 / CRC 不符 / 载荷格式非法都视为尾部损坏:停止并返回已消费长度。
+func replayReader(r io.Reader, fn func(r Record) error) (int64, error) {
+	var offset int64
 	for {
 		header := make([]byte, headerSize)
 		if _, err := io.ReadFull(r, header); err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-				return nil
+				return offset, nil
 			}
-			return err
+			return offset, err
 		}
 
 		recordCRC := binary.LittleEndian.Uint32(header[0:4])
@@ -218,53 +327,98 @@ func replayReader(r io.Reader, fn func(r Record) error) error {
 		payloadLen := binary.LittleEndian.Uint32(header[5:9])
 		if payloadLen > maxPayloadSize {
 			// 长度非法,视为截断,停止重放。
-			return nil
+			return offset, nil
 		}
 
 		payload := make([]byte, payloadLen)
 		if _, err := io.ReadFull(r, payload); err != nil {
 			// 载荷读不完整,视为截断,停止重放。
-			return nil
+			return offset, nil
 		}
 
 		computedCRC := crc32.Checksum(header[4:], castagnoli)
 		computedCRC = crc32.Update(computedCRC, castagnoli, payload)
 		if computedCRC != recordCRC {
-			// 校验失败,停止重放。
-			return nil
+			// 校验失败,整条丢弃,停止重放。
+			return offset, nil
 		}
 
-		rec, err := decodePayload(payload)
+		rec, err := decodePayload(recType, payload)
 		if err != nil {
-			// 载荷格式非法,停止重放。
-			return nil
+			// 载荷格式非法,当作损坏记录整条丢弃。
+			return offset, nil
 		}
-		rec.Type = recType
 		if err := fn(rec); err != nil {
-			return err
+			return offset, err
 		}
+		offset += int64(headerSize) + int64(payloadLen)
 	}
 }
 
-func decodePayload(payload []byte) (Record, error) {
-	if len(payload) < 4 {
-		return Record{}, errors.New("wal: payload too short for key length")
+func decodePayload(recType byte, payload []byte) (Record, error) {
+	switch recType {
+	case TypePut:
+		if len(payload) < 4 {
+			return Record{}, errors.New("wal: PUT payload too short for key length")
+		}
+		keyLen := int(binary.LittleEndian.Uint32(payload[0:4]))
+		if keyLen < 0 || 4+keyLen+4 > len(payload) {
+			return Record{}, errors.New("wal: PUT key length out of range")
+		}
+		key := make([]byte, keyLen)
+		copy(key, payload[4:4+keyLen])
+		off := 4 + keyLen
+		valueLen := int(binary.LittleEndian.Uint32(payload[off : off+4]))
+		off += 4
+		if valueLen < 0 || off+valueLen != len(payload) {
+			return Record{}, errors.New("wal: PUT value length mismatch")
+		}
+		value := make([]byte, valueLen)
+		copy(value, payload[off:])
+		return Record{Type: TypePut, KVs: []KV{{Key: key, Value: value}}}, nil
+
+	case TypeBatch:
+		if len(payload) < batchHeadSize {
+			return Record{}, errors.New("wal: BATCH payload too short")
+		}
+		commitTS := binary.BigEndian.Uint64(payload[0:8])
+		txnID := binary.BigEndian.Uint64(payload[8:16])
+		count := int(binary.LittleEndian.Uint32(payload[16:20]))
+		if count < 0 {
+			return Record{}, errors.New("wal: BATCH kv count out of range")
+		}
+		off := batchHeadSize
+		kvs := make([]KV, 0, count)
+		for i := 0; i < count; i++ {
+			if off+4 > len(payload) {
+				return Record{}, errors.New("wal: BATCH key length truncated")
+			}
+			keyLen := int(binary.LittleEndian.Uint32(payload[off : off+4]))
+			off += 4
+			if keyLen < 0 || off+keyLen+4 > len(payload) {
+				return Record{}, errors.New("wal: BATCH key truncated")
+			}
+			key := make([]byte, keyLen)
+			copy(key, payload[off:off+keyLen])
+			off += keyLen
+			valueLen := int(binary.LittleEndian.Uint32(payload[off : off+4]))
+			off += 4
+			if valueLen < 0 || off+valueLen > len(payload) {
+				return Record{}, errors.New("wal: BATCH value truncated")
+			}
+			value := make([]byte, valueLen)
+			copy(value, payload[off:off+valueLen])
+			off += valueLen
+			kvs = append(kvs, KV{Key: key, Value: value})
+		}
+		if off != len(payload) {
+			return Record{}, errors.New("wal: BATCH trailing bytes")
+		}
+		return Record{Type: TypeBatch, CommitTS: commitTS, TxnID: txnID, KVs: kvs}, nil
+
+	default:
+		return Record{}, fmt.Errorf("wal: unknown record type %d", recType)
 	}
-	keyLen := int(binary.LittleEndian.Uint32(payload[0:4]))
-	if 4+keyLen+4 > len(payload) {
-		return Record{}, errors.New("wal: key length out of range")
-	}
-	key := make([]byte, keyLen)
-	copy(key, payload[4:4+keyLen])
-	off := 4 + keyLen
-	valueLen := int(binary.LittleEndian.Uint32(payload[off : off+4]))
-	off += 4
-	if off+valueLen != len(payload) {
-		return Record{}, errors.New("wal: value length mismatch")
-	}
-	value := make([]byte, valueLen)
-	copy(value, payload[off:])
-	return Record{Key: key, Value: value}, nil
 }
 
 // WalName 返回 WAL 文件名,例如 000012.wal。

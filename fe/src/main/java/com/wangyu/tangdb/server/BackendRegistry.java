@@ -13,6 +13,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.LongSupplier;
+import java.util.logging.Logger;
 
 /**
  * BE 存活列表(规约 FR-154 / FR-155)。
@@ -22,6 +23,8 @@ import java.util.function.LongSupplier;
  * 这样不需要后台扫描线程,也不怕 FE 卡顿。</p>
  */
 public final class BackendRegistry {
+
+    private static final Logger LOG = Logger.getLogger(BackendRegistry.class.getName());
 
     private static final int DEFAULT_INTERVAL_SECONDS = 3;
     private static final DateTimeFormatter TIME_FMT =
@@ -134,6 +137,8 @@ public final class BackendRegistry {
         String beId = nullToEmpty(request.getBeId());
         Backend existing = byId.get(beId);
         if (existing == null) {
+            // FR-368 / K58:收到未登记过的 be_id 心跳时隐式注册。
+            // 这样 FE/CLI 重启后不必重启 BE 也能重新看到 BE 状态(P2 §11 G2)。
             existing = new Backend(beId,
                     nullToEmpty(request.getEndpoint()),
                     nullToEmpty(request.getVersion()),
@@ -141,6 +146,7 @@ public final class BackendRegistry {
                     interval,
                     now);
             byId.put(beId, existing);
+            LOG.info("收到未知 be_id 的心跳,已隐式注册: " + beId + " @ " + existing.endpoint());
         }
         existing.lastSeenMillis = now;
         existing.lastHeartbeat = request;

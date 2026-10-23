@@ -32,18 +32,21 @@ public final class FeConfig {
     private final int bePort;
     private final int heartbeatListenPort;
     private final int beOfflineCycles;
+    private final boolean heartbeatEnabled;
 
-    private FeConfig(String beHost, int bePort, int heartbeatListenPort, int beOfflineCycles) {
+    private FeConfig(String beHost, int bePort, int heartbeatListenPort, int beOfflineCycles,
+                     boolean heartbeatEnabled) {
         this.beHost = beHost;
         this.bePort = bePort;
         this.heartbeatListenPort = heartbeatListenPort;
         this.beOfflineCycles = beOfflineCycles;
+        this.heartbeatEnabled = heartbeatEnabled;
     }
 
     /** 内置默认配置。 */
     public static FeConfig defaults() {
         return new FeConfig(TangDbClient.DEFAULT_HOST, TangDbClient.DEFAULT_PORT,
-                DEFAULT_HEARTBEAT_LISTEN_PORT, DEFAULT_BE_OFFLINE_CYCLES);
+                DEFAULT_HEARTBEAT_LISTEN_PORT, DEFAULT_BE_OFFLINE_CYCLES, true);
     }
 
     /** 直接用给定取值构造配置(供程序化使用与测试)。 */
@@ -53,6 +56,12 @@ public final class FeConfig {
 
     /** 直接用给定取值构造配置(含 P2 新增项)。 */
     public static FeConfig of(String beHost, int bePort, int heartbeatListenPort, int beOfflineCycles) {
+        return of(beHost, bePort, heartbeatListenPort, beOfflineCycles, true);
+    }
+
+    /** 直接用给定取值构造配置(含 P3 的 heartbeat_enabled)。 */
+    public static FeConfig of(String beHost, int bePort, int heartbeatListenPort, int beOfflineCycles,
+                              boolean heartbeatEnabled) {
         if (beHost == null || beHost.isBlank()) {
             throw new IllegalArgumentException("be_host 不能为空");
         }
@@ -66,7 +75,7 @@ public final class FeConfig {
         if (beOfflineCycles < 1) {
             throw new IllegalArgumentException("be_offline_cycles 无效: " + beOfflineCycles + "（必须 >= 1）");
         }
-        return new FeConfig(beHost.trim(), bePort, heartbeatListenPort, beOfflineCycles);
+        return new FeConfig(beHost.trim(), bePort, heartbeatListenPort, beOfflineCycles, heartbeatEnabled);
     }
 
     public String beHost() {
@@ -85,6 +94,16 @@ public final class FeConfig {
     /** 超过多少个心跳周期未收到心跳即判 BE 不可用。 */
     public int beOfflineCycles() {
         return beOfflineCycles;
+    }
+
+    /**
+     * 是否启用心跳监听(SPEC-P3 FR-366 / K57)。
+     *
+     * <p>false 时不绑定心跳端口、不启动 FE 侧 gRPC 服务,SQL 照常;
+     * 这样同一台机器可以开多个 CLI 会话做并发验收。</p>
+     */
+    public boolean heartbeatEnabled() {
+        return heartbeatEnabled;
     }
 
     /**
@@ -119,6 +138,7 @@ public final class FeConfig {
         int port = TangDbClient.DEFAULT_PORT;
         int heartbeatPort = DEFAULT_HEARTBEAT_LISTEN_PORT;
         int offlineCycles = DEFAULT_BE_OFFLINE_CYCLES;
+        boolean heartbeatEnabled = true;
 
         for (int i = 0; i < lines.size(); i++) {
             String line = lines.get(i);
@@ -150,12 +170,25 @@ public final class FeConfig {
                 case "heartbeat_listen_port" ->
                         heartbeatPort = parseInt(key, value, path, i + 1, 1, 65535);
                 case "be_offline_cycles" -> offlineCycles = parseInt(key, value, path, i + 1, 1, 1000);
+                case "heartbeat_enabled" -> heartbeatEnabled = parseBoolean(key, value, path, i + 1);
                 default -> throw new IllegalArgumentException(
                         path + " 第 " + (i + 1) + " 行未知配置项: " + key);
             }
         }
 
-        return new FeConfig(host, port, heartbeatPort, offlineCycles);
+        return new FeConfig(host, port, heartbeatPort, offlineCycles, heartbeatEnabled);
+    }
+
+    private static boolean parseBoolean(String key, String raw, String path, int lineNo) {
+        String v = raw.trim();
+        if ("true".equalsIgnoreCase(v)) {
+            return true;
+        }
+        if ("false".equalsIgnoreCase(v)) {
+            return false;
+        }
+        throw new IllegalArgumentException(
+                path + " 第 " + lineNo + " 行 " + key + " 无效: " + raw + "(应为 true / false)");
     }
 
     private static String requireNonBlank(String value, String path, int lineNo) {

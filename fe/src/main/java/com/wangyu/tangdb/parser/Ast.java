@@ -17,7 +17,22 @@ public final class Ast {
 
     /** 一条语句。 */
     public sealed interface Statement permits CreateTable, DropTable, TruncateTable,
-            ShowTables, ShowDatabases, Describe, Insert, Update, Delete, Select {
+            ShowTables, ShowDatabases, Describe, Insert, Update, Delete, Select,
+            Begin, Commit, Rollback {
+    }
+
+    // ------------------------------------------------------------ P3:事务控制
+
+    /** BEGIN:向 BE 取快照,开启显式事务。 */
+    public record Begin() implements Statement {
+    }
+
+    /** COMMIT:提交写集(冲突时整批不写)。 */
+    public record Commit() implements Statement {
+    }
+
+    /** ROLLBACK:丢弃写集,释放 BE 句柄。 */
+    public record Rollback() implements Statement {
     }
 
     /** 列定义。NULL 性由主键标记推导:主键列不可空,其余列可空。 */

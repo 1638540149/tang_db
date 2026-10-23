@@ -2,6 +2,8 @@ package com.wangyu.tangdb.catalog;
 
 import com.wangyu.tangdb.storage.Column;
 import com.wangyu.tangdb.storage.DataType;
+import com.wangyu.tangdb.storage.KeyValue;
+import com.wangyu.tangdb.storage.KvStore;
 import com.wangyu.tangdb.storage.TableMeta;
 import com.wangyu.tangdb.testing.FakeKvStore;
 import org.junit.jupiter.api.Test;
@@ -78,6 +80,76 @@ class CatalogTest {
         assertEquals(fresh.id(), catalog.find("t").id());
         assertEquals(TableMeta.STATE_DROPPED, catalog.findById(old.id()).state());
         assertEquals(fresh.id(), Catalog.open(kv).require("t").id());
+    }
+
+    @Test
+    void createTableWritesAllMetadataInOneBatch() {
+        FakeKvStore delegate = new FakeKvStore();
+        int[] batches = {0};
+        int[] rowsInBatch = {0};
+        KvStore kv = new KvStore() {
+            @Override
+            public byte[] get(byte[] key) {
+                return delegate.get(key);
+            }
+
+            @Override
+            public void put(byte[] key, byte[] value) {
+                delegate.put(key, value);
+            }
+
+            @Override
+            public java.util.List<KeyValue> scan(byte[] start, byte[] end, int limit) {
+                return delegate.scan(start, end, limit);
+            }
+
+            @Override
+            public void writeBatch(java.util.List<KeyValue> writes) {
+                batches[0]++;
+                rowsInBatch[0] = writes.size();
+                delegate.writeBatch(writes);
+            }
+        };
+
+        Catalog catalog = Catalog.open(kv);
+        catalog.createTable("t", userColumns());
+
+        assertEquals(1, batches[0], "建表的元数据必须只走一条批记录");
+        // 表记录 1 条 + 列记录 3 条 + 计数器 1 条
+        assertEquals(5, rowsInBatch[0]);
+    }
+
+    @Test
+    void truncateWritesAllMetadataInOneBatch() {
+        FakeKvStore delegate = new FakeKvStore();
+        int[] batches = {0};
+        KvStore kv = new KvStore() {
+            @Override
+            public byte[] get(byte[] key) {
+                return delegate.get(key);
+            }
+
+            @Override
+            public void put(byte[] key, byte[] value) {
+                delegate.put(key, value);
+            }
+
+            @Override
+            public java.util.List<KeyValue> scan(byte[] start, byte[] end, int limit) {
+                return delegate.scan(start, end, limit);
+            }
+
+            @Override
+            public void writeBatch(java.util.List<KeyValue> writes) {
+                batches[0]++;
+                delegate.writeBatch(writes);
+            }
+        };
+        Catalog catalog = Catalog.open(kv);
+        catalog.createTable("t", userColumns());
+        int before = batches[0];
+        catalog.truncateTable("t");
+        assertEquals(before + 1, batches[0], "TRUNCATE 的元数据必须只走一条批记录");
     }
 
     @Test

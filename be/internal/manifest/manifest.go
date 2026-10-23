@@ -1,10 +1,10 @@
 // Package manifest 维护数据库版本状态:当前有效的 segment 集合与当前 WAL 编号。
 //
 // 更新策略:
-//   1. 将新状态写入 MANIFEST-<new>.tmp
-//   2. fsync 后 rename 为 MANIFEST-<new>
-//   3. 将 MANIFEST-<new> 文件名写入 CURRENT.tmp
-//   4. fsync 后 rename 为 CURRENT
+//  1. 将新状态写入 MANIFEST-<new>.tmp
+//  2. fsync 后 rename 为 MANIFEST-<new>
+//  3. 将 MANIFEST-<new> 文件名写入 CURRENT.tmp
+//  4. fsync 后 rename 为 CURRENT
 //
 // 这样 CURRENT 永远指向完整可用的 MANIFEST 文件。
 package manifest
@@ -22,19 +22,27 @@ import (
 	"sync"
 )
 
+// FormatVersion 是 P3 起的数据目录格式版本(SPEC-P3 §5.4 / FR-335)。
+//
+// 2 = 版本段按 ^commit_ts 存放。P2 及以前把版本段固定写成 0x00×8,
+// 两种语义混在一棵 LSM 里会产生静默的可见性错误,因此老目录必须被拒绝。
+const FormatVersion uint64 = 2
+
 // Manifest 描述数据库某一时刻的版本状态。
 type Manifest struct {
-	Version      uint64   `json:"version"`
-	Segments     []uint64 `json:"segments"`      // 有效 segment 编号(按创建顺序,旧到新)
-	NextSegment  uint64   `json:"next_segment"`  // 下一个 segment 编号
-	NextWAL      uint64   `json:"next_wal"`      // 下一个 WAL 编号
+	Version       uint64   `json:"version"`
+	FormatVersion uint64   `json:"format_version"` // P3 起固定为 2
+	LastCommitTS  uint64   `json:"last_commit_ts"` // 已落盘数据中的最大 commit_ts
+	Segments      []uint64 `json:"segments"`       // 有效 segment 编号(按创建顺序,旧到新)
+	NextSegment   uint64   `json:"next_segment"`   // 下一个 segment 编号
+	NextWAL       uint64   `json:"next_wal"`       // 下一个 WAL 编号
 }
 
 // Registry 管理 CURRENT 与 MANIFEST 文件的原子更新。
 type Registry struct {
-	mu       sync.Mutex
-	dir      string
-	current  uint64 // 当前 MANIFEST 编号
+	mu      sync.Mutex
+	dir     string
+	current uint64 // 当前 MANIFEST 编号
 }
 
 // Open 打开数据目录下的 manifest 系统。若 CURRENT 不存在则创建初始版本。
@@ -48,10 +56,19 @@ func Open(dir string) (*Registry, *Manifest, error) {
 		return nil, nil, err
 	}
 	if m == nil {
-		m = &Manifest{Version: 1, NextSegment: 1, NextWAL: 1}
+		// 空目录首次启动:写入 P3 的格式版本。
+		m = &Manifest{Version: 1, FormatVersion: FormatVersion, NextSegment: 1, NextWAL: 1}
 		if err := r.Save(m); err != nil {
 			return nil, nil, err
 		}
+		return r, m, nil
+	}
+	// 格式版本守卫(SPEC-P3 FR-362 / K54):缺失或不是 2 一律拒绝启动,
+	// 不静默兼容、不自动迁移 —— 混用会静默读错数据。
+	if m.FormatVersion != FormatVersion {
+		return nil, nil, fmt.Errorf(
+			"数据目录格式版本 %d 与本期(%d)不兼容:请清空数据目录后重启",
+			m.FormatVersion, FormatVersion)
 	}
 	return r, m, nil
 }

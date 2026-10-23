@@ -58,8 +58,11 @@ public final class Parser {
             case "UPDATE" -> parseUpdate();
             case "DELETE" -> parseDelete();
             case "SELECT" -> parseSelect();
+            case "BEGIN" -> parseBegin();
+            case "COMMIT" -> parseCommit();
+            case "ROLLBACK" -> parseRollback();
             default -> throw error("不支持的语句: " + t.text()
-                    + "(支持 CREATE/DROP/TRUNCATE/SHOW/DESC/INSERT/UPDATE/DELETE/SELECT)");
+                    + "(支持 CREATE/DROP/TRUNCATE/SHOW/DESC/INSERT/UPDATE/DELETE/SELECT/BEGIN/COMMIT/ROLLBACK)");
         };
     }
 
@@ -113,6 +116,29 @@ public final class Parser {
                     + "(支持 INT / BIGINT / DOUBLE / VARCHAR(n) / DATE / BOOLEAN)");
         }
         return type;
+    }
+
+    // ------------------------------------------------------------ 事务控制(P3)
+
+    private Ast.Statement parseBegin() {
+        advance(); // BEGIN
+        // 兼容常见的 BEGIN TRANSACTION / BEGIN WORK 写法(都不改变语义)。
+        if (!matchKeyword("TRANSACTION")) {
+            matchKeyword("WORK");
+        }
+        return new Ast.Begin();
+    }
+
+    private Ast.Statement parseCommit() {
+        advance(); // COMMIT
+        matchKeyword("WORK");
+        return new Ast.Commit();
+    }
+
+    private Ast.Statement parseRollback() {
+        advance(); // ROLLBACK
+        matchKeyword("WORK");
+        return new Ast.Rollback();
     }
 
     private Ast.Statement parseDrop() {

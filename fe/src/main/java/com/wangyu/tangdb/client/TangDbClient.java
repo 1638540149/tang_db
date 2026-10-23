@@ -1,8 +1,15 @@
 package com.wangyu.tangdb.client;
 
 import com.google.protobuf.ByteString;
+import com.wangyu.tangdb.proto.AbortTxnRequest;
+import com.wangyu.tangdb.proto.AbortTxnResponse;
+import com.wangyu.tangdb.proto.BeginTxnRequest;
+import com.wangyu.tangdb.proto.BeginTxnResponse;
+import com.wangyu.tangdb.proto.CommitTxnRequest;
+import com.wangyu.tangdb.proto.CommitTxnResponse;
 import com.wangyu.tangdb.proto.GetRequest;
 import com.wangyu.tangdb.proto.GetResponse;
+import com.wangyu.tangdb.proto.Kv;
 import com.wangyu.tangdb.proto.PingRequest;
 import com.wangyu.tangdb.proto.PingResponse;
 import com.wangyu.tangdb.proto.PutRequest;
@@ -11,9 +18,12 @@ import com.wangyu.tangdb.proto.RowBatch;
 import com.wangyu.tangdb.proto.ScanRequest;
 import com.wangyu.tangdb.proto.StatusCode;
 import com.wangyu.tangdb.proto.TangDbGrpc;
+import com.wangyu.tangdb.storage.ConflictException;
+import com.wangyu.tangdb.storage.KeyCodec;
 import com.wangyu.tangdb.storage.KeyValue;
 import com.wangyu.tangdb.storage.KvStore;
 import com.wangyu.tangdb.storage.StoreException;
+import com.wangyu.tangdb.storage.TransactionStore;
 
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
@@ -32,7 +42,7 @@ import java.util.concurrent.TimeUnit;
  * <p>只通过 {@code proto/tangdb.proto} 定义的接口与 BE 通信，不读写 BE 的任何数据文件。
  * 所有失败都转换成带中文提示的 {@link ClientException}，调用方无需处理 gRPC 异常类型。</p>
  */
-public class TangDbClient implements AutoCloseable, KvStore {
+public class TangDbClient implements AutoCloseable, KvStore, TransactionStore {
 
     /** 默认 BE 地址。 */
     public static final String DEFAULT_HOST = "127.0.0.1";
@@ -141,9 +151,16 @@ public class TangDbClient implements AutoCloseable, KvStore {
     // ------------------------------------------------------------ 原始 KV 接口(KvStore)
 
     /**
-     * 读取原始 key;不存在返回 null。
+     * 读取原始 key 的最新已提交版本;不存在返回 null。
      */
     public byte[] getRaw(byte[] key) throws ClientException {
+        return getRaw(key, 0);
+    }
+
+    /**
+     * 在指定快照下读取原始 key(snapshot = 0 表示最新已提交);不存在返回 null。
+     */
+    public byte[] getRaw(byte[] key, long snapshot) throws ClientException {
         if (key == null || key.length == 0) {
             throw new ClientException("key 不能为空", "INVALID_ARGUMENT");
         }
@@ -151,6 +168,7 @@ public class TangDbClient implements AutoCloseable, KvStore {
         try {
             response = stubWithDeadline().get(GetRequest.newBuilder()
                     .setKey(ByteString.copyFrom(key))
+                    .setSnapshot(Math.max(snapshot, 0))
                     .build());
         } catch (StatusRuntimeException e) {
             throw translate(e, host, port);
@@ -190,6 +208,16 @@ public class TangDbClient implements AutoCloseable, KvStore {
      * 不能当成正常截断(规约 FR-106)。</p>
      */
     public List<KeyValue> scanRaw(byte[] start, byte[] end, int limit) throws ClientException {
+        return scanRaw(start, end, 0, limit);
+    }
+
+    /**
+     * 在指定快照下按用户键范围 [start, end) 扫描(snapshot = 0 表示最新)。
+     *
+     * <p>返回的 key 已剥掉 BE 维护的版本段,调用方只看到用户键。</p>
+     */
+    public List<KeyValue> scanRaw(byte[] start, byte[] end, long snapshot, int limit)
+            throws ClientException {
         List<KeyValue> rows = new ArrayList<>();
         Iterator<RowBatch> iterator;
         try {
@@ -197,6 +225,7 @@ public class TangDbClient implements AutoCloseable, KvStore {
                     .setStartKey(start == null ? ByteString.EMPTY : ByteString.copyFrom(start))
                     .setEndKey(end == null ? ByteString.EMPTY : ByteString.copyFrom(end))
                     .setLimit(Math.max(limit, 0))
+                    .setSnapshot(Math.max(snapshot, 0))
                     .build());
         } catch (StatusRuntimeException e) {
             throw translate(e, host, port);
@@ -211,7 +240,8 @@ public class TangDbClient implements AutoCloseable, KvStore {
                             + (detail == null || detail.isBlank() ? "" : ": " + detail), "SCAN_FAILED");
                 }
                 for (com.wangyu.tangdb.proto.Kv kv : batch.getRowsList()) {
-                    rows.add(new KeyValue(kv.getKey().toByteArray(), kv.getValue().toByteArray()));
+                    rows.add(new KeyValue(KeyCodec.userKey(kv.getKey().toByteArray()),
+                            kv.getValue().toByteArray()));
                 }
             }
         } catch (StatusRuntimeException e) {
@@ -245,6 +275,108 @@ public class TangDbClient implements AutoCloseable, KvStore {
         } catch (ClientException e) {
             throw new StoreException(e.getMessage(), e);
         }
+    }
+
+    @Override
+    public byte[] get(byte[] key, long snapshot) {
+        try {
+            return getRaw(key, snapshot);
+        } catch (ClientException e) {
+            throw new StoreException(e.getMessage(), e);
+        }
+    }
+
+    @Override
+    public List<KeyValue> scan(byte[] start, byte[] end, long snapshot, int limit) {
+        try {
+            return scanRaw(start, end, snapshot, limit);
+        } catch (ClientException e) {
+            throw new StoreException(e.getMessage(), e);
+        }
+    }
+
+    /** DDL 的多条元数据记录走一条 CommitTxn 批记录,原子生效(FR-355)。 */
+    @Override
+    public void writeBatch(List<KeyValue> writes) {
+        commit(0, 0, writes);
+    }
+
+    // ------------------------------------------------------------ 事务(TransactionStore)
+
+    @Override
+    public TxnHandle beginTxn() {
+        BeginTxnResponse response;
+        try {
+            response = stubWithDeadline().beginTxn(BeginTxnRequest.newBuilder()
+                    .setReadOnly(false)
+                    .build());
+        } catch (StatusRuntimeException e) {
+            throw new StoreException(translate(e, host, port).getMessage(), e);
+        }
+        if (response.getStatus() != StatusCode.OK) {
+            throw new StoreException("BEGIN 失败: " + detailOf(response.getStatus(), response.getMessage()));
+        }
+        return new TxnHandle(response.getTxnId(), response.getSnapshot());
+    }
+
+    @Override
+    public long commit(long txnId, long snapshot, List<KeyValue> writes) {
+        if (writes == null || writes.isEmpty()) {
+            if (txnId != 0) {
+                abort(txnId);
+            }
+            return 0;
+        }
+        CommitTxnRequest.Builder builder = CommitTxnRequest.newBuilder()
+                .setTxnId(txnId)
+                .setSnapshot(Math.max(snapshot, 0));
+        for (KeyValue write : writes) {
+            builder.addWrites(Kv.newBuilder()
+                    .setKey(ByteString.copyFrom(write.key()))
+                    .setValue(ByteString.copyFrom(write.value() == null ? new byte[0] : write.value())));
+        }
+
+        CommitTxnResponse response;
+        try {
+            response = stubWithDeadline().commitTxn(builder.build());
+        } catch (StatusRuntimeException e) {
+            throw new StoreException(translate(e, host, port).getMessage(), e);
+        }
+
+        if (response.getStatus() == StatusCode.CONFLICT) {
+            throw new ConflictException("写写冲突", response.getConflictKey().toByteArray());
+        }
+        if (response.getStatus() != StatusCode.OK) {
+            throw new StoreException("COMMIT 失败: "
+                    + detailOf(response.getStatus(), response.getMessage()));
+        }
+        return response.getCommitTs();
+    }
+
+    @Override
+    public void abort(long txnId) {
+        if (txnId == 0) {
+            return;
+        }
+        try {
+            AbortTxnResponse response = stubWithDeadline().abortTxn(AbortTxnRequest.newBuilder()
+                    .setTxnId(txnId)
+                    .build());
+            if (response.getStatus() != StatusCode.OK) {
+                throw new StoreException("ROLLBACK 失败: "
+                        + detailOf(response.getStatus(), response.getMessage()));
+            }
+        } catch (StatusRuntimeException e) {
+            throw new StoreException(translate(e, host, port).getMessage(), e);
+        }
+    }
+
+    private static String detailOf(StatusCode status, String detail) {
+        String message = describeStatus(status);
+        if (detail != null && !detail.isBlank()) {
+            message += ":" + detail;
+        }
+        return message;
     }
 
     /**
@@ -311,6 +443,8 @@ public class TangDbClient implements AutoCloseable, KvStore {
                 return "参数无效";
             case INTERNAL:
                 return "BE 内部错误";
+            case CONFLICT:
+                return "写写冲突";
             case STATUS_UNSPECIFIED:
                 return "BE 未返回状态";
             case UNRECOGNIZED:

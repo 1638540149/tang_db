@@ -26,6 +26,7 @@ class TangDbClientTest {
         assertEquals("键不存在", TangDbClient.describeStatus(StatusCode.NOT_FOUND));
         assertEquals("参数无效", TangDbClient.describeStatus(StatusCode.INVALID_ARGUMENT));
         assertEquals("BE 内部错误", TangDbClient.describeStatus(StatusCode.INTERNAL));
+        assertEquals("写写冲突", TangDbClient.describeStatus(StatusCode.CONFLICT));
         assertEquals("BE 未返回状态", TangDbClient.describeStatus(StatusCode.STATUS_UNSPECIFIED));
         assertEquals("无法识别的状态码", TangDbClient.describeStatus(StatusCode.UNRECOGNIZED));
         assertEquals("未知状态", TangDbClient.describeStatus(null));

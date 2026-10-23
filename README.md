@@ -73,8 +73,9 @@ flowchart LR
 ```
 tang_db/
 ├── config/                     两个进程的配置(一行一项 key = value)
-│   ├── be.conf                 数据层:data_dir / port / memtable_size / fe_host / fe_port / heartbeat_interval_seconds
-│   └── fe.conf                 客户端层:be_host / be_port / heartbeat_listen_port / be_offline_cycles
+│   ├── be.conf                 数据层:data_dir / port / memtable_size / fe_host / fe_port /
+│   │                                  heartbeat_interval_seconds / max_txn_write_bytes / test_crash_point
+│   └── fe.conf                 客户端层:be_host / be_port / heartbeat_listen_port / be_offline_cycles / heartbeat_enabled
 ├── proto/tangdb.proto          FE 与 BE 之间唯一的接口契约
 ├── be/                         Go —— 数据层
 │   ├── go.mod
@@ -156,21 +157,19 @@ config/
 ./scripts/start-be.sh
 # === Building BE ===
 # === Starting BE (config: ...\config\be.conf) ===
-# 2026-10-22 ... INFO 正在启动 tang_db BE version=P1-0.1.0 config=...\config\be.conf data_dir=./data/BE port=9100 memtable_size=67108864
-# 2026-10-22 ... INFO 恢复完成 segments_loaded=0 wal_replayed=0
-# 2026-10-22 ... INFO BE 已就绪 listen=127.0.0.1:9100
+# 2026-10-23 ... INFO 正在启动 tang_db BE version=P3-0.1.0 config=...\config\be.conf data_dir=./data/BE port=9100 memtable_size=67108864 max_txn_write_bytes=67108864
+# 2026-10-23 ... INFO 恢复完成 segments_loaded=0 wal_replayed=0
+# 2026-10-23 ... INFO BE 已就绪 listen=127.0.0.1:9100
 ```
 
-终端 B —— 起客户端:
+终端 B —— 起客户端(SQL 控制台 + `ping`;P1 的 `put`/`get` 裸命令按 K59 不再恢复):
 
 ```bash
 ./scripts/start-fe.sh
-# tangdb> put name wangyu
-# OK
-# tangdb> get name
-# wangyu
-# tangdb> get no-such-key
-# 错误:键不存在
+# tangdb> ping
+# BE 版本: P3-0.1.0
+# tangdb> CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(32));
+# OK, 表 t 已创建(表 ID 16)
 ```
 
 ### 用 SQL:建表、写入、查询、改、删(P2)
@@ -303,9 +302,119 @@ tangdb> SHOW DATABASES;
 P2 的 SQL 边界(一期一期加,别当成完整 SQL):
 
 - 支持:`CREATE / DROP / TRUNCATE TABLE`、`SHOW TABLES` / `SHOW DATABASES`、`DESC`、`INSERT`(多行,可省略列名列表)、`UPDATE`、`DELETE`、`SELECT 列/*/AS` + `WHERE`(`=` `<>` `<` `<=` `>` `>=`、`AND`/`OR`、`IN`)+ `LIMIT`;标识符可用反引号包裹
+- **P3 新增**:`BEGIN` / `COMMIT` / `ROLLBACK`(`BEGIN TRANSACTION` / `COMMIT WORK` 也可);事务提示符为 `tangdb(txn)>`
 - 不做(留给后面几期):JOIN、聚合、GROUP BY、子查询、ORDER BY、表达式与函数、二级索引;`NOT` / `IS [NOT] NULL` / `LIKE` / `BETWEEN` 归 P5
 - 主键:单列,类型限 `INT` / `BIGINT` / `VARCHAR` / `DATE`
 - 一条端到端功能测试:`bash scripts/p2-test.sh`(11 个场景 + P2.1 兼容性断言,52 条断言,含强杀重启、心跳判死、跨内存/磁盘)
+
+### P3 事务与 MVCC:并发写不再静默覆盖(P3)
+
+下面两段都是**实际运行**的输出。
+
+**① 提交 / 回滚 / 读己之写**
+
+```sql
+tangdb> CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(32));
+OK, 表 t 已创建(表 ID 16)
+
+tangdb> BEGIN;
+OK, 事务已开始(snapshot = 18)
+
+tangdb(txn)> INSERT INTO t VALUES (1, 'a');
+OK, 1 row affected
+tangdb(txn)> INSERT INTO t VALUES (2, 'b');
+OK, 1 row affected
+tangdb(txn)> SELECT * FROM t;
++----+------+
+| id | name |
++----+------+
+| 1  | a    |
+| 2  | b    |
++----+------+
+(2 rows)                      -- 读己之写:本事务刚插入的行自己可见
+
+tangdb(txn)> COMMIT;
+OK, 事务已提交(commit_ts = 19)
+
+tangdb> BEGIN;
+OK, 事务已开始(snapshot = 19)
+
+tangdb(txn)> UPDATE t SET name = 'x' WHERE id = 1;
+OK, 1 row affected
+tangdb(txn)> ROLLBACK;
+OK, 已回滚
+
+tangdb> SELECT * FROM t WHERE id = 1;
++----+------+
+| id | name |
++----+------+
+| 1  | a    |                -- 回滚后与事务前完全一致(未提交数据从未落盘)
++----+------+
+(1 row)
+```
+
+**② 两个会话抢同一行:后到的被明确拒绝,绝不静默覆盖**
+
+两个终端都连同一个 BE;第二个及以后的会话用 `heartbeat_enabled = false` 启动(否则心跳端口会冲突)。
+按时间顺序:A 先 `BEGIN; UPDATE ...;`(未提交),B 再 `BEGIN; UPDATE ...;`(未提交),A 先 `COMMIT`,B 后 `COMMIT`。
+
+```
+# 会话 A(默认 config/fe.conf,持有心跳端口 9091)
+tangdb> BEGIN;
+OK, 事务已开始(snapshot = 21)
+tangdb(txn)> UPDATE t SET name = 'A' WHERE id = 1;
+OK, 1 row affected
+tangdb(txn)> COMMIT;
+OK, 事务已提交(commit_ts = 22)
+
+# 会话 B(另一份 fe.conf:heartbeat_enabled = false)
+tangdb> BEGIN;
+OK, 事务已开始(snapshot = 21)          -- 与 A 相同的快照
+tangdb(txn)> UPDATE t SET name = 'B' WHERE id = 1;
+OK, 1 row affected                      -- 写集只在 B 的内存里
+tangdb(txn)> COMMIT;
+错误：表 t 主键 1 写写冲突(该行在本事务开始后被其它事务修改,请重试)
+提示：事务仍在进行中，可继续执行或 ROLLBACK
+tangdb(txn)> exit
+已丢弃未提交事务(CLI 退出)
+
+# 再查:数据库里是 A 的值,B 没有覆盖 A
+tangdb> SELECT * FROM t WHERE id = 1;
+| 1  | A |
+```
+
+P3 的语义边界(详见 `specs/P3-transactions-mvcc.md` §2.3):
+
+- 一个事务要么全生效、要么全不发生;`COMMIT` 返回 OK ⇔ 批记录已 fsync
+- 快照隔离(SI):事务内反复读同一行结果稳定;读不到未来数据;不做 SSI(理论上仍有写偏斜)
+- 写写冲突:**报错、整批不写、不自动重试、不排队、不静默覆盖**
+- `commit_ts` 单调不回退、可跳号;未提交写集只活在 FE 内存,`ROLLBACK` 是零成本
+- 不支持:`READ UNCOMMITTED` / savepoint / 嵌套事务 / 分布式事务 / 死锁检测 / 事务超时
+
+**升级到 P3 必须清空数据目录。** P3 起数据目录格式版本 = 2(版本段语义从 P2 的固定 0 改成 `^commit_ts`);
+老目录(无 `format_version` 或 = 1)会**明确拒绝启动**:
+
+```
+错误：打开存储引擎失败: 数据目录格式版本 1 与本期(2)不兼容:请清空数据目录后重启
+```
+
+```bash
+taskkill /F /IM be.exe
+rm -rf data/BE          # 日常开发目录;测试脚本各自用独立目录,不受影响
+./scripts/start-be.sh
+```
+
+**验收开关(默认关闭,仅验收使用)**
+
+- `config/be.conf` 的 `test_crash_point`:取值 `before_wal` / `after_fsync` / `after_memtable` / `before_ok`,
+  命中一次即让 BE 进程立即退出(模拟强杀)。启动日志会打印 `WARN 崩溃注入已启用:...`。
+  **风险**:打开后任何一次提交都会杀掉进程,绝不能用于日常运行。
+- `config/fe.conf` 的 `heartbeat_enabled`:默认 `true`(P2 行为不变:心跳端口被占用即启动失败);
+  设为 `false` 时不绑心跳端口、不启动 FE 侧 gRPC 服务,SQL 照常 —— 这是同机开多个 CLI 会话做并发验收的前提。
+- `config/be.conf` 的 `max_txn_write_bytes`:单事务写入量上限(默认 `64MB`),超限报
+  `事务写入量超过上限(64MB)` 且不写任何数据。
+- 一键验收:`bash scripts/p3-test.sh`(SC-201 ~ SC-211,报告在 `tmp/p3-test/report.txt`),
+  其中会顺带跑 `p2-test.sh` 与 `crash-test.sh` 做回归。
 
 ### 最强的那个动作:强杀后重启,数据还在
 
@@ -313,7 +422,7 @@ P2 的 SQL 边界(一期一期加,别当成完整 SQL):
 taskkill /F /IM be.exe      # 强杀,不给它正常退出的机会
 ./scripts/start-be.sh
 # 恢复完成 segments_loaded=2 wal_replayed=37
-# 再 get,数据一条没少
+# 再查,数据一条没少
 ```
 
 ### 崩溃测试(一键)
@@ -333,33 +442,58 @@ bash scripts/gen-proto.sh
 
 ## 状态
 
-**P1(基座)已完成并通过独立验收。P2(表与 SQL)已实现完成并通过独立核验。P2.1(SQL 兼容性补齐:反引号 / 省略列名 / SHOW DATABASES)已实现。**
+**P1(基座)、P2(表与 SQL)、P2.1(SQL 兼容性补齐)、P3(事务与 MVCC)均已实现并通过核验。**
 
 核验口径(真实执行,不看实现方自述):
 
-- `bash scripts/p2-test.sh` —— 11 个场景 + P2.1 断言组 / 52 条断言全 PASS(含 4 个 ★:元数据重启不丢、心跳判死与自动恢复、跨内存/磁盘查询、强杀后零丢失)
+- `bash scripts/p3-test.sh` —— SC-201 ~ SC-211,**62 条断言全 PASS**(事务语义、并发写写冲突、4 个崩溃场景、序号不回退、快照稳定、DDL 原子性、P2/P1 回归、依赖红线)
+- `bash scripts/p2-test.sh` —— 11 个场景 + P2.1 断言组 / **52 条断言全 PASS**
 - `bash scripts/crash-test.sh` —— P1 回归:1000 条随机 KV,强杀重启后**丢失 0 条**
 - `cd be && go build ./... && go vet ./... && go test ./...` —— 全绿
-- `cd fe && mvn.cmd test` —— 133 个用例全绿
+- `cd fe && mvn.cmd test` —— **152 个用例全绿**
+- 单行 INSERT 延迟(n=1000,自动提交,含一次 WAL fsync,三次独立运行):
+  **avg 3.5–6.2ms / p50 2.5–7.3ms / p99 9.0–12.0ms**
+  (对比 SPEC-P2 SC-112 基线 `< 10ms`;p50 稳定低于 10ms,p99 随本机 fsync 尾部抖动。
+  瓶颈是每次提交的一次 `fsync`(P2 相同),不是 P3 新增的版本分组/冲突检测;
+  `scripts/p3-test.sh` 把这条记为 NOTE 而不是 FAIL,真实数字每次都写进报告)
 
-已知缺口(记在 `specs/P2-table-and-sql.md` §11 待补充,未修):
+P3 带来什么:
 
-- `put` / `get` 裸命令被 SQL 取代(与 P1 规约 FR-028 冲突,待拍板)
-- BE 在 FE 重启后不会重新注册,`SHOW BACKENDS` 会一直为空
-- FE 心跳端口硬绑定,同时只能跑一个 FE/CLI
+- `BEGIN` / `COMMIT` / `ROLLBACK`;事务内写集只活在 FE 内存,读己之写,`ROLLBACK` 零成本
+- 快照隔离:事务开始时固定 `snapshot`,事务内反复读同一行结果稳定
+- 原子批写:一个事务的全部写入是**同一条 WAL 批记录**,一次 fsync,要么全在要么全无;
+  事务外的单条 DML(含多行 `INSERT`)是一个自动提交事务,任一组失败则整条语句不写任何行
+- 写写冲突:快照之后被改过 → `CONFLICT`,整批不写,FE 报"表 t 主键 x 写写冲突"
+- `commit_ts` 单调不回退(允许跳号);`MANIFEST.last_commit_ts` 保证数据只在 segment 里也不回退
+- DDL 的表记录 + 全部列记录 + 计数器在同一条批记录里原子生效
+- 同机多 CLI 会话:`heartbeat_enabled = false` 不绑心跳端口;未知 `be_id` 心跳隐式注册
+
+已知限制 / 规格冲突(不影响本期验收,已记录):
+
+- **SC-203 对 `after_fsync` 的字面要求与提交协议冲突**:SPEC-P3 SC-203 写"after_fsync → 不可见",
+  但 FR-313/315(记录完整 + CRC 通过 = 已提交)、场景 6 ③ 与设计方案 §14 都要求"WAL 已刷盘但 memtable 未写崩 → 重放后全有"。
+  实现按 FR/设计文档执行:`after_fsync` 后重启该事务**可见**;`p3-test.sh` 的报告中已标注该 NOTE。
+- **范围扫描要求用户键两两不互为前缀**:P3 的 key 布局是"用户键 + 8 字节版本段",当用户键 A 是用户键 B 的前缀时
+  (`key-1` / `key-10`),完整 key 的字节序与用户键序不一致。FE 的主键编码(定长数值 / `0x00` 终止的 VARCHAR)
+  保证用户键两两不互为前缀,所以 SQL 路径不受影响;点查与冲突检测已额外处理前缀关系(P1 的 `crash-test.sh` 用
+  `key-1`/`key-10` 验证过)。原生的**范围扫描**在互为前缀的原始键上不保证用户键升序 —— 这是 P3 的格式约束,
+  记在 `specs/P3-transactions-mvcc.md` §12 待补充。
+- `put` / `get` 裸命令不恢复(K59:CLI = SQL 控制台 + `ping`)
+- 不做 SSI / 间隙锁 / savepoint / 嵌套事务 / 分布式事务 / 死锁检测 / 事务超时 / version GC(归 P5)
 
 已完成:
 
 - 仓库初始化、README、`.gitignore`
 - 项目结构骨架:`config/` `proto/` `be/` `fe/` `tools/` `scripts/`
-- **配置**:两个进程的配置放进 `config/be.conf`、`config/fe.conf`,命令行参数可覆盖(2026-10-22 修订)
-- 接口契约 `proto/tangdb.proto`(`Ping` / `Put` / `Get`)
-- **BE 最小可用 LSM**:WAL(CRC32C + fsync)、跳表 memtable、列式 segment、MANIFEST 原子版本管理
-- **崩溃恢复**:启动时载入 segment + 重放 WAL,尾部坏记录就地截断
-- **FE**:gRPC 客户端封装 + 命令行客户端
-- **崩溃测试**:1000 条随机 KV,强杀两个进程后重启逐条校验,**丢失 0 条**
+- **配置**:两个进程的配置放进 `config/be.conf`、`config/fe.conf`,命令行参数可覆盖
+- 接口契约 `proto/tangdb.proto`(`Ping` / `Put` / `Get` / `Scan` / `BeginTxn` / `CommitTxn` / `AbortTxn`)
+- **BE LSM**:WAL(CRC32C + fsync + 批记录)、跳表 memtable、列式 segment、MANIFEST 原子版本管理
+- **崩溃恢复**:载入 segment + 重放 WAL,尾部坏记录物理截断;数据目录格式版本守卫
+- **FE**:gRPC 客户端封装 + SQL 控制台 + catalog(元数据存在 BE 系统表)
+- **事务与 MVCC**:commit_ts、快照读与版本分组、原子批写、写写冲突、序号持久化
+- **一键验收**:`p3-test.sh` / `p2-test.sh` / `crash-test.sh`
 
-下一步:**P2 · 表与 SQL** —— 引入元数据(存进 BE 自身系统表)、DDL/DML/条件查询、BE 注册与心跳上报。
+下一步:**P4 · 索引** —— 主键/二级/唯一索引与索引选择;版本回收与 compaction 归 P5。
 
 ---
 

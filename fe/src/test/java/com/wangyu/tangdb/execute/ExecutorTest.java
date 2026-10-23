@@ -62,14 +62,14 @@ class ExecutorTest {
     }
 
     @Test
-    void multiRowInsertConflictReportsGroupAndKeepsWrittenRows() {
+    void multiRowInsertIsAtomicWhenOneGroupConflicts() {
+        // P3:一条 INSERT 是一个自动提交事务,冲突时整条语句不写任何行。
         dml("INSERT INTO users (id, name) VALUES (10, 'a')");
         StoreException e = assertThrows(StoreException.class, () -> executor.execute(Parser.parse(
                 "INSERT INTO users (id, name) VALUES (11, 'b'), (10, 'dup'), (12, 'c')")));
         assertTrue(e.getMessage().contains("第 2 组"), e.getMessage());
-        assertTrue(e.getMessage().contains("此前已写入 1 行"), e.getMessage());
 
-        assertEquals(1, select("SELECT * FROM users WHERE id = 11").rows().size());
+        assertEquals(0, select("SELECT * FROM users WHERE id = 11").rows().size());
         assertEquals(0, select("SELECT * FROM users WHERE id = 12").rows().size());
     }
 
@@ -271,9 +271,8 @@ class ExecutorTest {
         StoreException e = assertThrows(StoreException.class, () -> executor.execute(Parser.parse(
                 "INSERT INTO users VALUES (1, 'a', '北京', 20), (2, 'b')")));
         assertTrue(e.getMessage().contains("第 2 组取值个数(2)与列数(4)不一致"), e.getMessage());
-        // 出错的那一组不写半行;此前已成功的组保留(与主键冲突时的口径一致)
-        assertEquals(1, select("SELECT * FROM users").rows().size());
-        assertEquals(1, select("SELECT * FROM users WHERE id = 1").rows().size());
+        // P3:整条 INSERT 是一个事务,任何一组非法都不写任何行。
+        assertEquals(0, select("SELECT * FROM users").rows().size());
     }
 
     @Test
@@ -304,9 +303,9 @@ class ExecutorTest {
         StoreException e = assertThrows(StoreException.class, () -> executor.execute(Parser.parse(
                 "INSERT INTO users VALUES (2, 'b', '上海', 21), (1, 'dup', '上海', 22)")));
         assertTrue(e.getMessage().contains("第 2 组主键冲突"), e.getMessage());
-        assertTrue(e.getMessage().contains("此前已写入 1 行"), e.getMessage());
+        // 原子性:失败的那条语句不写入任何行;此前已提交的 seed 行(1)保持不变。
         assertEquals(1, select("SELECT * FROM users WHERE id = 1").rows().size());
-        assertEquals(1, select("SELECT * FROM users WHERE id = 2").rows().size());
+        assertEquals(0, select("SELECT * FROM users WHERE id = 2").rows().size());
     }
 
     // ------------------------------------------------------------ P2.1 SHOW DATABASES

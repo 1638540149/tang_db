@@ -80,9 +80,19 @@ func run() error {
 		"data_dir", cfg.DataDir,
 		"port", cfg.Port,
 		"memtable_size", cfg.MemTableSize,
+		"max_txn_write_bytes", cfg.MaxTxnWriteBytes,
 	)
 
-	engine, stats, err := store.Open(cfg.DataDir, cfg.MemTableSize)
+	// FR-365:崩溃注入必须在启动日志里显眼告警(仅验收使用)。
+	if cfg.TestCrashPoint != "" {
+		slog.Warn("WARN 崩溃注入已启用:"+cfg.TestCrashPoint+"(仅验收使用)", "test_crash_point", cfg.TestCrashPoint)
+	}
+
+	engine, stats, err := store.OpenWithOptions(cfg.DataDir, store.Options{
+		MemtableSize:     cfg.MemTableSize,
+		MaxTxnWriteBytes: cfg.MaxTxnWriteBytes,
+		TestCrashPoint:   cfg.TestCrashPoint,
+	})
 	if err != nil {
 		return fmt.Errorf("打开存储引擎失败: %w", err)
 	}

@@ -21,22 +21,26 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * tang_db 命令行客户端(P2 起是 SQL 客户端)。
+ * tang_db 命令行客户端(P3 起是带事务的 SQL 控制台)。
  *
  * <p>启动顺序:加载配置 → 连接 BE 并加载 catalog(BE 不可用则启动失败,FR-111)
- * → 启动 FE 心跳服务(9091)→ 进入 SQL 循环。</p>
+ * → 按 heartbeat_enabled 决定是否启动 FE 心跳服务 → 进入 SQL 循环。</p>
  *
- * <p>所有错误只输出中文提示,绝不向用户打印 Java 堆栈(FR-173)。</p>
+ * <p>所有错误只输出中文提示,绝不向用户打印 Java 堆栈(FR-173 / FR-363)。</p>
  */
 public final class Cli {
 
     static final String USAGE =
             "用法: java com.wangyu.tangdb.client.Cli [--config <file>] [--be-host <host>] [--be-port <port>]\n"
             + "配置: 默认读 " + FeConfig.DEFAULT_PATH + ",命令行参数覆盖配置文件\n"
-            + "命令: SQL 以 ; 结束;SHOW TABLES | SHOW DATABASES | DESC <表> | SHOW BACKENDS | exit";
+            + "命令: SQL 以 ; 结束;BEGIN / COMMIT / ROLLBACK | SHOW TABLES | SHOW DATABASES | "
+            + "DESC <表> | SHOW BACKENDS | exit";
 
     private static final String PROMPT = "tangdb> ";
+    private static final String TXN_PROMPT = "tangdb(txn)> ";
     private static final String CONTINUATION_PROMPT = "    -> ";
+    private static final String HEARTBEAT_DISABLED_BACKENDS =
+            "本会话未启用心跳监听(heartbeat_enabled = false),看不到 BE 状态";
 
     private Cli() {
     }
@@ -73,8 +77,12 @@ public final class Cli {
         }
 
         out.println("tang_db 命令行客户端（BE " + config.host() + ":" + config.port()
-                + "，FE 心跳端口 " + feConfig.heartbeatListenPort() + "）");
-        out.println("输入 SQL 以 ; 结束;可用: SHOW TABLES | SHOW DATABASES | DESC <表> | SHOW BACKENDS | exit");
+                + "，" + (feConfig.heartbeatEnabled()
+                        ? "FE 心跳端口 " + feConfig.heartbeatListenPort()
+                        : "本会话未启用心跳监听")
+                + "）");
+        out.println("输入 SQL 以 ; 结束;可用: BEGIN / COMMIT / ROLLBACK | SHOW TABLES | "
+                + "SHOW DATABASES | DESC <表> | SHOW BACKENDS | exit");
 
         TangDbClient client;
         try {
@@ -98,19 +106,23 @@ public final class Cli {
             }
 
             BackendRegistry registry = new BackendRegistry(feConfig.beOfflineCycles());
-            FeGrpcServer server;
-            try {
-                server = FeGrpcServer.start(feConfig.heartbeatListenPort(), registry);
-            } catch (FeStartupException e) {
-                err.println("错误：FE 启动失败：" + e.getMessage());
-                return 1;
+            FeGrpcServer server = null;
+            if (feConfig.heartbeatEnabled()) {
+                try {
+                    server = FeGrpcServer.start(feConfig.heartbeatListenPort(), registry);
+                } catch (FeStartupException e) {
+                    err.println("错误：FE 启动失败：" + e.getMessage());
+                    return 1;
+                }
             }
 
             try {
                 Executor executor = new Executor(client, catalog);
                 return loop(in, out, err, config, feConfig, registry, executor, client);
             } finally {
-                server.close();
+                if (server != null) {
+                    server.close();
+                }
             }
         } catch (RuntimeException e) {
             printInternalError(err, e);
@@ -125,7 +137,8 @@ public final class Cli {
                             Executor executor, TangDbClient client) {
         SqlBuffer buffer = new SqlBuffer();
         while (true) {
-            out.print(buffer.hasPending() ? CONTINUATION_PROMPT : PROMPT);
+            String prompt = executor.inTransaction() ? TXN_PROMPT : PROMPT;
+            out.print(buffer.hasPending() ? CONTINUATION_PROMPT : prompt);
             out.flush();
 
             String line;
@@ -133,10 +146,12 @@ public final class Cli {
                 line = in.readLine();
             } catch (IOException e) {
                 err.println("错误：读取输入失败");
+                finishTransaction(executor, out);
                 return 1;
             }
             if (line == null) {
                 out.println();
+                finishTransaction(executor, out);
                 return 0;
             }
 
@@ -146,6 +161,7 @@ public final class Cli {
                     continue;
                 }
                 if (isExit(trimmed)) {
+                    finishTransaction(executor, out);
                     out.println("再见");
                     return 0;
                 }
@@ -154,8 +170,7 @@ public final class Cli {
                     continue;
                 }
                 if ("show backends".equalsIgnoreCase(trimmed)) {
-                    out.print(formatBackends(registry));
-                    out.flush();
+                    printBackends(out, feConfig, registry);
                     continue;
                 }
             }
@@ -163,44 +178,69 @@ public final class Cli {
             List<String> statements = buffer.append(line);
             for (String statement : statements) {
                 if (isExit(statement)) {
+                    finishTransaction(executor, out);
                     out.println("再见");
                     return 0;
                 }
                 if ("show backends".equalsIgnoreCase(statement)) {
-                    out.print(formatBackends(registry));
-                    out.flush();
+                    printBackends(out, feConfig, registry);
                     continue;
                 }
-                executeOne(statement, out, err, config, registry, executor, client);
+                executeOne(statement, out, err, config, feConfig, registry, executor);
             }
         }
     }
 
     private static void executeOne(String statement, PrintStream out, PrintStream err,
-                                   Config config, BackendRegistry registry,
-                                   Executor executor, TangDbClient client) {
+                                   Config config, FeConfig feConfig, BackendRegistry registry,
+                                   Executor executor) {
+        boolean failed = false;
         try {
-            ensureBackendAvailable(registry, config);
+            ensureBackendAvailable(feConfig, registry, config);
             Result result = executor.execute(Parser.parse(statement));
             printResult(result, out);
         } catch (ParseException e) {
+            failed = true;
             err.println("错误：" + e.getMessage());
         } catch (CatalogException e) {
+            failed = true;
             err.println("错误：" + e.getMessage());
         } catch (StoreException e) {
+            failed = true;
             err.println("错误：" + e.getMessage());
         } catch (ClientException e) {
+            failed = true;
             err.println("错误：" + e.getMessage());
         } catch (RuntimeException e) {
+            failed = true;
             printInternalError(err, e);
+        }
+        // FR-344:事务内语句失败不自动回滚,但必须让用户知道事务还在。
+        if (failed && executor.inTransaction()) {
+            err.println("提示：事务仍在进行中，可继续执行或 ROLLBACK");
+        }
+    }
+
+    /** CLI 退出时丢弃未提交事务(FR-345)。 */
+    private static void finishTransaction(Executor executor, PrintStream out) {
+        String message = executor.rollbackOnDisconnect();
+        if (message != null) {
+            out.println(message);
         }
     }
 
     /**
      * BE 存活判定:如果 FE 已经认识至少一个 BE 且全部判死,直接给出明确错误(FR-156),
      * 不让 SQL 请求挂在那里等超时。
+     *
+     * <p>heartbeat_enabled = false 时不看心跳(本来就没有),连接错误交给 gRPC 返回。</p>
      */
-    private static void ensureBackendAvailable(BackendRegistry registry, Config config) throws ClientException {
+    private static void ensureBackendAvailable(FeConfig feConfig, BackendRegistry registry,
+                                               Config config) throws ClientException {
+        // 心跳关闭时 registry 恒为空,直接用 gRPC 的真实结果,不误报"BE 不可用"。
+        if (!feConfig.heartbeatEnabled()) {
+            return;
+        }
         if (registry.all().isEmpty()) {
             return; // 还没收到注册(刚启动);真正的连接错误会由 gRPC 返回
         }
@@ -217,6 +257,16 @@ public final class Cli {
         }
         Result.Table table = (Result.Table) result;
         out.print(TableFormatter.format(table.columns(), table.rows()));
+    }
+
+    private static void printBackends(PrintStream out, FeConfig feConfig, BackendRegistry registry) {
+        if (!feConfig.heartbeatEnabled()) {
+            // FR-367:明确说明"没监听",不得报"BE 不可用"或返回空表。
+            out.println(HEARTBEAT_DISABLED_BACKENDS);
+            return;
+        }
+        out.print(formatBackends(registry));
+        out.flush();
     }
 
     private static void doPing(TangDbClient client, PrintStream out, PrintStream err) {

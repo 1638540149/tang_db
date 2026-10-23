@@ -65,13 +65,55 @@ class KeyCodecTest {
     }
 
     @Test
-    void rowKeyLayout() {
+    void rowKeyHasNoVersionSegment() {
+        // P3:FE 只产出用户键(表 ID + 索引 ID + 主键),版本段由 BE 追加。
         byte[] key = KeyCodec.rowKey(16, DataType.BIGINT, 1L);
         byte[] prefix = KeyCodec.prefix(16);
-        assertEquals(8 + 8 + 8, key.length);
+        assertEquals(8 + 8, key.length);
         assertArrayEquals(new byte[]{0, 0, 0, 16, 0, 0, 0, 0}, prefix);
-        assertArrayEquals(Arrays.copyOfRange(key, 0, 8), prefix);
-        assertArrayEquals(new byte[8], Arrays.copyOfRange(key, key.length - 8, key.length));
+        assertArrayEquals(prefix, Arrays.copyOfRange(key, 0, 8));
+        // 后 8 字节是主键编码本身(不是版本段)。
+        assertArrayEquals(KeyCodec.encodePrimaryKey(DataType.BIGINT, 1L),
+                Arrays.copyOfRange(key, 8, key.length));
+    }
+
+    @Test
+    void userKeyStripsVersionSegment() {
+        byte[] user = KeyCodec.rowKey(16, DataType.BIGINT, 7L);
+        byte[] full = new byte[user.length + KeyCodec.VERSION_BYTES];
+        System.arraycopy(user, 0, full, 0, user.length);
+        Arrays.fill(full, user.length, full.length, (byte) 0xA5);
+        assertArrayEquals(user, KeyCodec.userKey(full));
+        assertEquals(16, KeyCodec.tableId(user));
+    }
+
+    @Test
+    void rangeBoundsExcludeOrIncludeAllVersions() {
+        // FE 不解释版本段内容,但边界必须对"任意 8 字节后缀"都成立。
+        long tableId = 16;
+        byte[] user = KeyCodec.rowKey(tableId, DataType.BIGINT, 5L);
+        byte[][] suffixes = {
+                new byte[8],
+                {(byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF,
+                        (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF},
+                {1, 2, 3, 4, 5, 6, 7, 8},
+        };
+        byte[] lowerExclusive = KeyCodec.lowerBound(tableId, DataType.BIGINT, 5L, false);
+        byte[] upperInclusive = KeyCodec.upperBound(tableId, DataType.BIGINT, 5L, true);
+        assertArrayEquals(KeyCodec.rowKey(tableId, DataType.BIGINT, 5L),
+                KeyCodec.lowerBound(tableId, DataType.BIGINT, 5L, true));
+        assertArrayEquals(KeyCodec.rowKey(tableId, DataType.BIGINT, 5L),
+                KeyCodec.upperBound(tableId, DataType.BIGINT, 5L, false));
+
+        for (byte[] suffix : suffixes) {
+            byte[] full = new byte[user.length + suffix.length];
+            System.arraycopy(user, 0, full, 0, user.length);
+            System.arraycopy(suffix, 0, full, user.length, suffix.length);
+            assertTrue(Arrays.compareUnsigned(full, lowerExclusive) < 0,
+                    "排他下界必须大于该主键的任何版本");
+            assertTrue(Arrays.compareUnsigned(full, upperInclusive) < 0,
+                    "包含上界必须覆盖该主键的任何版本");
+        }
     }
 
     @Test
@@ -108,6 +150,10 @@ class KeyCodecTest {
         byte[] lower = KeyCodec.lowerBound(tableId, DataType.VARCHAR, "a", false);
         assertTrue(Arrays.compareUnsigned(keyA, lower) < 0);
         assertTrue(Arrays.compareUnsigned(keyAB, lower) > 0, "> 'a' 应包含 'ab'");
+        // 完整 key(用户键 + 版本)也必须被排他下界排除在外。
+        byte[] fullA = Arrays.copyOf(keyA, keyA.length + 8);
+        Arrays.fill(fullA, keyA.length, fullA.length, (byte) 0xFF);
+        assertTrue(Arrays.compareUnsigned(fullA, lower) < 0);
     }
 
     @Test

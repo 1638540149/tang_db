@@ -7,8 +7,13 @@
 //   - 本文件里不得出现任何"表名""列名""SQL"的概念
 //   - FE 传给 BE 的永远是 key/value 与算子描述
 //
-// 本文件包含 P1(基座)与 P2(表与 SQL)所需的接口。后续期次的接口按规约逐步加入,
-// 不提前定义未实现的东西。
+// 本文件包含 P1(基座)、P2(表与 SQL)与 P3(事务与 MVCC)所需的接口。
+// 后续期次的接口按规约逐步加入,不提前定义未实现的东西。
+//
+// P3 key 约定(SPEC-P3 §5.1 / §5.2):
+//   - FE 传来的 key 一律是"用户键",不含尾部的 8 字节版本段;
+//   - 版本段由 BE 独占维护(写入时追加 ^commit_ts,大端),FE 不得拼装或解释它;
+//   - 范围扫描的 start_key / end_key 也是用户键级语义 [start, end)。
 
 syntax = "proto3";
 
@@ -26,6 +31,9 @@ enum StatusCode {
   NOT_FOUND          = 2;
   INVALID_ARGUMENT   = 3;
   INTERNAL           = 4;
+  // CONFLICT:写写冲突(SPEC-P3 FR-307)。conflict_key 带回冲突 key 的原始字节,
+  // 由 FE 翻译成"表 t 主键 x 写写冲突";BE 不返回表名/列名/SQL。
+  CONFLICT           = 5;
 }
 
 // ---------------------------------------------------------------- 探活
@@ -52,7 +60,10 @@ message PutResponse {
 // ---------------------------------------------------------------- 读取
 
 message GetRequest {
+  // 用户键(不含版本段)。BE 返回该用户键在快照下可见的版本值。
   bytes key = 1;
+  // 快照水位(SPEC-P3 FR-304):0 = 最新已提交;否则返回 commit_ts <= snapshot 的最大版本。
+  uint64 snapshot = 2;
 }
 
 message GetResponse {
@@ -70,10 +81,14 @@ message Kv {
 }
 
 message ScanRequest {
+  // start_key / end_key 是**用户键级**语义(SPEC-P3 FR-305),不含版本段:
+  // BE 按"去掉 key 尾部 8 字节"后的用户键比较范围。
   bytes  start_key  = 1;   // 含
   bytes  end_key    = 2;   // 不含;空 = 到末尾
-  uint32 limit      = 3;   // 0 = 不限
+  uint32 limit      = 3;   // 0 = 不限;限制的是"每个用户键只输出一次"之后的行数
   uint32 batch_rows = 4;   // 0 = 默认 1024
+  // 快照水位(SPEC-P3 FR-304):0 = 最新已提交。
+  uint64 snapshot   = 5;
 }
 
 // 服务端流式返回的一批行。status 不是 OK 时表示扫描中途出错,
@@ -84,22 +99,67 @@ message RowBatch {
   repeated Kv rows    = 3;
 }
 
+// ---------------------------------------------------------------- 事务(P3)
+
+// 开始一个事务:BE 返回事务句柄与快照水位。
+// 写集不在 BE:未提交的写入只活在 FE 内存里,BE 只在 CommitTxn 时看到它们。
+message BeginTxnRequest {
+  bool read_only = 1;   // 本期只是提示,不改变语义(SPEC-P3 K47)
+}
+
+message BeginTxnResponse {
+  StatusCode status   = 1;
+  string     message  = 2;
+  uint64     txn_id   = 3;   // BE 侧句柄,不参与可见性
+  uint64     snapshot = 4;   // 当前已提交水位;空库为 0
+}
+
+// 提交:写集按用户键给出(不含版本段),BE 内部追加版本段。
+// 顺序固定:冲突检测 → WAL 追加 → fsync → memtable → OK。
+message CommitTxnRequest {
+  uint64 txn_id   = 1;   // 0 = 自动提交(不占用 BE 句柄)
+  uint64 snapshot = 2;   // 0 = 最新已提交;否则为 BeginTxn 返回的水位
+  repeated Kv writes = 3; // 写集:key 为用户键
+}
+
+message CommitTxnResponse {
+  StatusCode status       = 1;
+  uint64     commit_ts    = 2;   // 成功时给出;写集为空时可能为 0
+  bytes      conflict_key = 3;   // status == CONFLICT 时的冲突 key(原始字节,FE 负责翻译)
+  string     message      = 4;
+}
+
+// 释放 BE 侧事务句柄(不产生任何 I/O)。未提交的数据从未离开 FE,所以无需回滚动作。
+message AbortTxnRequest {
+  uint64 txn_id = 1;
+}
+
+message AbortTxnResponse {
+  StatusCode status  = 1;
+  string     message = 2;
+}
+
 // ---------------------------------------------------------------- 服务
 
 service TangDb {
   // 探活:客户端与验收脚本用来确认 BE 已就绪
   rpc Ping(PingRequest) returns (PingResponse);
 
-  // 写入一个键值。返回 OK 意味着数据已被日志与 fsync 保护,
-  // 进程被 kill -9 后仍然存在。
+  // 写入一个键值。语义与 P1 保持不变:BE 内部把它当成"单 key 自动提交事务"。
+  // 返回 OK 意味着数据已被日志与 fsync 保护,进程被 kill -9 后仍然存在。
   rpc Put(PutRequest) returns (PutResponse);
 
-  // 读取一个键值。key 不存在返回 NOT_FOUND,而不是空值。
+  // 读取一个键值(用户键)。key 不存在返回 NOT_FOUND,而不是空值。
   rpc Get(GetRequest) returns (GetResponse);
 
-  // 按 key 范围有序流式扫描。范围语义 [start_key, end_key),end_key 为空表示到末尾。
-  // 同一 key 只出现一次(取最新值);limit 为 0 表示不限;batch_rows 为 0 表示默认 1024。
+  // 按用户键范围有序流式扫描。范围语义 [start_key, end_key),end_key 为空表示到末尾。
+  // 同一用户键只出现一次(取快照下可见版本);limit 为 0 表示不限;batch_rows 为 0 表示默认 1024。
   rpc Scan(ScanRequest) returns (stream RowBatch);
+
+  // ---- P3:事务 ----
+  rpc BeginTxn(BeginTxnRequest) returns (BeginTxnResponse);
+  rpc CommitTxn(CommitTxnRequest) returns (CommitTxnResponse);
+  rpc AbortTxn(AbortTxnRequest) returns (AbortTxnResponse);
 }
 
 // ---------------------------------------------------------------- BE → FE:注册与心跳

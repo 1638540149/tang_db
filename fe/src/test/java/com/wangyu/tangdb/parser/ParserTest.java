@@ -312,6 +312,17 @@ class ParserTest {
     // ------------------------------------------------------------ P2.1 SHOW DATABASES
 
     @Test
+    void transactionStatements() {
+        assertInstanceOf(Ast.Begin.class, Parser.parse("BEGIN"));
+        assertInstanceOf(Ast.Begin.class, Parser.parse("begin;"));
+        assertInstanceOf(Ast.Begin.class, Parser.parse("BEGIN TRANSACTION"));
+        assertInstanceOf(Ast.Commit.class, Parser.parse("COMMIT"));
+        assertInstanceOf(Ast.Commit.class, Parser.parse("commit work;"));
+        assertInstanceOf(Ast.Rollback.class, Parser.parse("ROLLBACK"));
+        assertInstanceOf(Ast.Rollback.class, Parser.parse("rollback;"));
+    }
+
+    @Test
     void showDatabases() {
         assertInstanceOf(Ast.ShowDatabases.class, Parser.parse("SHOW DATABASES"));
         assertInstanceOf(Ast.ShowDatabases.class, Parser.parse("show databases;"));

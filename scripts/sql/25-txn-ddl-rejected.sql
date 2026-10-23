@@ -1,0 +1,4 @@
+-- P3 K45 / FR-357:DDL 不允许在事务内执行
+BEGIN;
+CREATE TABLE nope (id INT PRIMARY KEY);
+ROLLBACK;

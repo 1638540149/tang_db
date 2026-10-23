@@ -106,7 +106,12 @@ public final class Catalog {
 
     // ------------------------------------------------------------ DDL
 
-    /** 建表。columns 的 ordinal 会被规范化为列表顺序。 */
+    /**
+     * 建表。columns 的 ordinal 会被规范化为列表顺序。
+     *
+     * <p>P3 起:表记录 + 全部列记录 + sys_counters 更新进**同一条批记录**
+     * (SPEC-P3 FR-355),所以不存在"表在、列缺"或"没有主键"的半套元数据。</p>
+     */
     public TableMeta createTable(String tableName, List<Column> columns) {
         lock.writeLock().lock();
         try {
@@ -115,9 +120,15 @@ public final class Catalog {
                 throw new CatalogException("表 " + name + " 已存在");
             }
             List<Column> normalized = validateColumns(columns);
-            long id = allocateTableId();
+            long id = nextTableId;
             TableMeta table = new TableMeta(id, name, TableMeta.STATE_ACTIVE, now(), normalized, false);
-            persistTable(table);
+
+            List<KeyValue> batch = new ArrayList<>();
+            stageCounter(batch, id + 1);
+            stageTable(batch, table);
+            kv.writeBatch(batch);
+
+            nextTableId = id + 1;
             byId.put(id, table);
             activeByName.put(name, table);
             return table;
@@ -137,8 +148,11 @@ public final class Catalog {
             }
             TableMeta dropped = new TableMeta(table.id(), table.name(), TableMeta.STATE_DROPPED,
                     table.createdAt(), table.columns(), false);
-            kv.put(SystemTables.tableKey(dropped.id()),
-                    SystemTables.encodeTableRow(dropped.id(), dropped.name(), dropped.state(), dropped.createdAt()));
+            List<KeyValue> batch = new ArrayList<>();
+            batch.add(new KeyValue(SystemTables.tableKey(dropped.id()),
+                    SystemTables.encodeTableRow(dropped.id(), dropped.name(), dropped.state(), dropped.createdAt())));
+            kv.writeBatch(batch);
+
             byId.put(dropped.id(), dropped);
             activeByName.remove(name);
         } finally {
@@ -149,6 +163,8 @@ public final class Catalog {
     /**
      * 清空表:换一个新的表 ID(等价于一张新的空表),旧 ID 标记 dropped。
      * 旧数据不做物理删除,等后续期次 compaction 回收(K18)。
+     *
+     * <p>新表记录 + 列记录 + 旧表 dropped + 计数器进同一条批记录(FR-355)。</p>
      */
     public TableMeta truncateTable(String tableName) {
         lock.writeLock().lock();
@@ -158,14 +174,19 @@ public final class Catalog {
             if (old == null) {
                 throw new CatalogException("表 " + name + " 不存在");
             }
-            long newId = allocateTableId();
+            long newId = nextTableId;
             TableMeta fresh = new TableMeta(newId, name, TableMeta.STATE_ACTIVE, now(), old.columns(), false);
-            persistTable(fresh);
             TableMeta dropped = new TableMeta(old.id(), old.name(), TableMeta.STATE_DROPPED,
                     old.createdAt(), old.columns(), false);
-            kv.put(SystemTables.tableKey(dropped.id()),
-                    SystemTables.encodeTableRow(dropped.id(), dropped.name(), dropped.state(), dropped.createdAt()));
 
+            List<KeyValue> batch = new ArrayList<>();
+            stageCounter(batch, newId + 1);
+            stageTable(batch, fresh);
+            batch.add(new KeyValue(SystemTables.tableKey(dropped.id()),
+                    SystemTables.encodeTableRow(dropped.id(), dropped.name(), dropped.state(), dropped.createdAt())));
+            kv.writeBatch(batch);
+
+            nextTableId = newId + 1;
             byId.put(newId, fresh);
             byId.put(dropped.id(), dropped);
             activeByName.put(name, fresh);
@@ -371,22 +392,22 @@ public final class Catalog {
 
     // ------------------------------------------------------------ 内部
 
-    private long allocateTableId() {
-        long id = nextTableId;
-        // 先落盘计数器,再使用新 ID:即使随后崩溃,也只会浪费一个 ID,不会复用(FR-113)。
-        kv.put(SystemTables.counterKey(SystemTables.COUNTER_NEXT_TABLE_ID),
-                SystemTables.encodeCounterRow(SystemTables.COUNTER_NEXT_TABLE_ID, id + 1));
-        nextTableId = id + 1;
-        return id;
+    /**
+     * 把"计数器推进 + 表记录 + 全部列记录"放进同一个批(FR-355)。
+     * 计数器与表记录一起原子生效:即使随后崩溃,也只会浪费一个 ID,不会复用(FR-113)。
+     */
+    private static void stageTable(List<KeyValue> batch, TableMeta table) {
+        batch.add(new KeyValue(SystemTables.tableKey(table.id()),
+                SystemTables.encodeTableRow(table.id(), table.name(), table.state(), table.createdAt())));
+        for (Column column : table.columns()) {
+            batch.add(new KeyValue(SystemTables.columnKey(table.id(), column.ordinal()),
+                    SystemTables.encodeColumnRow(column, table.id())));
+        }
     }
 
-    private void persistTable(TableMeta table) {
-        kv.put(SystemTables.tableKey(table.id()),
-                SystemTables.encodeTableRow(table.id(), table.name(), table.state(), table.createdAt()));
-        for (Column column : table.columns()) {
-            kv.put(SystemTables.columnKey(table.id(), column.ordinal()),
-                    SystemTables.encodeColumnRow(column, table.id()));
-        }
+    private static void stageCounter(List<KeyValue> batch, long nextId) {
+        batch.add(new KeyValue(SystemTables.counterKey(SystemTables.COUNTER_NEXT_TABLE_ID),
+                SystemTables.encodeCounterRow(SystemTables.COUNTER_NEXT_TABLE_ID, nextId)));
     }
 
     private static List<Column> validateColumns(List<Column> columns) {

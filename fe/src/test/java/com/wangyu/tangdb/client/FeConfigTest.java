@@ -54,6 +54,16 @@ class FeConfigTest {
     }
 
     @Test
+    void heartbeatEnabledDefaultsTrueAndCanBeDisabled() throws IOException {
+        assertTrue(FeConfig.defaults().heartbeatEnabled());
+        Path on = write("heartbeat_enabled = true\n");
+        assertTrue(FeConfig.load(on.toString()).heartbeatEnabled());
+        Path off = write("heartbeat_enabled = false\n");
+        assertFalse(FeConfig.load(off.toString()).heartbeatEnabled());
+        assertMessage("heartbeat_enabled = maybe", "heartbeat_enabled 无效");
+    }
+
+    @Test
     void missingKeysKeepDefaults() throws IOException {
         Path file = write("be_port = 9300\n");
         FeConfig cfg = FeConfig.load(file.toString());

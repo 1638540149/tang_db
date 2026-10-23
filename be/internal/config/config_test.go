@@ -16,6 +16,48 @@ func TestDefault(t *testing.T) {
 	if cfg.FeHost != "127.0.0.1" || cfg.FePort != 9091 || cfg.HeartbeatIntervalSeconds != 3 {
 		t.Fatalf("心跳默认值不对: %+v", cfg)
 	}
+	if cfg.TestCrashPoint != "" {
+		t.Fatalf("test_crash_point 默认应为空(关闭),实际 %q", cfg.TestCrashPoint)
+	}
+	if cfg.MaxTxnWriteBytes != DefaultMaxTxnWriteBytes {
+		t.Fatalf("max_txn_write_bytes 默认 = %d, want %d", cfg.MaxTxnWriteBytes, DefaultMaxTxnWriteBytes)
+	}
+}
+
+// TestParseP3Fields test_crash_point / max_txn_write_bytes 的解析与校验(FR-364)。
+func TestParseP3Fields(t *testing.T) {
+	src := `test_crash_point = after_fsync
+max_txn_write_bytes = 8MB
+`
+	cfg, err := Parse(strings.NewReader(src))
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	if cfg.TestCrashPoint != "after_fsync" {
+		t.Fatalf("test_crash_point = %q", cfg.TestCrashPoint)
+	}
+	if cfg.MaxTxnWriteBytes != 8*1024*1024 {
+		t.Fatalf("max_txn_write_bytes = %d", cfg.MaxTxnWriteBytes)
+	}
+
+	// 显式空值 = 关闭,应被接受。
+	cfg, err = Parse(strings.NewReader("test_crash_point =\n"))
+	if err != nil {
+		t.Fatalf("空 test_crash_point 应被接受: %v", err)
+	}
+	if cfg.TestCrashPoint != "" {
+		t.Fatalf("test_crash_point = %q", cfg.TestCrashPoint)
+	}
+
+	for _, bad := range []string{
+		"test_crash_point = somewhere\n",
+		"max_txn_write_bytes = 0\n",
+		"max_txn_write_bytes = 1XB\n",
+	} {
+		if _, err := Parse(strings.NewReader(bad)); err == nil {
+			t.Fatalf("期望报错: %q", bad)
+		}
+	}
 }
 
 func TestParseFullFile(t *testing.T) {

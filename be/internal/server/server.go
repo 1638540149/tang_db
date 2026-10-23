@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
+	"sync/atomic"
 
 	"github.com/1638540149/tang_db/be/internal/server/pb"
 	"github.com/1638540149/tang_db/be/internal/store"
@@ -20,11 +22,19 @@ const defaultBatchRows = 1024
 type TangDbServer struct {
 	pb.UnimplementedTangDbServer
 	engine *store.Engine
+
+	// 事务句柄:BE 只发号与释放,不保存写集(写集在 FE 内存,FR-319)。
+	txnMu     sync.Mutex
+	txns      map[uint64]uint64 // txn_id -> snapshot
+	nextTxnID atomic.Uint64
 }
 
 // NewTangDbServer 创建 gRPC 服务实例。
 func NewTangDbServer(engine *store.Engine) *TangDbServer {
-	return &TangDbServer{engine: engine}
+	return &TangDbServer{
+		engine: engine,
+		txns:   make(map[uint64]uint64),
+	}
 }
 
 // Ping 返回 BE 版本与数据目录,供客户端探活。
@@ -35,7 +45,7 @@ func (s *TangDbServer) Ping(ctx context.Context, _ *pb.PingRequest) (*pb.PingRes
 	}, nil
 }
 
-// Put 写入键值。engine.Put 内部保证 WAL fsync 后才返回,因此这里返回 OK 即表示已落盘。
+// Put 写入键值。语义与 P1 保持不变:单 key 自动提交事务,返回 OK 即已 fsync。
 func (s *TangDbServer) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
 	if len(req.Key) == 0 {
 		return &pb.PutResponse{
@@ -60,7 +70,7 @@ func (s *TangDbServer) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutResp
 	return &pb.PutResponse{Status: pb.StatusCode_OK, Message: "OK"}, nil
 }
 
-// Get 读取键值;不存在时返回 NOT_FOUND。
+// Get 读取用户键在快照下可见的版本值;不存在时返回 NOT_FOUND。
 func (s *TangDbServer) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, error) {
 	if len(req.Key) == 0 {
 		return &pb.GetResponse{
@@ -69,7 +79,7 @@ func (s *TangDbServer) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResp
 		}, nil
 	}
 
-	value, ok, err := s.engine.Get(req.Key)
+	value, ok, err := s.engine.GetSnapshot(req.Key, req.Snapshot)
 	if err != nil {
 		slog.Error("get failed", "error", err)
 		return &pb.GetResponse{
@@ -89,11 +99,7 @@ func (s *TangDbServer) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResp
 	}, nil
 }
 
-// Scan 按 key 范围 [start_key, end_key) 有序流式返回。
-//
-// 每批最多 batch_rows 行(默认 1024);limit 为 0 表示不限。
-// 正常结束时客户端会收到流 EOF;扫描中途出错时最后一帧是 status != OK 的 RowBatch,
-// 客户端据此区分"正常结束"与"出错结束",BE 不会静默截断。
+// Scan 按**用户键**范围 [start_key, end_key) 有序流式返回;每个用户键只出现一次。
 func (s *TangDbServer) Scan(req *pb.ScanRequest, stream pb.TangDb_ScanServer) error {
 	batchRows := int(req.BatchRows)
 	if batchRows <= 0 {
@@ -108,7 +114,7 @@ func (s *TangDbServer) Scan(req *pb.ScanRequest, stream pb.TangDb_ScanServer) er
 		})
 	}
 
-	sc := s.engine.NewScanner(req.StartKey, req.EndKey, limit)
+	sc := s.engine.NewMVCCScanner(req.StartKey, req.EndKey, req.Snapshot, limit)
 	batch := make([]*pb.Kv, 0, batchRows)
 
 	send := func(status pb.StatusCode, message string) error {
@@ -152,7 +158,96 @@ func (s *TangDbServer) Scan(req *pb.ScanRequest, stream pb.TangDb_ScanServer) er
 	return nil
 }
 
-// mustEmbedUnimplementedTangDbServer 由生成的代码提供,这里不需要额外实现。
+// BeginTxn 发放事务句柄并返回当前已提交水位(SPEC-P3 FR-301)。
+//
+// 未提交的写集不在 BE:这里不做任何 I/O,只发号 + 读一次水位。
+func (s *TangDbServer) BeginTxn(ctx context.Context, req *pb.BeginTxnRequest) (*pb.BeginTxnResponse, error) {
+	snapshot := s.engine.MaxCommittedTS()
+	txnID := s.nextTxnID.Add(1)
+	s.txnMu.Lock()
+	s.txns[txnID] = snapshot
+	s.txnMu.Unlock()
+	// read_only 本期只是提示(K47),不影响发号或快照。
+	return &pb.BeginTxnResponse{
+		Status:   pb.StatusCode_OK,
+		Message:  "OK",
+		TxnId:    txnID,
+		Snapshot: snapshot,
+	}, nil
+}
+
+// CommitTxn 执行"冲突检测 → 原子批写 → fsync → memtable"(SPEC-P3 FR-302 / FR-312)。
+func (s *TangDbServer) CommitTxn(ctx context.Context, req *pb.CommitTxnRequest) (*pb.CommitTxnResponse, error) {
+	if req.TxnId != 0 {
+		s.txnMu.Lock()
+		_, known := s.txns[req.TxnId]
+		s.txnMu.Unlock()
+		if !known {
+			return &pb.CommitTxnResponse{
+				Status:  pb.StatusCode_INVALID_ARGUMENT,
+				Message: "事务句柄无效或已结束,请重新 BEGIN",
+			}, nil
+		}
+	}
+
+	writes := make([]store.Write, 0, len(req.Writes))
+	for _, kv := range req.Writes {
+		if len(kv.Key) == 0 {
+			return &pb.CommitTxnResponse{
+				Status:  pb.StatusCode_INVALID_ARGUMENT,
+				Message: "写集里有空的 key",
+			}, nil
+		}
+		writes = append(writes, store.Write{
+			Key:   kv.Key,
+			Value: kv.Value,
+		})
+	}
+
+	commitTS, conflictKey, err := s.engine.Commit(req.Snapshot, req.TxnId, writes)
+	if err != nil {
+		slog.Error("commit failed", "error", err)
+		if errors.Is(err, store.ErrTxnTooLarge) || errors.Is(err, store.ErrTxnTooManyWrite) {
+			return &pb.CommitTxnResponse{
+				Status:  pb.StatusCode_INVALID_ARGUMENT,
+				Message: err.Error(),
+			}, nil
+		}
+		return &pb.CommitTxnResponse{
+			Status:  pb.StatusCode_INTERNAL,
+			Message: err.Error(),
+		}, nil
+	}
+	if conflictKey != nil {
+		// 只回 key 的原始字节;翻译成"表/主键"是 FE 的事(FR-307 / FR-333)。
+		return &pb.CommitTxnResponse{
+			Status:      pb.StatusCode_CONFLICT,
+			ConflictKey: conflictKey,
+			Message:     "写写冲突",
+		}, nil
+	}
+
+	if req.TxnId != 0 {
+		s.txnMu.Lock()
+		delete(s.txns, req.TxnId)
+		s.txnMu.Unlock()
+	}
+	return &pb.CommitTxnResponse{
+		Status:   pb.StatusCode_OK,
+		CommitTs: commitTS,
+		Message:  "OK",
+	}, nil
+}
+
+// AbortTxn 只释放 BE 侧句柄,不产生任何 I/O(SPEC-P3 FR-303)。
+func (s *TangDbServer) AbortTxn(ctx context.Context, req *pb.AbortTxnRequest) (*pb.AbortTxnResponse, error) {
+	if req.TxnId != 0 {
+		s.txnMu.Lock()
+		delete(s.txns, req.TxnId)
+		s.txnMu.Unlock()
+	}
+	return &pb.AbortTxnResponse{Status: pb.StatusCode_OK, Message: "OK"}, nil
+}
 
 // grpcError 将内部错误转换为 gRPC 状态错误(非业务错误时使用)。
 func grpcError(err error) error {

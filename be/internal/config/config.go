@@ -23,6 +23,18 @@ const DefaultPath = "./config/be.conf"
 // DefaultMemTableSize 是 memtable 刷盘阈值的默认值(64MB)。
 const DefaultMemTableSize int64 = 64 * 1024 * 1024
 
+// DefaultMaxTxnWriteBytes 是单事务写入量的默认上限(64MB,SPEC-P3 FR-309)。
+const DefaultMaxTxnWriteBytes int64 = 64 * 1024 * 1024
+
+// 崩溃注入点取值(SPEC-P3 FR-364 / K55)。空字符串表示关闭。
+var crashPoints = map[string]bool{
+	"":               true,
+	"before_wal":     true,
+	"after_fsync":    true,
+	"after_memtable": true,
+	"before_ok":      true,
+}
+
 // 心跳相关默认值(见 P2 规约 FR-160)。
 const (
 	DefaultFeHost                   = "127.0.0.1"
@@ -39,6 +51,11 @@ type Config struct {
 	FeHost                   string // FE 心跳服务地址
 	FePort                   int    // FE 心跳服务端口
 	HeartbeatIntervalSeconds int    // 心跳间隔(秒)
+
+	// TestCrashPoint 崩溃注入点(仅验收使用;默认空 = 关闭)。
+	TestCrashPoint string
+	// MaxTxnWriteBytes 单事务写入量上限(默认 64MB)。
+	MaxTxnWriteBytes int64
 }
 
 // Default 返回内置默认配置。
@@ -50,6 +67,8 @@ func Default() Config {
 		FeHost:                   DefaultFeHost,
 		FePort:                   DefaultFePort,
 		HeartbeatIntervalSeconds: DefaultHeartbeatIntervalSeconds,
+		TestCrashPoint:           "",
+		MaxTxnWriteBytes:         DefaultMaxTxnWriteBytes,
 	}
 }
 
@@ -91,7 +110,8 @@ func Parse(r io.Reader) (Config, error) {
 		if key == "" {
 			return Config{}, fmt.Errorf("第 %d 行缺少配置项名:%q", lineNo, line)
 		}
-		if value == "" {
+		// test_crash_point 的默认值就是空(关闭),允许显式写空值。
+		if value == "" && key != "test_crash_point" {
 			return Config{}, fmt.Errorf("第 %d 行 %s 的取值为空", lineNo, key)
 		}
 
@@ -124,6 +144,18 @@ func Parse(r io.Reader) (Config, error) {
 				return Config{}, fmt.Errorf("第 %d 行 heartbeat_interval_seconds 无效:%q(应为 1-3600)", lineNo, value)
 			}
 			cfg.HeartbeatIntervalSeconds = sec
+		case "test_crash_point":
+			if !crashPoints[value] {
+				return Config{}, fmt.Errorf("第 %d 行 test_crash_point 无效:%q"+
+					"(应为空 / before_wal / after_fsync / after_memtable / before_ok)", lineNo, value)
+			}
+			cfg.TestCrashPoint = value
+		case "max_txn_write_bytes":
+			size, err := ParseSize(value)
+			if err != nil {
+				return Config{}, fmt.Errorf("第 %d 行 max_txn_write_bytes 无效:%v", lineNo, err)
+			}
+			cfg.MaxTxnWriteBytes = size
 		default:
 			return Config{}, fmt.Errorf("第 %d 行未知配置项:%q", lineNo, key)
 		}
