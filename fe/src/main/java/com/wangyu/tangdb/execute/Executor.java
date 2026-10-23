@@ -50,6 +50,9 @@ public final class Executor {
         if (statement instanceof Ast.ShowTables) {
             return showTables();
         }
+        if (statement instanceof Ast.ShowDatabases) {
+            return showDatabases();
+        }
         if (statement instanceof Ast.Describe describe) {
             return describe(describe);
         }
@@ -90,6 +93,13 @@ public final class Executor {
         return new Result.Table(List.of("table_name", "table_id", "created_at"), rows);
     }
 
+    /**
+     * SHOW DATABASES:只有默认库(K22),静态回答,不访问 BE(FR-200 / FR-201)。
+     */
+    private Result showDatabases() {
+        return new Result.Table(List.of("Database"), List.<Object[]>of(new Object[]{"default"}));
+    }
+
     private Result describe(Ast.Describe describe) {
         TableMeta table = catalog.require(describe.table());
         List<Object[]> rows = new ArrayList<>(table.columnCount());
@@ -112,17 +122,26 @@ public final class Executor {
             throw new StoreException("INSERT 至少需要一组 VALUES");
         }
 
-        List<Column> targets = new ArrayList<>(insert.columns().size());
+        // 空列名列表 = 省略写法:按表定义顺序取全部列(FR-190 / K35)。
+        List<Column> targets = new ArrayList<>(
+                insert.columns().isEmpty() ? table.columnCount() : insert.columns().size());
         Set<String> seen = new HashSet<>();
-        for (String columnName : insert.columns()) {
-            Column column = table.column(columnName);
-            if (column == null) {
-                throw new CatalogException("列 " + columnName + " 不存在(表 " + table.name() + ")");
+        if (insert.columns().isEmpty()) {
+            for (Column column : table.columns()) {
+                targets.add(column);
+                seen.add(column.name());
             }
-            if (!seen.add(column.name())) {
-                throw new StoreException("列 " + column.name() + " 在 INSERT 列表里重复出现");
+        } else {
+            for (String columnName : insert.columns()) {
+                Column column = table.column(columnName);
+                if (column == null) {
+                    throw new CatalogException("列 " + columnName + " 不存在(表 " + table.name() + ")");
+                }
+                if (!seen.add(column.name())) {
+                    throw new StoreException("列 " + column.name() + " 在 INSERT 列表里重复出现");
+                }
+                targets.add(column);
             }
-            targets.add(column);
         }
         Column pk = table.primaryKey();
         if (!seen.contains(pk.name())) {

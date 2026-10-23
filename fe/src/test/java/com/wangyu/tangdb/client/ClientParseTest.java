@@ -122,6 +122,65 @@ class ClientParseTest {
         assertTrue(buffer.append("").isEmpty());
     }
 
+    // ------------------------------------------------------------ SqlBuffer 反引号状态(FR-187)
+
+    @Test
+    void semicolonInsideQuotedIdentDoesNotSplit() {
+        SqlBuffer buffer = new SqlBuffer();
+        assertTrue(buffer.append("SELECT * FROM t WHERE `a;b` = 1").isEmpty());
+        assertTrue(buffer.hasPending());
+
+        List<String> statements = buffer.append(";");
+        assertEquals(1, statements.size());
+        assertEquals("SELECT * FROM t WHERE `a;b` = 1", statements.get(0));
+        assertFalse(buffer.hasPending());
+    }
+
+    @Test
+    void unterminatedQuotedIdentKeepsWaiting() {
+        SqlBuffer buffer = new SqlBuffer();
+        assertTrue(buffer.append("SELECT * FROM `t_").isEmpty());
+        assertTrue(buffer.hasPending());
+        assertTrue(buffer.append("quoted`").isEmpty());   // 标识符闭合了,但还没有分号
+        assertTrue(buffer.hasPending());
+
+        List<String> statements = buffer.append(";");
+        assertEquals(1, statements.size());
+        // 与字符串一致:跨行时用换行连接,避免往标识符里塞入空格
+        assertEquals("SELECT * FROM `t_\nquoted`", statements.get(0));
+        assertFalse(buffer.hasPending());
+    }
+
+    @Test
+    void doubledBacktickDoesNotCloseIdentifier() {
+        SqlBuffer buffer = new SqlBuffer();
+        List<String> statements = buffer.append("SELECT `a``;b` FROM t;");
+        assertEquals(1, statements.size());
+        assertEquals("SELECT `a``;b` FROM t", statements.get(0));
+        assertFalse(buffer.hasPending());
+    }
+
+    @Test
+    void doubleDashInsideQuotedIdentIsNotComment() {
+        SqlBuffer buffer = new SqlBuffer();
+        List<String> statements = buffer.append("SELECT `a--b` FROM t;");
+        assertEquals(1, statements.size());
+        assertEquals("SELECT `a--b` FROM t", statements.get(0));
+    }
+
+    @Test
+    void resetAbandonsUnterminatedQuotedIdent() {
+        SqlBuffer buffer = new SqlBuffer();
+        assertTrue(buffer.append("SELECT * FROM `t").isEmpty());
+        assertTrue(buffer.hasPending());
+        buffer.reset();
+        assertFalse(buffer.hasPending());
+
+        List<String> statements = buffer.append("SHOW DATABASES;");
+        assertEquals(1, statements.size());
+        assertEquals("SHOW DATABASES", statements.get(0));
+    }
+
     // ------------------------------------------------------------ TableFormatter
 
     @Test

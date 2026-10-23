@@ -33,7 +33,7 @@ public final class Cli {
     static final String USAGE =
             "用法: java com.wangyu.tangdb.client.Cli [--config <file>] [--be-host <host>] [--be-port <port>]\n"
             + "配置: 默认读 " + FeConfig.DEFAULT_PATH + ",命令行参数覆盖配置文件\n"
-            + "命令: SQL 以 ; 结束;SHOW TABLES | DESC <表> | SHOW BACKENDS | exit";
+            + "命令: SQL 以 ; 结束;SHOW TABLES | SHOW DATABASES | DESC <表> | SHOW BACKENDS | exit";
 
     private static final String PROMPT = "tangdb> ";
     private static final String CONTINUATION_PROMPT = "    -> ";
@@ -74,7 +74,7 @@ public final class Cli {
 
         out.println("tang_db 命令行客户端（BE " + config.host() + ":" + config.port()
                 + "，FE 心跳端口 " + feConfig.heartbeatListenPort() + "）");
-        out.println("输入 SQL 以 ; 结束;可用: SHOW TABLES | DESC <表> | SHOW BACKENDS | exit");
+        out.println("输入 SQL 以 ; 结束;可用: SHOW TABLES | SHOW DATABASES | DESC <表> | SHOW BACKENDS | exit");
 
         TangDbClient client;
         try {

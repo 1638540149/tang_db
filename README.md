@@ -238,12 +238,74 @@ tangdb> SHOW BACKENDS;
 
 元数据(表、列)存在**库里自己的系统表**里,不依赖任何外部数据库;重启 BE 与 FE 之后 `SHOW TABLES` / `DESC` 与数据都还在。
 
+### P2.1 补充的三类写法(反引号列名 / 省略列名 / SHOW DATABASES)
+
+下面三段都是**实际运行**的输入与输出(合并自同一次会话)。
+
+**① 反引号标识符** —— `select`、`from` 这类关键字可以当列名;反引号内除反引号外任意字符都合法(空格、中划线、中文、数字开头),双写反引号表示一个反引号。反引号**不改变大小写语义**,也不能用来包裹语句关键字或列类型。
+
+```sql
+tangdb> CREATE TABLE `order` (`id` INT PRIMARY KEY, `select` VARCHAR(16), `from` INT);
+OK, 表 order 已创建(表 ID 16)
+
+tangdb> INSERT INTO `order` (`id`, `select`, `from`) VALUES (1, 'first', 10);
+OK, 1 row affected
+
+tangdb> SELECT `id`, `select`, `from` FROM `order` WHERE `id` = 1;
++----+--------+------+
+| id | select | from |
++----+--------+------+
+| 1  | first  | 10   |
++----+--------+------+
+(1 row)
+```
+
+**② INSERT 省略列名列表** —— 值按**表定义顺序**给全所有列;少给/多给会指出第几组。
+
+```sql
+tangdb> CREATE TABLE users (id BIGINT PRIMARY KEY, name VARCHAR(32), city VARCHAR(32), age INT);
+OK, 表 users 已创建(表 ID 17)
+
+tangdb> INSERT INTO users VALUES (1, 'wangyu', '北京', 26);
+OK, 1 row affected
+
+tangdb> INSERT INTO users VALUES (2, 'lisi', '上海', 20), (3, 'zhangsan', '北京', 30);
+OK, 2 rows affected
+
+tangdb> SELECT * FROM users;
++----+----------+------+-----+
+| id | name     | city | age |
++----+----------+------+-----+
+| 1  | wangyu   | 北京 | 26  |
+| 2  | lisi     | 上海 | 20  |
+| 3  | zhangsan | 北京 | 30  |
++----+----------+------+-----+
+(3 rows)
+
+tangdb> INSERT INTO users VALUES (5, 'sunqi');
+错误：第 1 组取值个数(2)与列数(4)不一致
+```
+
+显式列名(`INSERT INTO users (id, name) VALUES (...)`)行为不变,两种写法可以混用;`INSERT INTO users () VALUES (...)` 报 `列名列表不能为空`。
+
+**③ SHOW DATABASES** —— 只有默认库 `default`;由 FE 直接回答,**不访问 BE**,BE 停着也照常输出。
+
+```sql
+tangdb> SHOW DATABASES;
++----------+
+| Database |
++----------+
+| default  |
++----------+
+(1 row)
+```
+
 P2 的 SQL 边界(一期一期加,别当成完整 SQL):
 
-- 支持:`CREATE / DROP / TRUNCATE TABLE`、`SHOW TABLES`、`DESC`、`INSERT`(多行)、`UPDATE`、`DELETE`、`SELECT 列/*/AS` + `WHERE`(`=` `<>` `<` `<=` `>` `>=`、`AND`/`OR`、`IN`)+ `LIMIT`
-- 不做(留给后面几期):JOIN、聚合、GROUP BY、子查询、ORDER BY、表达式与函数、二级索引
+- 支持:`CREATE / DROP / TRUNCATE TABLE`、`SHOW TABLES` / `SHOW DATABASES`、`DESC`、`INSERT`(多行,可省略列名列表)、`UPDATE`、`DELETE`、`SELECT 列/*/AS` + `WHERE`(`=` `<>` `<` `<=` `>` `>=`、`AND`/`OR`、`IN`)+ `LIMIT`;标识符可用反引号包裹
+- 不做(留给后面几期):JOIN、聚合、GROUP BY、子查询、ORDER BY、表达式与函数、二级索引;`NOT` / `IS [NOT] NULL` / `LIKE` / `BETWEEN` 归 P5
 - 主键:单列,类型限 `INT` / `BIGINT` / `VARCHAR` / `DATE`
-- 一条端到端功能测试:`bash scripts/p2-test.sh`(11 个场景,含强杀重启、心跳判死、跨内存/磁盘)
+- 一条端到端功能测试:`bash scripts/p2-test.sh`(11 个场景 + P2.1 兼容性断言,52 条断言,含强杀重启、心跳判死、跨内存/磁盘)
 
 ### 最强的那个动作:强杀后重启,数据还在
 
@@ -271,14 +333,14 @@ bash scripts/gen-proto.sh
 
 ## 状态
 
-**P1(基座)已完成并通过独立验收。P2(表与 SQL)已实现完成并通过独立核验。**
+**P1(基座)已完成并通过独立验收。P2(表与 SQL)已实现完成并通过独立核验。P2.1(SQL 兼容性补齐:反引号 / 省略列名 / SHOW DATABASES)已实现。**
 
-P2 核验口径(真实执行,不看实现方自述):
+核验口径(真实执行,不看实现方自述):
 
-- `bash scripts/p2-test.sh` —— 11 个场景 / 40 条断言全 PASS(含 4 个 ★:元数据重启不丢、心跳判死与自动恢复、跨内存/磁盘查询、强杀后零丢失)
+- `bash scripts/p2-test.sh` —— 11 个场景 + P2.1 断言组 / 52 条断言全 PASS(含 4 个 ★:元数据重启不丢、心跳判死与自动恢复、跨内存/磁盘查询、强杀后零丢失)
 - `bash scripts/crash-test.sh` —— P1 回归:1000 条随机 KV,强杀重启后**丢失 0 条**
 - `cd be && go build ./... && go vet ./... && go test ./...` —— 全绿
-- `cd fe && mvn.cmd test` —— 105 个用例全绿
+- `cd fe && mvn.cmd test` —— 133 个用例全绿
 
 已知缺口(记在 `specs/P2-table-and-sql.md` §11 待补充,未修):
 

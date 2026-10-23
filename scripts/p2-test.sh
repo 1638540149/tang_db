@@ -7,6 +7,9 @@
 #   场景 9  跨内存与磁盘的查询
 #   场景 10 强杀后 SQL 视角零丢失
 #
+# P2.1 补丁(SPEC-P2.1)在场景 6 之后追加一组断言:
+#   反引号标识符 / INSERT 省略列名列表 / SHOW DATABASES(脚本 scripts/sql/13-sql-compat.sql)
+#
 # 用法: bash scripts/p2-test.sh            # 报告写到 tmp/p2-test/report.txt
 # 说明:
 #   - 用**独立端口**(BE 9200 / FE 心跳 9291)与**独立数据目录**(tmp/p2-test/data),
@@ -187,6 +190,22 @@ expect "${out}" "类型" "类型不匹配有明确提示"
 expect "${out}" "主键" "缺主键被拒绝"
 expect "${out}" "语法" "语法错误有明确提示"
 expect_absent "${out}" "Exception in thread" "错误输出里没有 Java 堆栈"
+
+log ""
+log "---------- P2.1 场景 A 反引号标识符 / 省略列名 / SHOW DATABASES ----------"
+out="$(run_sql "${SQL_DIR}/13-sql-compat.sql")"
+expect "${out}" "Database" "SHOW DATABASES 输出列头 Database"
+expect "${out}" "default" "SHOW DATABASES 出一行 default"
+expect "${out}" "OK, 表 t_quoted 已创建" "反引号建表可用(select/from 做列名)"
+expect "${out}" "quoted_value" "反引号列名插入后能查回"
+expect "${out}" "| 37" "反引号列名可 UPDATE(SET \`from\` = 37)"
+expect "${out}" "期望一条 SQL 语句" "反引号不能包裹语句关键字"
+expect "${out}" "标识符不能为空" "空反引号报'标识符不能为空'"
+expect "${out}" "OK, 2 rows affected" "省略列名的多行 INSERT 可用"
+expect "${out}" "sunqi" "省略列名插入的行能按主键点查读回"
+expect "${out}" "第 1 组取值个数(2)与列数(4)不一致" "省略列名少给值时报第几组"
+expect "${out}" "列名列表不能为空" "空列名列表被拒绝"
+expect_absent "${out}" "无法识别的字符" "输出里不再出现'无法识别的字符'"
 
 log ""
 log "---------- 场景 7 ★ 元数据重启不丢 ----------"

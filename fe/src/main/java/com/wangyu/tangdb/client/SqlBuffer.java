@@ -4,13 +4,15 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * 多行 SQL 缓冲:语句以分号结束;分号出现在字符串字面量里不算结束;
- * {@code --} 之后到行尾是注释(FR-170 / FR-171 / K30)。
+ * 多行 SQL 缓冲:语句以分号结束;分号出现在字符串字面量或反引号标识符里不算结束;
+ * {@code --} 之后到行尾是注释(FR-170 / FR-171 / K30 / FR-187)。
  */
 public final class SqlBuffer {
 
     private final StringBuilder buf = new StringBuilder();
     private boolean inString;
+    /** 是否处于反引号标识符内部(FR-187:与单引号同级跟踪)。 */
+    private boolean inQuotedIdent;
 
     /**
      * 追加一行输入,返回本次凑齐的完整语句(可能多条,也可能为空)。
@@ -37,11 +39,31 @@ public final class SqlBuffer {
                 i++;
                 continue;
             }
+            if (inQuotedIdent) {
+                buf.append(c);
+                if (c == '`') {
+                    // 双写反引号表示一个反引号,不结束标识符(FR-184)
+                    if (i + 1 < line.length() && line.charAt(i + 1) == '`') {
+                        buf.append('`');
+                        i += 2;
+                        continue;
+                    }
+                    inQuotedIdent = false;
+                }
+                i++;
+                continue;
+            }
             if (c == '-' && i + 1 < line.length() && line.charAt(i + 1) == '-') {
                 break; // 行注释,丢弃本行剩余内容
             }
             if (c == '\'') {
                 inString = true;
+                buf.append(c);
+                i++;
+                continue;
+            }
+            if (c == '`') {
+                inQuotedIdent = true;
                 buf.append(c);
                 i++;
                 continue;
@@ -54,7 +76,7 @@ public final class SqlBuffer {
             buf.append(c);
             i++;
         }
-        if (inString) {
+        if (inString || inQuotedIdent) {
             buf.append('\n');
         } else {
             buf.append(' ');
@@ -84,5 +106,6 @@ public final class SqlBuffer {
     public void reset() {
         buf.setLength(0);
         inString = false;
+        inQuotedIdent = false;
     }
 }

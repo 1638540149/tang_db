@@ -10,7 +10,7 @@ BE_DIR="${ROOT_DIR}/be"
 FE_DIR="${ROOT_DIR}/fe"
 DATA_DIR="${ROOT_DIR}/data/BE"
 TEST_DIR="${ROOT_DIR}/tmp/crash-test"
-KV_FILE="${TEST_DIR}/kv.txt"
+KV_FILE="$(cygpath -w "${TEST_DIR}/kv.txt")"
 REPORT_FILE="${TEST_DIR}/report.txt"
 BE_EXE="${ROOT_DIR}/tmp/be.exe"
 # 传给原生 go build 的路径要用 Windows 形式,否则在某些 shell 里会被当相对路径

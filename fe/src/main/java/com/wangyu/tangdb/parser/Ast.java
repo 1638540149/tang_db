@@ -17,7 +17,7 @@ public final class Ast {
 
     /** 一条语句。 */
     public sealed interface Statement permits CreateTable, DropTable, TruncateTable,
-            ShowTables, Describe, Insert, Update, Delete, Select {
+            ShowTables, ShowDatabases, Describe, Insert, Update, Delete, Select {
     }
 
     /** 列定义。NULL 性由主键标记推导:主键列不可空,其余列可空。 */
@@ -37,6 +37,10 @@ public final class Ast {
     }
 
     public record ShowTables() implements Statement {
+    }
+
+    /** SHOW DATABASES:只有默认库 default(K22 / FR-200),由 FE 直接回答。 */
+    public record ShowDatabases() implements Statement {
     }
 
     public record Describe(String table) implements Statement {

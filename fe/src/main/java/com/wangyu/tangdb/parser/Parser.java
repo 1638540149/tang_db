@@ -8,17 +8,18 @@ import java.util.List;
 /**
  * 手写递归下降语法分析器(D2)。
  *
- * <p>文法(只覆盖 P2 范围):</p>
+ * <p>文法(只覆盖 P2 + P2.1 范围):</p>
  * <pre>
  * statement := CREATE TABLE ident '(' coldef (',' coldef)* ')'
  *            | DROP TABLE ident
  *            | TRUNCATE TABLE ident
- *            | SHOW TABLES
+ *            | SHOW TABLES | SHOW DATABASES
  *            | DESC ident
- *            | INSERT INTO ident '(' ident (',' ident)* ')' VALUES '(' literal,... ')' (',' '(' ... ')')*
+ *            | INSERT INTO ident ['(' ident (',' ident)* ')'] VALUES 行 (',' 行)*   -- 省略列表 = 全部列
  *            | UPDATE ident SET ident '=' literal (',' ident '=' literal)* [WHERE cond]
  *            | DELETE FROM ident [WHERE cond]
  *            | SELECT ('*' | ident [AS ident] (',' ...)*) FROM ident [WHERE cond] [LIMIT int]
+ * ident      := 普通标识符 | '`' 任意字符 '`'(反引号不解释关键字,不改变大小写语义)
  * cond       := cond AND cond | cond OR cond | '(' cond ')' | ident op literal | ident IN '(' literal,... ')'
  * </pre>
  */
@@ -131,7 +132,10 @@ public final class Parser {
         if (matchKeyword("TABLES")) {
             return new Ast.ShowTables();
         }
-        throw error("SHOW 只支持 SHOW TABLES");
+        if (matchKeyword("DATABASES")) {
+            return new Ast.ShowDatabases();
+        }
+        throw error("SHOW 只支持 SHOW TABLES / SHOW DATABASES");
     }
 
     private Ast.Statement parseDescribe() {
@@ -143,21 +147,29 @@ public final class Parser {
         expectKeyword("INSERT");
         expectKeyword("INTO");
         String table = expectIdentifier("表名");
-        expect(TokenType.LPAREN, "列名列表的 '('");
+        // 列名列表可省略(FR-190):空列表即"按表定义顺序取全部列"。
         List<String> columns = new ArrayList<>();
-        do {
-            columns.add(expectIdentifier("列名"));
-        } while (match(TokenType.COMMA));
-        expect(TokenType.RPAREN, "列名列表的 ')'");
+        if (match(TokenType.LPAREN)) {
+            if (current().type() == TokenType.RPAREN) {
+                throw error("列名列表不能为空"); // FR-192 / K38
+            }
+            do {
+                columns.add(expectIdentifier("列名"));
+            } while (match(TokenType.COMMA));
+            expect(TokenType.RPAREN, "列名列表的 ')'");
+        }
         expectKeyword("VALUES");
 
         List<List<Object>> rows = new ArrayList<>();
         do {
             expect(TokenType.LPAREN, "VALUES 的 '('");
             List<Object> row = new ArrayList<>();
-            do {
-                row.add(parseLiteral());
-            } while (match(TokenType.COMMA));
+            // 允许空组:解析层放行,由执行器统一报"取值个数(0)与列数(N)不一致"(§9)。
+            if (current().type() != TokenType.RPAREN) {
+                do {
+                    row.add(parseLiteral());
+                } while (match(TokenType.COMMA));
+            }
             expect(TokenType.RPAREN, "VALUES 的 ')'");
             rows.add(row);
         } while (match(TokenType.COMMA));
@@ -259,8 +271,7 @@ public final class Parser {
             expect(TokenType.RPAREN, "条件的 ')'");
             return cond;
         }
-        Token colToken = expect(TokenType.IDENT, "列名");
-        String column = colToken.text();
+        String column = expectIdentifier("列名");
 
         if (matchKeyword("IN")) {
             expect(TokenType.LPAREN, "IN 列表的 '('");
@@ -414,7 +425,22 @@ public final class Parser {
     }
 
     private String expectIdentifier(String what) {
-        return expect(TokenType.IDENT, what).text();
+        Token t = expectIdentifierToken(what);
+        // 反引号不引入大小写语义(FR-182 / K31):内部统一小写。
+        // 普通标识符保持原样交给下游(下游本来就按不区分大小写匹配)。
+        return t.type() == TokenType.QUOTED_IDENT
+                ? t.text().toLowerCase(java.util.Locale.ROOT)
+                : t.text();
+    }
+
+    /** 接受普通标识符与反引号标识符(FR-180);关键字仍只匹配普通标识符。 */
+    private Token expectIdentifierToken(String what) {
+        Token t = current();
+        if (t.type() != TokenType.IDENT && t.type() != TokenType.QUOTED_IDENT) {
+            throw error("期望 " + what + ",实际是 " + describe(t));
+        }
+        advance();
+        return t;
     }
 
     private void skipSemicolons() {
@@ -440,6 +466,9 @@ public final class Parser {
         }
         if (t.type() == TokenType.STRING) {
             return "字符串 '" + t.text() + "'";
+        }
+        if (t.type() == TokenType.QUOTED_IDENT) {
+            return "`" + t.text() + "`";
         }
         return "'" + t.text() + "'";
     }

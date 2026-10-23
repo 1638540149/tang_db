@@ -6,7 +6,7 @@ import java.util.List;
 /**
  * 手写词法分析器(P2 规约 D2:不引入任何第三方 SQL 解析库)。
  *
- * <p>支持:标识符、整数/小数、单引号字符串(内部 {@code ''} 表示一个单引号)、
+ * <p>支持:标识符、反引号标识符、整数/小数、单引号字符串(内部 {@code ''} 表示一个单引号)、
  * 运算符 {@code = != <> < <= > >=}、标点、以及 {@code --} 行注释。</p>
  */
 public final class Lexer {
@@ -104,6 +104,7 @@ public final class Lexer {
                     }
                 }
                 case '\'' -> tokens.add(readString(startLine, startCol));
+                case '`' -> tokens.add(readQuotedIdent(startLine, startCol));
                 default -> {
                     if (Character.isDigit(c)) {
                         tokens.add(readNumber(startLine, startCol));
@@ -138,6 +139,36 @@ public final class Lexer {
             advance();
         }
         throw error(startLine, startCol, "字符串缺少结束的单引号");
+    }
+
+    /**
+     * 读取用反引号包裹的标识符(FR-180 ~ FR-185)。
+     *
+     * <p>反引号内除反引号本身外任意字符都合法(含空格、中划线、中文、数字开头);
+     * 双写反引号表示一个反引号;未闭合与空名字各有明确报错,不再报"无法识别的字符"。</p>
+     */
+    private Token readQuotedIdent(int startLine, int startCol) {
+        advance(); // 跳过开头的 `
+        StringBuilder sb = new StringBuilder();
+        while (pos < src.length()) {
+            char c = src.charAt(pos);
+            if (c == '`') {
+                if (peek(1) == '`') {
+                    sb.append('`');
+                    advance();
+                    advance();
+                    continue;
+                }
+                advance();
+                if (sb.length() == 0) {
+                    throw error(startLine, startCol, "标识符不能为空");
+                }
+                return new Token(TokenType.QUOTED_IDENT, sb.toString(), startLine, startCol);
+            }
+            sb.append(c);
+            advance();
+        }
+        throw error(startLine, startCol, "标识符缺少结束的反引号");
     }
 
     private Token readNumber(int startLine, int startCol) {
