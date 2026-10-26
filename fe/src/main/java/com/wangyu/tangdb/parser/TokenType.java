@@ -13,6 +13,7 @@ public enum TokenType {
     COMMA,
     SEMICOLON,
     STAR,
+    DOT,
     MINUS,
     EQ,
     NEQ,

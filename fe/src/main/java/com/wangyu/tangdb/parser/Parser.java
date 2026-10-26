@@ -61,22 +61,39 @@ public final class Parser {
             case "BEGIN" -> parseBegin();
             case "COMMIT" -> parseCommit();
             case "ROLLBACK" -> parseRollback();
+            case "USE" -> parseUse();
             default -> throw error("不支持的语句: " + t.text()
-                    + "(支持 CREATE/DROP/TRUNCATE/SHOW/DESC/INSERT/UPDATE/DELETE/SELECT/BEGIN/COMMIT/ROLLBACK)");
+                    + "(支持 CREATE/DROP/TRUNCATE/SHOW/DESC/INSERT/UPDATE/DELETE/SELECT/BEGIN/COMMIT/ROLLBACK/USE)");
         };
     }
 
     private Ast.Statement parseCreate() {
         expectKeyword("CREATE");
+        if (matchKeyword("DATABASE")) {
+            return new Ast.CreateDatabase(expectIdentifier("库名"));
+        }
         expectKeyword("TABLE");
-        String table = expectIdentifier("表名");
+        Ref ref = parseTableRef("表名");
         expect(TokenType.LPAREN, "列定义列表的 '('");
         List<Ast.ColumnDef> columns = new ArrayList<>();
         do {
             columns.add(parseColumnDef());
         } while (match(TokenType.COMMA));
         expect(TokenType.RPAREN, "列定义列表的 ')'");
-        return new Ast.CreateTable(table, columns);
+        return new Ast.CreateTable(ref.database(), ref.table(), columns);
+    }
+
+    /** 解析一个可限定的表引用:ident 或 ident . ident(db.tbl)。 */
+    private Ref parseTableRef(String what) {
+        String first = expectIdentifier(what);
+        if (match(TokenType.DOT)) {
+            return new Ref(first, expectIdentifier("表名"));
+        }
+        return new Ref(null, first);
+    }
+
+    /** 表引用:database 为 null 表示未限定。 */
+    private record Ref(String database, String table) {
     }
 
     private Ast.ColumnDef parseColumnDef() {
@@ -143,14 +160,24 @@ public final class Parser {
 
     private Ast.Statement parseDrop() {
         expectKeyword("DROP");
+        if (matchKeyword("DATABASE")) {
+            return new Ast.DropDatabase(expectIdentifier("库名"));
+        }
         expectKeyword("TABLE");
-        return new Ast.DropTable(expectIdentifier("表名"));
+        Ref ref = parseTableRef("表名");
+        return new Ast.DropTable(ref.database(), ref.table());
     }
 
     private Ast.Statement parseTruncate() {
         expectKeyword("TRUNCATE");
         expectKeyword("TABLE");
-        return new Ast.TruncateTable(expectIdentifier("表名"));
+        Ref ref = parseTableRef("表名");
+        return new Ast.TruncateTable(ref.database(), ref.table());
+    }
+
+    private Ast.Statement parseUse() {
+        expectKeyword("USE");
+        return new Ast.Use(expectIdentifier("库名"));
     }
 
     private Ast.Statement parseShow() {
@@ -166,13 +193,14 @@ public final class Parser {
 
     private Ast.Statement parseDescribe() {
         advance(); // DESC / DESCRIBE
-        return new Ast.Describe(expectIdentifier("表名"));
+        Ref ref = parseTableRef("表名");
+        return new Ast.Describe(ref.database(), ref.table());
     }
 
     private Ast.Statement parseInsert() {
         expectKeyword("INSERT");
         expectKeyword("INTO");
-        String table = expectIdentifier("表名");
+        Ref ref = parseTableRef("表名");
         // 列名列表可省略(FR-190):空列表即"按表定义顺序取全部列"。
         List<String> columns = new ArrayList<>();
         if (match(TokenType.LPAREN)) {
@@ -199,12 +227,12 @@ public final class Parser {
             expect(TokenType.RPAREN, "VALUES 的 ')'");
             rows.add(row);
         } while (match(TokenType.COMMA));
-        return new Ast.Insert(table, columns, rows);
+        return new Ast.Insert(ref.database(), ref.table(), columns, rows);
     }
 
     private Ast.Statement parseUpdate() {
         expectKeyword("UPDATE");
-        String table = expectIdentifier("表名");
+        Ref ref = parseTableRef("表名");
         expectKeyword("SET");
         List<Ast.Assignment> assignments = new ArrayList<>();
         do {
@@ -216,18 +244,18 @@ public final class Parser {
         if (matchKeyword("WHERE")) {
             where = parseCondition();
         }
-        return new Ast.Update(table, assignments, where);
+        return new Ast.Update(ref.database(), ref.table(), assignments, where);
     }
 
     private Ast.Statement parseDelete() {
         expectKeyword("DELETE");
         expectKeyword("FROM");
-        String table = expectIdentifier("表名");
+        Ref ref = parseTableRef("表名");
         Ast.Condition where = null;
         if (matchKeyword("WHERE")) {
             where = parseCondition();
         }
-        return new Ast.Delete(table, where);
+        return new Ast.Delete(ref.database(), ref.table(), where);
     }
 
     private Ast.Statement parseSelect() {
@@ -247,7 +275,7 @@ public final class Parser {
             } while (match(TokenType.COMMA));
         }
         expectKeyword("FROM");
-        String table = expectIdentifier("表名");
+        Ref ref = parseTableRef("表名");
         Ast.Condition where = null;
         if (matchKeyword("WHERE")) {
             where = parseCondition();
@@ -266,7 +294,7 @@ public final class Parser {
             }
             limit = (int) v;
         }
-        return new Ast.Select(table, star, items, where, limit);
+        return new Ast.Select(ref.database(), ref.table(), star, items, where, limit);
     }
 
     // ------------------------------------------------------------ 条件

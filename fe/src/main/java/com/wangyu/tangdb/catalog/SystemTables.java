@@ -8,35 +8,74 @@ import com.wangyu.tangdb.storage.TableMeta;
 
 import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.Set;
 
 /**
- * 系统表布局(规约 §5.4)。系统表就是普通表,只是表 ID 落在保留区 1~15。
+ * 系统表布局(规约 §5.4)。系统表就是普通表,只是表 ID 落在登记表里。
  *
  * <pre>
- * 1 sys_tables   : key = table_id(4B BE)
- *                  列: table_id BIGINT, name VARCHAR, state INT, created_at VARCHAR
- * 2 sys_columns  : key = table_id(4B BE) + ordinal(2B BE)
- *                  列: table_id BIGINT, ordinal INT, name VARCHAR, type INT,
- *                      type_len INT, nullable BOOLEAN, is_pk BOOLEAN
- * 4 sys_counters : key = name(VARCHAR 保序编码)
- *                  列: name VARCHAR, value BIGINT
+ * 1 sys_tables     : key = table_id(4B BE)
+ *                    列: table_id BIGINT, name VARCHAR, state INT, created_at VARCHAR,
+ *                        db_name VARCHAR
+ * 2 sys_columns    : key = table_id(4B BE) + ordinal(2B BE)
+ *                    列: table_id BIGINT, ordinal INT, name VARCHAR, type INT,
+ *                        type_len INT, nullable BOOLEAN, is_pk BOOLEAN
+ * 3 sys_databases  : key = db_name(VARCHAR 保序编码)
+ *                    列: db_name VARCHAR, create_ts VARCHAR, remark VARCHAR
+ * 4 sys_counters   : key = name(VARCHAR 保序编码)
+ *                    列: name VARCHAR, value BIGINT
+ * </pre>
+ *
+ * <p>系统表 ID 登记表(SPEC-P3.5 K70 / FR-426):</p>
+ *
+ * <pre>
+ * | ID | 状态   | 用途        |
+ * |  1 | 已分配 | sys_tables  |
+ * |  2 | 已分配 | sys_columns |
+ * |  3 | 已分配 | sys_databases |
+ * |  4 | 已分配 | sys_counters|
+ * | 5~63 | 预留 | 后续元数据族 |
+ * | ≥64 | 用户表 | 新库 next_table_id 初值 |
  * </pre>
  */
 public final class SystemTables {
 
     public static final long SYS_TABLES = 1;
     public static final long SYS_COLUMNS = 2;
+    public static final long SYS_DATABASES = 3;
     public static final long SYS_COUNTERS = 4;
 
-    /** 预留的表 ID 上界(1~15)。 */
-    public static final long RESERVED_MAX_TABLE_ID = 15;
+    /** 系统表 ID 登记表(FR-426 / K70):不在其中的 ID 即用户表。 */
+    public static final Set<Long> REGISTERED_IDS = Set.of(SYS_TABLES, SYS_COLUMNS, SYS_DATABASES, SYS_COUNTERS);
+
+    /** 预留区上界(5~63 预留给后续元数据族,当前未登记)。 */
+    public static final long RESERVED_MAX_TABLE_ID = 63;
 
     public static final String COUNTER_NEXT_TABLE_ID = "next_table_id";
-    public static final long INITIAL_NEXT_TABLE_ID = 16;
+
+    /** 新库 next_table_id 初值(FR-425)。 */
+    public static final long INITIAL_NEXT_TABLE_ID = 64;
+
+    /** 任何数据目录里 next_table_id 的下限:1~4 是系统表,不得分配(FR-426)。 */
+    public static final long MIN_TABLE_ID = 5;
+
+    public static final String DEFAULT_DATABASE = "default";
 
     private static final int MAX_VARCHAR = 65535;
 
+    /** sys_tables(新 5 列形态,db_name 追加在末尾,老目录 4 列行是它的前缀)。 */
     public static final TableMeta TABLES = new TableMeta(
+            SYS_TABLES, "sys_tables", TableMeta.STATE_ACTIVE, "",
+            List.of(
+                    new Column("table_id", DataType.BIGINT, 0, false, true, 0),
+                    new Column("name", DataType.VARCHAR, MAX_VARCHAR, false, false, 1),
+                    new Column("state", DataType.INT, 0, false, false, 2),
+                    new Column("created_at", DataType.VARCHAR, MAX_VARCHAR, false, false, 3),
+                    new Column("db_name", DataType.VARCHAR, 64, false, false, 4)),
+            true);
+
+    /** sys_tables 老形态(P3 及以前,4 列,无 db_name),用于老数据目录的宽容读(FR-424)。 */
+    public static final TableMeta TABLES_LEGACY = new TableMeta(
             SYS_TABLES, "sys_tables", TableMeta.STATE_ACTIVE, "",
             List.of(
                     new Column("table_id", DataType.BIGINT, 0, false, true, 0),
@@ -57,6 +96,14 @@ public final class SystemTables {
                     new Column("is_pk", DataType.BOOLEAN, 0, false, false, 6)),
             true);
 
+    public static final TableMeta DATABASES = new TableMeta(
+            SYS_DATABASES, "sys_databases", TableMeta.STATE_ACTIVE, "",
+            List.of(
+                    new Column("db_name", DataType.VARCHAR, 64, false, true, 0),
+                    new Column("create_ts", DataType.VARCHAR, 64, false, false, 1),
+                    new Column("remark", DataType.VARCHAR, MAX_VARCHAR, true, false, 2)),
+            true);
+
     public static final TableMeta COUNTERS = new TableMeta(
             SYS_COUNTERS, "sys_counters", TableMeta.STATE_ACTIVE, "",
             List.of(
@@ -67,8 +114,9 @@ public final class SystemTables {
     private SystemTables() {
     }
 
+    /** 表 ID 是否属于系统表登记表(FR-426:不在登记表内即用户表)。 */
     public static boolean isSystemTable(long tableId) {
-        return tableId >= 1 && tableId <= RESERVED_MAX_TABLE_ID;
+        return REGISTERED_IDS.contains(tableId);
     }
 
     /** sys_tables 的主键编码:table_id 4B 大端。 */
@@ -89,8 +137,13 @@ public final class SystemTables {
         return KeyCodec.systemRowKey(SYS_COUNTERS, KeyCodec.encodePrimaryKey(DataType.VARCHAR, name));
     }
 
-    public static byte[] encodeTableRow(long tableId, String name, int state, String createdAt) {
-        return RowCodec.encode(TABLES, new Object[]{tableId, name, state, createdAt});
+    /** sys_databases 的主键编码:db_name 的 VARCHAR 保序编码。 */
+    public static byte[] databaseKey(String dbName) {
+        return KeyCodec.systemRowKey(SYS_DATABASES, KeyCodec.encodePrimaryKey(DataType.VARCHAR, dbName));
+    }
+
+    public static byte[] encodeTableRow(long tableId, String name, int state, String createdAt, String dbName) {
+        return RowCodec.encode(TABLES, new Object[]{tableId, name, state, createdAt, dbName});
     }
 
     public static byte[] encodeColumnRow(Column column, long tableId) {
@@ -107,6 +160,10 @@ public final class SystemTables {
 
     public static byte[] encodeCounterRow(String name, long value) {
         return RowCodec.encode(COUNTERS, new Object[]{name, value});
+    }
+
+    public static byte[] encodeDatabaseRow(String dbName, String createTs, String remark) {
+        return RowCodec.encode(DATABASES, new Object[]{dbName, createTs, remark});
     }
 
     public static long decodeTableId(byte[] row) {

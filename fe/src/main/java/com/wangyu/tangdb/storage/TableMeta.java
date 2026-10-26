@@ -16,6 +16,8 @@ public final class TableMeta {
 
     private final long id;
     private final String name;
+    /** 所属库(小写);系统表为 null。SPEC-P3.5 起用户表才有库归属。 */
+    private final String dbName;
     private final int state;
     private final String createdAt;
     private final List<Column> columns;
@@ -23,8 +25,14 @@ public final class TableMeta {
 
     public TableMeta(long id, String name, int state, String createdAt,
                      List<Column> columns, boolean system) {
+        this(id, name, null, state, createdAt, columns, system);
+    }
+
+    public TableMeta(long id, String name, String dbName, int state, String createdAt,
+                     List<Column> columns, boolean system) {
         this.id = id;
         this.name = name == null ? null : name.toLowerCase();
+        this.dbName = dbName == null ? null : dbName.toLowerCase();
         this.state = state;
         this.createdAt = createdAt;
         this.columns = List.copyOf(columns);
@@ -37,6 +45,11 @@ public final class TableMeta {
 
     public String name() {
         return name;
+    }
+
+    /** 所属库名;系统表返回 null。 */
+    public String dbName() {
+        return dbName;
     }
 
     public int state() {

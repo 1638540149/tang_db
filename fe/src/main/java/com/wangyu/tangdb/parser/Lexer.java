@@ -39,6 +39,19 @@ public final class Lexer {
                 }
                 continue;
             }
+            // /* ... */ 块注释
+            if (c == '/' && peek(1) == '*') {
+                advance();
+                advance();
+                while (pos < src.length() && !(src.charAt(pos) == '*' && peek(1) == '/')) {
+                    advance();
+                }
+                if (pos < src.length()) {
+                    advance(); // '*'
+                    advance(); // '/'
+                }
+                continue;
+            }
             int startLine = line;
             int startCol = column;
             switch (c) {
@@ -61,6 +74,10 @@ public final class Lexer {
                 case '*' -> {
                     advance();
                     tokens.add(new Token(TokenType.STAR, "*", startLine, startCol));
+                }
+                case '.' -> {
+                    advance();
+                    tokens.add(new Token(TokenType.DOT, ".", startLine, startCol));
                 }
                 case '-' -> {
                     advance();

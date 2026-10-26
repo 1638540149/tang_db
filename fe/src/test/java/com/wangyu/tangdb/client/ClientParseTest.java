@@ -20,29 +20,37 @@ class ClientParseTest {
     void parseArgs() {
         Cli.Config defaults = Cli.parseArgs(new String[0], FeConfig.defaults());
         assertEquals("127.0.0.1", defaults.host());
-        assertEquals(9100, defaults.port());
+        assertEquals(3406, defaults.port());
+        assertEquals("root", defaults.user());
+        assertEquals("tangdb", defaults.password());
+        assertNull(defaults.database());
 
+        // be_host/be_port 是 fed 连 BE 用的,与 CLI 连 fed 的 host/port 无关。
         Cli.Config fromConfigFile = Cli.parseArgs(new String[0], FeConfig.of("10.0.0.8", 9200));
-        assertEquals("10.0.0.8", fromConfigFile.host());
-        assertEquals(9200, fromConfigFile.port());
+        assertEquals("127.0.0.1", fromConfigFile.host());
+        assertEquals(3406, fromConfigFile.port());
 
         Cli.Config separate = Cli.parseArgs(
-                new String[]{"--be-host", "10.0.0.8", "--be-port", "9200"}, FeConfig.defaults());
+                new String[]{"--host", "10.0.0.8", "--port", "9200"}, FeConfig.defaults());
         assertEquals("10.0.0.8", separate.host());
         assertEquals(9200, separate.port());
 
         Cli.Config equals = Cli.parseArgs(
-                new String[]{"--be-host=localhost", "--be-port=19100"}, FeConfig.defaults());
+                new String[]{"--host=localhost", "--port=19100", "--database=shop",
+                        "--user=bob", "--password=secret"}, FeConfig.defaults());
         assertEquals("localhost", equals.host());
         assertEquals(19100, equals.port());
+        assertEquals("bob", equals.user());
+        assertEquals("secret", equals.password());
+        assertEquals("shop", equals.database());
     }
 
     @Test
     void invalidArgs() {
-        expectArgsError(new String[]{"--be-port", "abc"}, "端口无效: abc");
-        expectArgsError(new String[]{"--be-port", "0"}, "端口无效: 0");
-        expectArgsError(new String[]{"--be-port", "70000"}, "端口无效: 70000");
-        expectArgsError(new String[]{"--be-host"}, "参数 --be-host 缺少取值");
+        expectArgsError(new String[]{"--port", "abc"}, "端口无效: abc");
+        expectArgsError(new String[]{"--port", "0"}, "端口无效: 0");
+        expectArgsError(new String[]{"--port", "70000"}, "端口无效: 70000");
+        expectArgsError(new String[]{"--host"}, "参数 --host 缺少取值");
         expectArgsError(new String[]{"--bad-flag"}, "未知启动参数: --bad-flag");
     }
 

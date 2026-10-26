@@ -37,9 +37,7 @@ public final class CrashTest {
         }
         String mode = args[0];
 
-        String[] clientArgs = extractClientArgs(args);
-        String host = Cli.parseArgs(clientArgs).host();
-        int port = Cli.parseArgs(clientArgs).port();
+        Target target = resolveTarget(args);
 
         if ("write".equals(mode)) {
             if (args.length < 4) {
@@ -49,31 +47,45 @@ public final class CrashTest {
             int count = Integer.parseInt(args[1]);
             long seed = Long.parseLong(args[2]);
             Path file = Paths.get(args[3]);
-            write(host, port, count, seed, file);
+            write(target.host, target.port, count, seed, file);
         } else if ("verify".equals(mode)) {
             Path file = Paths.get(args[1]);
-            verify(host, port, file);
+            verify(target.host, target.port, file);
         } else {
             System.err.println("未知模式: " + mode);
             System.exit(2);
         }
     }
 
-    private static String[] extractClientArgs(String[] args) {
-        List<String> list = new ArrayList<>();
+    /** BE 连接目标:直接从 --be-host / --be-port / --config 解析(与 CLI 的 fed 参数解耦)。 */
+    private static Target resolveTarget(String[] args) {
+        String configPath = null;
+        String beHost = null;
+        String bePort = null;
         for (int i = 0; i < args.length; i++) {
-            if (args[i].equals("--be-host") || args[i].equals("--be-port")
-                    || args[i].equals("--config")) {
-                if (i + 1 < args.length) {
-                    list.add(args[i]);
-                    list.add(args[++i]);
-                }
-            } else if (args[i].startsWith("--be-host=") || args[i].startsWith("--be-port=")
-                    || args[i].startsWith("--config=")) {
-                list.add(args[i]);
+            String arg = args[i];
+            if (arg.startsWith("--be-host=")) {
+                beHost = arg.substring("--be-host=".length());
+            } else if (arg.equals("--be-host") && i + 1 < args.length) {
+                beHost = args[++i];
+            } else if (arg.startsWith("--be-port=")) {
+                bePort = arg.substring("--be-port=".length());
+            } else if (arg.equals("--be-port") && i + 1 < args.length) {
+                bePort = args[++i];
+            } else if (arg.startsWith("--config=")) {
+                configPath = arg.substring("--config=".length());
+            } else if (arg.equals("--config") && i + 1 < args.length) {
+                configPath = args[++i];
             }
         }
-        return list.toArray(new String[0]);
+        FeConfig cfg = configPath == null
+                ? FeConfig.load(FeConfig.DEFAULT_PATH) : FeConfig.load(configPath);
+        String host = beHost == null ? cfg.beHost() : beHost;
+        int port = bePort == null ? cfg.bePort() : Integer.parseInt(bePort);
+        return new Target(host, port);
+    }
+
+    private record Target(String host, int port) {
     }
 
     private static void write(String host, int port, int count, long seed, Path file) throws Exception {

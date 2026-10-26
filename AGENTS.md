@@ -91,7 +91,7 @@ mvn.cmd test
 
 - BE:`go build ./...` 与 `go vet ./...` 无错,相关单测通过
 - FE:`mvn.cmd compile` 无错
-- 涉及写路径的改动:跑一次崩溃测试(`scripts/crash-test.sh`)
+- 涉及写路径的改动:跑一次崩溃测试(`scripts/tests/crash-test.sh`)
 
 **交付时必须列出实际执行的命令与真实输出。禁止把未运行的检查描述为通过。** 没有跑的项要明说"未验证"。
 

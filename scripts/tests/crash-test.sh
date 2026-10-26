@@ -5,7 +5,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+ROOT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 BE_DIR="${ROOT_DIR}/be"
 FE_DIR="${ROOT_DIR}/fe"
 DATA_DIR="${ROOT_DIR}/data/BE"
@@ -44,11 +44,13 @@ kill_be() {
 }
 
 wait_for_be() {
-    local host="$1"
-    local port="$2"
+    local logfile="$1"
     for i in $(seq 1 60); do
-        if java -Dfile.encoding=UTF-8 -cp "${CP}" com.wangyu.tangdb.client.Cli --config="${FE_CONFIG}" --be-host="${host}" --be-port="${port}" <<<"ping" 2>/dev/null | grep -q "BE 版本"; then
+        if grep -q "BE 已就绪" "${logfile}" 2>/dev/null; then
             return 0
+        fi
+        if grep -q "BE 启动失败" "${logfile}" 2>/dev/null; then
+            return 1
         fi
         sleep 1
     done
@@ -81,7 +83,7 @@ export CP
 log "=== 启动 BE (端口 ${BE_PORT}) ==="
 "${BE_EXE}" --config="${BE_CONFIG}" --data-dir="$(cygpath -w "${DATA_DIR}")" --port="${BE_PORT}" --memtable-size=32KB >"${TEST_DIR}/be.log" 2>&1 &
 BE_PID=$!
-if ! wait_for_be 127.0.0.1 "${BE_PORT}"; then
+if ! wait_for_be "${TEST_DIR}/be.log"; then
     log "BE 未在预期时间内就绪"
     cat "${TEST_DIR}/be.log" || true
     kill_be
@@ -107,7 +109,7 @@ wait "${BE_PID}" 2>/dev/null || true
 log "=== 重启 BE ==="
 "${BE_EXE}" --config="${BE_CONFIG}" --data-dir="$(cygpath -w "${DATA_DIR}")" --port="${BE_PORT}" --memtable-size=32KB >"${TEST_DIR}/be-recovery.log" 2>&1 &
 BE_PID=$!
-if ! wait_for_be 127.0.0.1 "${BE_PORT}"; then
+if ! wait_for_be "${TEST_DIR}/be-recovery.log"; then
     log "BE 恢复后未在预期时间内就绪"
     cat "${TEST_DIR}/be-recovery.log" || true
     kill_be

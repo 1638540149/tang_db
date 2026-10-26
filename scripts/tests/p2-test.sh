@@ -10,7 +10,7 @@
 # P2.1 补丁(SPEC-P2.1)在场景 6 之后追加一组断言:
 #   反引号标识符 / INSERT 省略列名列表 / SHOW DATABASES(脚本 scripts/sql/13-sql-compat.sql)
 #
-# 用法: bash scripts/p2-test.sh            # 报告写到 tmp/p2-test/report.txt
+# 用法: bash scripts/tests/p2-test.sh      # 报告写到 tmp/p2-test/report.txt
 # 说明:
 #   - 用**独立端口**(BE 9200 / FE 心跳 9291)与**独立数据目录**(tmp/p2-test/data),
 #     不碰日常使用的 data/BE 与 9100。
@@ -20,7 +20,7 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+ROOT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 BE_DIR="${ROOT_DIR}/be"
 FE_DIR="${ROOT_DIR}/fe"
@@ -35,6 +35,7 @@ SQL_DIR="${ROOT_DIR}/scripts/sql"
 
 BE_PORT=9200
 FE_HEART_PORT=9291
+MYSQL_PORT=9406
 MEMTABLE_SIZE=1KB
 
 export PATH="/c/Program Files/Go/bin:${PATH}"
@@ -61,6 +62,38 @@ kill_be() {
         taskkill /F /PID "${pid}" >/dev/null 2>&1 || true
     done
     sleep 1
+}
+
+kill_fed() {
+    # git-bash 的 $! 是 MSYS PID,不是 taskkill 需要的 Windows PID;
+    # 按命令行精确匹配 fed 的 java 进程(gRPC/MySQL 端口随进程退出释放)。
+    powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='java.exe'\" | Where-Object { \$_.CommandLine -like '*tangdb.fed.Fed*' } | ForEach-Object { Stop-Process -Id \$_.ProcessId -Force -ErrorAction SilentlyContinue }" >/dev/null 2>&1 || true
+    FED_PID=""
+    sleep 1
+}
+
+start_fed() {
+    java -Dfile.encoding=UTF-8 -cp "${CP}" com.wangyu.tangdb.fed.Fed \
+        --config="$(cygpath -w "${FE_CONF}")" >"${TEST_DIR}/fed.log" 2>&1 &
+    FED_PID=$!
+    for _ in $(seq 1 60); do
+        if grep -q "fed 已就绪" "${TEST_DIR}/fed.log" 2>/dev/null; then
+            return 0
+        fi
+        if grep -q "FE 启动失败" "${TEST_DIR}/fed.log" 2>/dev/null; then
+            log "fed 启动失败:"; cat "${TEST_DIR}/fed.log" | tee -a "${REPORT}"
+            return 1
+        fi
+        sleep 0.5
+    done
+    log "fed 未在预期时间内就绪:"; cat "${TEST_DIR}/fed.log" | tee -a "${REPORT}"
+    return 1
+}
+
+# 数据目录被清空后必须重启 fed,让 catalog 从当前数据目录重新加载(数据目录重置是测试动作)
+restart_fed() {
+    kill_fed
+    start_fed
 }
 
 start_be() {
@@ -135,15 +168,26 @@ EOF
 cat >"${FE_CONF}" <<EOF
 be_host = 127.0.0.1
 be_port = ${BE_PORT}
+mode = fed
+mysql_port = ${MYSQL_PORT}
+user = root
+password = p2test
+session_max = 64
+session_idle_timeout = 0
+shutdown_grace_seconds = 5
 heartbeat_listen_port = ${FE_HEART_PORT}
 be_offline_cycles = 3
+heartbeat_enabled = true
 EOF
 
-log "[配置] BE 端口 ${BE_PORT} / FE 心跳端口 ${FE_HEART_PORT} / 数据目录 ${DATA_DIR} / memtable ${MEMTABLE_SIZE}"
+log "[配置] BE 端口 ${BE_PORT} / fed 心跳端口 ${FE_HEART_PORT} / MySQL 端口 ${MYSQL_PORT} / 数据目录 ${DATA_DIR} / memtable ${MEMTABLE_SIZE}"
 
 kill_be
+kill_fed
 if ! start_be; then log "无法启动 BE,测试中止"; exit 1; fi
 log "[就绪] BE 已启动"
+if ! start_fed; then log "无法启动 fed,测试中止"; kill_be; exit 1; fi
+log "[就绪] fed 已启动"
 
 # ---------------------------------------------------------------- 场景 1~6
 
@@ -232,6 +276,7 @@ kill_be
 rm -rf "${DATA_DIR}"; mkdir -p "${DATA_DIR}"
 # 顺序要点:BE 先起(它会在 FE 不在时不断重试注册),CLI 起来后它会在 ≤10 秒内注册成功
 start_be || bad "心跳场景里 BE 启动失败"
+restart_fed || bad "心跳场景里 fed 重启失败"
 (
     sleep 14; echo 'SHOW BACKENDS;'   # t+14:BE 已登记 → 可用
     sleep 16; echo 'SHOW BACKENDS;'   # t+30:BE 在 t+16 被杀 → 应不可用
@@ -272,6 +317,7 @@ log "---------- 场景 9 ★ 跨内存与磁盘的查询 ----------"
 kill_be
 rm -rf "${DATA_DIR}"; mkdir -p "${DATA_DIR}"
 start_be || bad "跨内存/磁盘场景里 BE 启动失败"
+restart_fed || bad "跨内存/磁盘场景里 fed 重启失败"
 out="$(run_sql "${SQL_DIR}/10-cross-memdisk.sql")"
 expect "${out}" "OK, 30 rows affected" "写入 30 行"
 expect "${out}" "name_30" "范围查询(id >= 26)跨内存/磁盘取到最新行"
@@ -320,6 +366,7 @@ expect "${tables_after}" "big" "DROP 后其它表(前面场景建的 big)仍然�
 # ---------------------------------------------------------------- 收尾
 
 kill_be
+kill_fed
 
 log ""
 log "=================================================="

@@ -43,6 +43,9 @@ public final class Executor {
     private final KvStore kv;
     private final Catalog catalog;
 
+    /** 会话当前库(小写);默认 default。只影响本会话(FR-403 / FR-418)。 */
+    private String currentDatabase = "default";
+
     /** null = IDLE;非 null = ACTIVE。同一会话最多一个事务(FR-341)。 */
     private Transaction active;
 
@@ -66,6 +69,30 @@ public final class Executor {
         return active != null;
     }
 
+    /** 会话当前库(小写)。 */
+    public String currentDatabase() {
+        return currentDatabase;
+    }
+
+    /** 切换会话当前库(FR-418)。库不存在抛 1049。 */
+    public void useDatabase(String database) {
+        String name = database == null ? null : database.trim().toLowerCase();
+        catalog.requireDatabase(name);
+        this.currentDatabase = name;
+    }
+
+    /**
+     * 把限定名解析成实际库名:未限定 = 当前库。
+     *
+     * <p>无论是否限定都校验库存在(1049):会话当前库可能被别人 DROP 掉(边界 4),
+     * 此时下一条带库语义的语句应报"库不存在",而不是"表不存在"。</p>
+     */
+    private String resolveDatabase(String database) {
+        String db = database == null ? currentDatabase : database.toLowerCase();
+        catalog.requireDatabase(db);
+        return db;
+    }
+
     public Result execute(Ast.Statement statement) {
         if (statement instanceof Ast.Begin) {
             return begin();
@@ -76,6 +103,20 @@ public final class Executor {
         if (statement instanceof Ast.Rollback) {
             return rollback();
         }
+        if (statement instanceof Ast.CreateDatabase createDb) {
+            requireNoTransaction("CREATE DATABASE");
+            catalog.createDatabase(createDb.name());
+            return new Result.Message("OK, 库 " + createDb.name().trim().toLowerCase() + " 已创建");
+        }
+        if (statement instanceof Ast.DropDatabase dropDb) {
+            requireNoTransaction("DROP DATABASE");
+            catalog.dropDatabase(dropDb.name());
+            return new Result.Message("OK, 库 " + dropDb.name().trim().toLowerCase() + " 已删除");
+        }
+        if (statement instanceof Ast.Use use) {
+            useDatabase(use.name());
+            return new Result.Message("OK, 已切换库 " + currentDatabase);
+        }
 
         if (statement instanceof Ast.CreateTable create) {
             requireNoTransaction("CREATE TABLE");
@@ -83,12 +124,14 @@ public final class Executor {
         }
         if (statement instanceof Ast.DropTable drop) {
             requireNoTransaction("DROP TABLE");
-            catalog.dropTable(drop.table());
+            String db = resolveDatabase(drop.database());
+            catalog.dropTable(db, drop.table());
             return new Result.Message("OK, 表 " + drop.table().toLowerCase() + " 已删除");
         }
         if (statement instanceof Ast.TruncateTable truncate) {
             requireNoTransaction("TRUNCATE TABLE");
-            TableMeta table = catalog.truncateTable(truncate.table());
+            String db = resolveDatabase(truncate.database());
+            TableMeta table = catalog.truncateTable(db, truncate.table());
             return new Result.Message("OK, 表 " + table.name() + " 已清空(新表 ID " + table.id() + ")");
         }
         if (statement instanceof Ast.ShowTables) {
@@ -277,12 +320,15 @@ public final class Executor {
             columns.add(new Column(def.name(), def.type(), def.length(), def.nullable(),
                     def.primaryKey(), i));
         }
-        TableMeta table = catalog.createTable(create.table(), columns);
+        String db = resolveDatabase(create.database());
+        TableMeta table = catalog.createTable(db, create.table(), columns);
         return new Result.Message("OK, 表 " + table.name() + " 已创建(表 ID " + table.id() + ")");
     }
 
     private Result showTables() {
-        List<TableMeta> tables = catalog.tables();
+        // 当前库可能已被别人 DROP(边界 4):先校验存在,不存在报 1049。
+        catalog.requireDatabase(currentDatabase);
+        List<TableMeta> tables = catalog.tables(currentDatabase);
         List<Object[]> rows = new ArrayList<>(tables.size());
         for (TableMeta table : tables) {
             rows.add(new Object[]{table.name(), table.id(), table.createdAt()});
@@ -290,15 +336,18 @@ public final class Executor {
         return new Result.Table(List.of("table_name", "table_id", "created_at"), rows);
     }
 
-    /**
-     * SHOW DATABASES:只有默认库(K22),静态回答,不访问 BE(FR-200 / FR-201)。
-     */
+    /** SHOW DATABASES:列出全部库(含 default),由 FE 内存直接回答(FR-201 / FR-422)。 */
     private Result showDatabases() {
-        return new Result.Table(List.of("Database"), List.<Object[]>of(new Object[]{"default"}));
+        List<String> dbs = catalog.databases();
+        List<Object[]> rows = new ArrayList<>(dbs.size());
+        for (String db : dbs) {
+            rows.add(new Object[]{db});
+        }
+        return new Result.Table(List.of("Database"), rows);
     }
 
     private Result describe(Ast.Describe describe) {
-        TableMeta table = catalog.require(describe.table());
+        TableMeta table = requireTable(describe.database(), describe.table());
         List<Object[]> rows = new ArrayList<>(table.columnCount());
         for (Column column : table.columns()) {
             rows.add(new Object[]{
@@ -311,10 +360,15 @@ public final class Executor {
         return new Result.Table(List.of("column", "type", "primary_key", "nullable"), rows);
     }
 
+    /** 解析表名:限定名取指定库,未限定取当前库;不存在抛 1146。 */
+    private TableMeta requireTable(String database, String table) {
+        return catalog.require(resolveDatabase(database), table);
+    }
+
     // ------------------------------------------------------------ DML
 
     private Result insert(Ast.Insert insert) {
-        TableMeta table = catalog.require(insert.table());
+        TableMeta table = requireTable(insert.database(), insert.table());
         if (insert.rows().isEmpty()) {
             throw new StoreException("INSERT 至少需要一组 VALUES");
         }
@@ -332,7 +386,8 @@ public final class Executor {
             for (String columnName : insert.columns()) {
                 Column column = table.column(columnName);
                 if (column == null) {
-                    throw new CatalogException("列 " + columnName + " 不存在(表 " + table.name() + ")");
+                    throw new CatalogException("列 " + columnName + " 不存在(表 " + table.name() + ")",
+                            SqlError.ER_BAD_FIELD_ERROR);
                 }
                 if (!seen.add(column.name())) {
                     throw new StoreException("列 " + column.name() + " 在 INSERT 列表里重复出现");
@@ -367,17 +422,17 @@ public final class Executor {
             byte[] existing = view.get(key);
             if (existing != null && !isTombstone(table, existing)) {
                 throw new StoreException("第 " + (k + 1) + " 组主键冲突(表 " + table.name()
-                        + ",主键 " + Values.display(pkValue) + ")");
+                        + ",主键 " + Values.display(pkValue) + ")", SqlError.ER_DUP_ENTRY);
             }
             local.put(key, RowCodec.encode(table, values));
             written++;
         }
         flushWrites(local);
-        return new Result.Message(affected(written));
+        return affected(written);
     }
 
     private Result update(Ast.Update update) {
-        TableMeta table = catalog.require(update.table());
+        TableMeta table = requireTable(update.database(), update.table());
 
         int[] targetIndexes = new int[update.assignments().size()];
         Object[] targetValues = new Object[update.assignments().size()];
@@ -385,7 +440,8 @@ public final class Executor {
             Ast.Assignment assignment = update.assignments().get(i);
             Column column = table.column(assignment.column());
             if (column == null) {
-                throw new CatalogException("列 " + assignment.column() + " 不存在(表 " + table.name() + ")");
+                throw new CatalogException("列 " + assignment.column() + " 不存在(表 " + table.name() + ")",
+                        SqlError.ER_BAD_FIELD_ERROR);
             }
             if (column.primaryKey()) {
                 throw new StoreException("不允许修改主键列 " + column.name()
@@ -408,11 +464,11 @@ public final class Executor {
             return true;
         });
         flushWrites(local);
-        return new Result.Message(affected(count[0]));
+        return affected(count[0]);
     }
 
     private Result delete(Ast.Delete delete) {
-        TableMeta table = catalog.require(delete.table());
+        TableMeta table = requireTable(delete.database(), delete.table());
 
         WriteSet local = new WriteSet();
         ReadView view = currentView(local);
@@ -423,7 +479,7 @@ public final class Executor {
             return true;
         });
         flushWrites(local);
-        return new Result.Message(affected(count[0]));
+        return affected(count[0]);
     }
 
     /** 把语句的临时写集并入事务,或作为自动提交事务一次性提交。 */
@@ -450,7 +506,7 @@ public final class Executor {
     // ------------------------------------------------------------ SELECT
 
     private Result select(Ast.Select select) {
-        TableMeta table = catalog.require(select.table());
+        TableMeta table = requireTable(select.database(), select.table());
         Plan plan = Planner.access(table, select.where());
         Planner.Projection projection = Planner.projection(table, select);
 
@@ -532,7 +588,8 @@ public final class Executor {
         return data.length > 0 && data[0] == RowCodec.FORMAT_TOMBSTONE;
     }
 
-    static String affected(int rows) {
-        return "OK, " + rows + (rows == 1 ? " row affected" : " rows affected");
+    static Result.Message affected(int rows) {
+        return new Result.Message(
+                "OK, " + rows + (rows == 1 ? " row affected" : " rows affected"), rows);
     }
 }

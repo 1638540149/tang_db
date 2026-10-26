@@ -135,7 +135,8 @@ public sealed interface Predicate {
     static Column requireColumn(TableMeta table, String name) {
         Column column = table.column(name);
         if (column == null) {
-            throw new CatalogException("列 " + name + " 不存在(表 " + table.name() + ")");
+            throw new CatalogException("列 " + name + " 不存在(表 " + table.name() + ")",
+                    com.wangyu.tangdb.execute.SqlError.ER_BAD_FIELD_ERROR);
         }
         return column;
     }

@@ -88,12 +88,14 @@ class FeConfigTest {
     /** 命令行参数覆盖配置文件。 */
     @Test
     void commandLineOverridesConfigFile() throws IOException {
-        Path file = write("be_host = 10.0.0.8\nbe_port = 9200\n");
+        Path file = write("user = alice\npassword = pw\nmysql_port = 3456\n");
         Cli.Config config = Cli.parseArgs(
-                new String[]{"--config=" + file, "--be-port=9300"},
+                new String[]{"--config=" + file, "--port=9300", "--user=bob"},
                 FeConfig.load(file.toString()));
-        assertEquals("10.0.0.8", config.host());
+        assertEquals("127.0.0.1", config.host());
         assertEquals(9300, config.port());
+        assertEquals("bob", config.user());
+        assertEquals("pw", config.password());
     }
 
     private void assertMessage(String content, String expected) throws IOException {

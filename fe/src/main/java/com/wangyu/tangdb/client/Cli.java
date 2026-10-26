@@ -1,46 +1,34 @@
 package com.wangyu.tangdb.client;
 
-import com.wangyu.tangdb.catalog.Catalog;
-import com.wangyu.tangdb.catalog.CatalogException;
-import com.wangyu.tangdb.execute.Executor;
-import com.wangyu.tangdb.execute.Result;
-import com.wangyu.tangdb.parser.ParseException;
-import com.wangyu.tangdb.parser.Parser;
-import com.wangyu.tangdb.proto.HeartbeatRequest;
-import com.wangyu.tangdb.server.BackendRegistry;
-import com.wangyu.tangdb.server.FeGrpcServer;
-import com.wangyu.tangdb.server.FeStartupException;
-import com.wangyu.tangdb.storage.StoreException;
+import com.wangyu.tangdb.protocol.mysql.MysqlClientConnection;
 
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
 import java.util.List;
 
 /**
- * tang_db 命令行客户端(P3 起是带事务的 SQL 控制台)。
+ * tang_db 命令行客户端(P3.5 起是瘦客户端:通过 MySQL 协议连 fed,不再自带 FE、不直连 BE)。
  *
- * <p>启动顺序:加载配置 → 连接 BE 并加载 catalog(BE 不可用则启动失败,FR-111)
- * → 按 heartbeat_enabled 决定是否启动 FE 心跳服务 → 进入 SQL 循环。</p>
+ * <p>参数:{@code --host / --port / --user / --password / --database},或从
+ * {@code config/fe.conf} 取(FR-408 / SC-303)。fed 没起时报"连不上 fed",不崩栈。</p>
  *
  * <p>所有错误只输出中文提示,绝不向用户打印 Java 堆栈(FR-173 / FR-363)。</p>
  */
 public final class Cli {
 
     static final String USAGE =
-            "用法: java com.wangyu.tangdb.client.Cli [--config <file>] [--be-host <host>] [--be-port <port>]\n"
+            "用法: java com.wangyu.tangdb.client.Cli [--config <file>] [--host <host>] [--port <port>]\n"
+            + "          [--user <user>] [--password <password>] [--database <db>]\n"
             + "配置: 默认读 " + FeConfig.DEFAULT_PATH + ",命令行参数覆盖配置文件\n"
             + "命令: SQL 以 ; 结束;BEGIN / COMMIT / ROLLBACK | SHOW TABLES | SHOW DATABASES | "
-            + "DESC <表> | SHOW BACKENDS | exit";
+            + "SHOW SESSIONS | DESC <表> | SHOW BACKENDS | exit";
 
     private static final String PROMPT = "tangdb> ";
     private static final String TXN_PROMPT = "tangdb(txn)> ";
     private static final String CONTINUATION_PROMPT = "    -> ";
-    private static final String HEARTBEAT_DISABLED_BACKENDS =
-            "本会话未启用心跳监听(heartbeat_enabled = false),看不到 BE 状态";
 
     private Cli() {
     }
@@ -48,7 +36,6 @@ public final class Cli {
     public static void main(String[] args) {
         BufferedReader in = new BufferedReader(
                 new InputStreamReader(System.in, StandardCharsets.UTF_8));
-        // 固定 UTF-8 输出,避免 Windows 控制台默认编码把中文提示打成乱码。
         PrintStream out = new PrintStream(System.out, true, StandardCharsets.UTF_8);
         PrintStream err = new PrintStream(System.err, true, StandardCharsets.UTF_8);
         int exitCode = run(args, in, out, err);
@@ -76,68 +63,35 @@ public final class Cli {
             return 2;
         }
 
-        out.println("tang_db 命令行客户端（BE " + config.host() + ":" + config.port()
-                + "，" + (feConfig.heartbeatEnabled()
-                        ? "FE 心跳端口 " + feConfig.heartbeatListenPort()
-                        : "本会话未启用心跳监听")
-                + "）");
+        out.println("tang_db 命令行客户端（fed " + config.host() + ":" + config.port() + "）");
         out.println("输入 SQL 以 ; 结束;可用: BEGIN / COMMIT / ROLLBACK | SHOW TABLES | "
-                + "SHOW DATABASES | DESC <表> | SHOW BACKENDS | exit");
+                + "SHOW DATABASES | SHOW SESSIONS | DESC <表> | SHOW BACKENDS | exit");
 
-        TangDbClient client;
+        MysqlClientConnection conn;
         try {
-            client = new TangDbClient(config.host(), config.port());
-        } catch (RuntimeException e) {
-            err.println("错误：创建 BE 客户端失败（" + safeMessage(e) + "）");
+            conn = MysqlClientConnection.connect(config.host(), config.port(),
+                    config.user(), config.password(), config.database());
+        } catch (MysqlClientConnection.MysqlClientException e) {
+            err.println("错误：" + e.getMessage());
+            return 1;
+        } catch (IOException e) {
+            err.println("错误：连不上 fed " + config.host() + ":" + config.port()
+                    + "（" + safeMessage(e) + "）");
             return 1;
         }
 
         try {
-            Catalog catalog;
-            try {
-                catalog = Catalog.open(client);
-            } catch (CatalogException e) {
-                err.println("错误：FE 启动失败：" + e.getMessage());
-                return 1;
-            } catch (StoreException e) {
-                err.println("错误：FE 启动失败：无法从 BE 加载元数据（" + e.getMessage() + "）");
-                err.println("提示：FE 启动前必须先启动 BE " + config.host() + ":" + config.port());
-                return 1;
-            }
-
-            BackendRegistry registry = new BackendRegistry(feConfig.beOfflineCycles());
-            FeGrpcServer server = null;
-            if (feConfig.heartbeatEnabled()) {
-                try {
-                    server = FeGrpcServer.start(feConfig.heartbeatListenPort(), registry);
-                } catch (FeStartupException e) {
-                    err.println("错误：FE 启动失败：" + e.getMessage());
-                    return 1;
-                }
-            }
-
-            try {
-                Executor executor = new Executor(client, catalog);
-                return loop(in, out, err, config, feConfig, registry, executor, client);
-            } finally {
-                if (server != null) {
-                    server.close();
-                }
-            }
-        } catch (RuntimeException e) {
-            printInternalError(err, e);
-            return 1;
+            return loop(in, out, err, conn);
         } finally {
-            client.close();
+            conn.close();
         }
     }
 
     private static int loop(BufferedReader in, PrintStream out, PrintStream err,
-                            Config config, FeConfig feConfig, BackendRegistry registry,
-                            Executor executor, TangDbClient client) {
+                            MysqlClientConnection conn) {
         SqlBuffer buffer = new SqlBuffer();
         while (true) {
-            String prompt = executor.inTransaction() ? TXN_PROMPT : PROMPT;
+            String prompt = conn.inTransaction() ? TXN_PROMPT : PROMPT;
             out.print(buffer.hasPending() ? CONTINUATION_PROMPT : prompt);
             out.flush();
 
@@ -146,12 +100,10 @@ public final class Cli {
                 line = in.readLine();
             } catch (IOException e) {
                 err.println("错误：读取输入失败");
-                finishTransaction(executor, out);
                 return 1;
             }
             if (line == null) {
                 out.println();
-                finishTransaction(executor, out);
                 return 0;
             }
 
@@ -161,16 +113,11 @@ public final class Cli {
                     continue;
                 }
                 if (isExit(trimmed)) {
-                    finishTransaction(executor, out);
                     out.println("再见");
                     return 0;
                 }
                 if ("ping".equalsIgnoreCase(trimmed)) {
-                    doPing(client, out, err);
-                    continue;
-                }
-                if ("show backends".equalsIgnoreCase(trimmed)) {
-                    printBackends(out, feConfig, registry);
+                    doPing(conn, out, err);
                     continue;
                 }
             }
@@ -178,129 +125,54 @@ public final class Cli {
             List<String> statements = buffer.append(line);
             for (String statement : statements) {
                 if (isExit(statement)) {
-                    finishTransaction(executor, out);
                     out.println("再见");
                     return 0;
                 }
-                if ("show backends".equalsIgnoreCase(statement)) {
-                    printBackends(out, feConfig, registry);
-                    continue;
-                }
-                executeOne(statement, out, err, config, feConfig, registry, executor);
+                executeOne(statement, out, err, conn);
             }
         }
     }
 
     private static void executeOne(String statement, PrintStream out, PrintStream err,
-                                   Config config, FeConfig feConfig, BackendRegistry registry,
-                                   Executor executor) {
+                                   MysqlClientConnection conn) {
         boolean failed = false;
         try {
-            ensureBackendAvailable(feConfig, registry, config);
-            Result result = executor.execute(Parser.parse(statement));
-            printResult(result, out);
-        } catch (ParseException e) {
+            MysqlClientConnection.Response response = conn.query(statement);
+            if (response.isResultSet()) {
+                out.print(TableFormatter.format(response.columns(), response.rows()));
+            } else {
+                String info = response.info();
+                out.println(info != null && !info.isBlank() ? info : okText(response.affectedRows()));
+            }
+        } catch (MysqlClientConnection.MysqlClientException e) {
             failed = true;
             err.println("错误：" + e.getMessage());
-        } catch (CatalogException e) {
+        } catch (IOException e) {
             failed = true;
-            err.println("错误：" + e.getMessage());
-        } catch (StoreException e) {
-            failed = true;
-            err.println("错误：" + e.getMessage());
-        } catch (ClientException e) {
-            failed = true;
-            err.println("错误：" + e.getMessage());
+            err.println("错误：与 fed 通信失败（" + safeMessage(e) + "）");
         } catch (RuntimeException e) {
             failed = true;
-            printInternalError(err, e);
+            err.println("错误：客户端内部错误（" + safeMessage(e) + "）");
         }
         // FR-344:事务内语句失败不自动回滚,但必须让用户知道事务还在。
-        if (failed && executor.inTransaction()) {
+        if (failed && conn.inTransaction()) {
             err.println("提示：事务仍在进行中，可继续执行或 ROLLBACK");
         }
     }
 
-    /** CLI 退出时丢弃未提交事务(FR-345)。 */
-    private static void finishTransaction(Executor executor, PrintStream out) {
-        String message = executor.rollbackOnDisconnect();
-        if (message != null) {
-            out.println(message);
-        }
+    private static String okText(long affectedRows) {
+        return "OK, " + affectedRows + (affectedRows == 1 ? " row affected" : " rows affected");
     }
 
-    /**
-     * BE 存活判定:如果 FE 已经认识至少一个 BE 且全部判死,直接给出明确错误(FR-156),
-     * 不让 SQL 请求挂在那里等超时。
-     *
-     * <p>heartbeat_enabled = false 时不看心跳(本来就没有),连接错误交给 gRPC 返回。</p>
-     */
-    private static void ensureBackendAvailable(FeConfig feConfig, BackendRegistry registry,
-                                               Config config) throws ClientException {
-        // 心跳关闭时 registry 恒为空,直接用 gRPC 的真实结果,不误报"BE 不可用"。
-        if (!feConfig.heartbeatEnabled()) {
-            return;
-        }
-        if (registry.all().isEmpty()) {
-            return; // 还没收到注册(刚启动);真正的连接错误会由 gRPC 返回
-        }
-        if (!registry.anyAvailable()) {
-            throw new ClientException("BE 不可用(" + config.host() + ":" + config.port()
-                    + "," + registry.unavailableHint() + ")", "UNAVAILABLE");
-        }
-    }
-
-    private static void printResult(Result result, PrintStream out) {
-        if (result instanceof Result.Message message) {
-            out.println(message.text());
-            return;
-        }
-        Result.Table table = (Result.Table) result;
-        out.print(TableFormatter.format(table.columns(), table.rows()));
-    }
-
-    private static void printBackends(PrintStream out, FeConfig feConfig, BackendRegistry registry) {
-        if (!feConfig.heartbeatEnabled()) {
-            // FR-367:明确说明"没监听",不得报"BE 不可用"或返回空表。
-            out.println(HEARTBEAT_DISABLED_BACKENDS);
-            return;
-        }
-        out.print(formatBackends(registry));
-        out.flush();
-    }
-
-    private static void doPing(TangDbClient client, PrintStream out, PrintStream err) {
+    private static void doPing(MysqlClientConnection conn, PrintStream out, PrintStream err) {
         try {
-            out.println("BE 版本: " + client.ping());
-        } catch (ClientException e) {
+            conn.ping();
+            out.println("OK");
+        } catch (MysqlClientConnection.MysqlClientException e) {
             err.println("错误：" + e.getMessage());
-        } catch (RuntimeException e) {
-            printInternalError(err, e);
+        } catch (IOException e) {
+            err.println("错误：" + safeMessage(e));
         }
-    }
-
-    /** SHOW BACKENDS:be_id、endpoint、version、状态、最后心跳、内存表/segment/put/get(FR-155)。 */
-    static String formatBackends(BackendRegistry registry) {
-        long now = System.currentTimeMillis();
-        List<Object[]> rows = new ArrayList<>();
-        for (BackendRegistry.Backend backend : registry.all()) {
-            HeartbeatRequest hb = backend.lastHeartbeat();
-            rows.add(new Object[]{
-                    backend.beId(),
-                    backend.endpoint(),
-                    backend.version(),
-                    backend.statusText(now, registry.offlineCycles()),
-                    backend.lastSeenText(),
-                    hb == null ? 0 : hb.getMemtableBytes(),
-                    hb == null ? 0 : hb.getSegmentCount(),
-                    hb == null ? 0 : hb.getPutCount(),
-                    hb == null ? 0 : hb.getGetCount()
-            });
-        }
-        return TableFormatter.format(
-                List.of("be_id", "endpoint", "version", "status", "last_heartbeat",
-                        "memtable_bytes", "segment_count", "put_count", "get_count"),
-                rows);
     }
 
     private static boolean isExit(String text) {
@@ -316,10 +188,14 @@ public final class Cli {
 
     /** 在给定配置的基础上解析命令行参数(不做文件 IO,便于测试)。 */
     static Config parseArgs(String[] args, FeConfig base) {
-        String host = base.beHost();
-        int port = base.bePort();
+        String host = "127.0.0.1";
+        int port = base.mysqlPort();
+        String user = base.user();
+        String password = base.password();
+        String database = null;
+
         if (args == null) {
-            return new Config(host, port);
+            return new Config(host, port, user, password, database);
         }
 
         for (int i = 0; i < args.length; i++) {
@@ -327,14 +203,26 @@ public final class Cli {
             if (arg == null) {
                 throw new IllegalArgumentException("启动参数不能为 null");
             }
-            if (arg.startsWith("--be-host=")) {
-                host = requireNonBlank(arg.substring("--be-host=".length()), "--be-host");
-            } else if (arg.equals("--be-host")) {
-                host = requireNonBlank(nextValue(args, ++i, "--be-host"), "--be-host");
-            } else if (arg.startsWith("--be-port=")) {
-                port = parsePort(arg.substring("--be-port=".length()));
-            } else if (arg.equals("--be-port")) {
-                port = parsePort(nextValue(args, ++i, "--be-port"));
+            if (arg.startsWith("--host=")) {
+                host = requireNonBlank(arg.substring("--host=".length()), "--host");
+            } else if (arg.equals("--host")) {
+                host = requireNonBlank(nextValue(args, ++i, "--host"), "--host");
+            } else if (arg.startsWith("--port=")) {
+                port = parsePort(arg.substring("--port=".length()));
+            } else if (arg.equals("--port")) {
+                port = parsePort(nextValue(args, ++i, "--port"));
+            } else if (arg.startsWith("--user=")) {
+                user = requireNonBlank(arg.substring("--user=".length()), "--user");
+            } else if (arg.equals("--user")) {
+                user = requireNonBlank(nextValue(args, ++i, "--user"), "--user");
+            } else if (arg.startsWith("--password=")) {
+                password = arg.substring("--password=".length());
+            } else if (arg.equals("--password")) {
+                password = nextValue(args, ++i, "--password");
+            } else if (arg.startsWith("--database=")) {
+                database = requireNonBlank(arg.substring("--database=".length()), "--database");
+            } else if (arg.equals("--database")) {
+                database = requireNonBlank(nextValue(args, ++i, "--database"), "--database");
             } else if (arg.startsWith("--config=")) {
                 requireNonBlank(arg.substring("--config=".length()), "--config");
             } else if (arg.equals("--config")) {
@@ -343,7 +231,7 @@ public final class Cli {
                 throw new IllegalArgumentException("未知启动参数: " + arg + "。\n" + USAGE);
             }
         }
-        return new Config(host, port);
+        return new Config(host, port, user, password, database);
     }
 
     private static String findConfigPath(String[] args) {
@@ -391,16 +279,12 @@ public final class Cli {
         }
     }
 
-    private static void printInternalError(PrintStream err, RuntimeException e) {
-        err.println("错误：客户端内部错误（" + safeMessage(e) + "）");
-    }
-
     private static String safeMessage(Throwable e) {
         String message = e.getMessage();
         return message == null || message.isBlank() ? e.getClass().getSimpleName() : message;
     }
 
-    /** 生效的连接配置(心跳端口等其它项在 {@link FeConfig} 里)。 */
-    record Config(String host, int port) {
+    /** 生效的连接配置。 */
+    record Config(String host, int port, String user, String password, String database) {
     }
 }

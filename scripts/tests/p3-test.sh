@@ -14,7 +14,7 @@
 #   SC-210  依赖与边界红线
 #   SC-211  一键执行 + 报告(tmp/p3-test/report.txt)
 #
-# 用法: bash scripts/p3-test.sh
+# 用法: bash scripts/tests/p3-test.sh
 # 说明:
 #   - 独立端口(BE 9600 / FE 心跳 9691)与独立数据目录(tmp/p3-test/data),不碰 data/BE。
 #   - 第二个及以后的并发 CLI 会话用 heartbeat_enabled = false 启动(FR-370)。
@@ -23,7 +23,7 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+ROOT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 BE_DIR="${ROOT_DIR}/be"
 FE_DIR="${ROOT_DIR}/fe"
@@ -32,13 +32,16 @@ DATA_DIR="${TEST_DIR}/data"
 BE_EXE="${TEST_DIR}/be.exe"
 BE_CONF="${TEST_DIR}/be.conf"
 FE_CONF="${TEST_DIR}/fe.conf"
-FE_NOHB_CONF="${TEST_DIR}/fe-nohb.conf"
+NOHB_FED_CONF="${TEST_DIR}/fe-nohb-fed.conf"
 CP_FILE="${TEST_DIR}/cp.txt"
 REPORT="${TEST_DIR}/report.txt"
 SQL_DIR="${ROOT_DIR}/scripts/sql"
 
 BE_PORT=9600
 FE_HEART_PORT=9691
+MYSQL_PORT=9706
+NOHB_HEART_PORT=9692
+MYSQL_PORT_NOHB=9707
 
 export PATH="/c/Program Files/Go/bin:/d/dev/apache-maven-3.9.16/bin:${PATH}"
 
@@ -66,6 +69,31 @@ kill_be() {
     sleep 1
 }
 
+kill_fed() {
+    # git-bash 的 $! 是 MSYS PID;按命令行精确匹配 fed 的 java 进程再 taskkill。
+    powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='java.exe'\" | Where-Object { \$_.CommandLine -like '*tangdb.fed.Fed*' } | ForEach-Object { Stop-Process -Id \$_.ProcessId -Force -ErrorAction SilentlyContinue }" >/dev/null 2>&1 || true
+    FED_PID=""
+    sleep 1
+}
+
+start_fed() { # start_fed <fe-conf> <log-name> -> sets FED_PID_LAST
+    java -Dfile.encoding=UTF-8 -cp "${CP}" com.wangyu.tangdb.fed.Fed \
+        --config="$(cygpath -w "$1")" >"${TEST_DIR}/$2" 2>&1 &
+    FED_PID_LAST=$!
+    for _ in $(seq 1 60); do
+        if grep -q "fed 已就绪" "${TEST_DIR}/$2" 2>/dev/null; then
+            return 0
+        fi
+        if grep -q "FE 启动失败" "${TEST_DIR}/$2" 2>/dev/null; then
+            log "fed 启动失败($1):"; tail -20 "${TEST_DIR}/$2" | tee -a "${REPORT}"
+            return 1
+        fi
+        sleep 0.5
+    done
+    log "fed 未在预期时间内就绪($1):"; tail -20 "${TEST_DIR}/$2" | tee -a "${REPORT}"
+    return 1
+}
+
 write_be_conf() { # write_be_conf <crash_point> <memtable_size>
     cat >"${BE_CONF}" <<EOF
 data_dir = $(cygpath -w "${DATA_DIR}")
@@ -81,10 +109,17 @@ EOF
 
 start_be() { # start_be <log-name>
     local name="${1:-be.log}"
+    kill_fed
     "${BE_EXE}" --config="$(cygpath -w "${BE_CONF}")" >"${TEST_DIR}/${name}" 2>&1 &
     for _ in $(seq 1 80); do
         if grep -q "BE 已就绪" "${TEST_DIR}/${name}" 2>/dev/null; then
-            return 0
+            # BE 就绪后重启主 fed:catalog 必须从当前数据目录重新加载
+            # (每个会话共享同一 fed 的 catalog,这是 P3.5 的核心语义)
+            if start_fed "${FE_CONF}" "fed.log"; then
+                FED_PID="${FED_PID_LAST}"
+                return 0
+            fi
+            return 1
         fi
         if grep -q "BE 启动失败" "${TEST_DIR}/${name}" 2>/dev/null; then
             log "BE 启动失败:"; tail -20 "${TEST_DIR}/${name}" | tee -a "${REPORT}"
@@ -167,30 +202,54 @@ export CP
 cat >"${FE_CONF}" <<EOF
 be_host = 127.0.0.1
 be_port = ${BE_PORT}
+mode = fed
+mysql_port = ${MYSQL_PORT}
+user = root
+password = p3test
+session_max = 64
+session_idle_timeout = 0
+shutdown_grace_seconds = 5
 heartbeat_listen_port = ${FE_HEART_PORT}
 be_offline_cycles = 3
 heartbeat_enabled = true
 EOF
 
-cat >"${FE_NOHB_CONF}" <<EOF
+# 仅供 FR-367 断言使用的 no-heartbeat fed(独立端口,不参与其它会话)
+cat >"${NOHB_FED_CONF}" <<EOF
 be_host = 127.0.0.1
 be_port = ${BE_PORT}
-heartbeat_listen_port = $((FE_HEART_PORT + 1))
+mode = fed
+mysql_port = ${MYSQL_PORT_NOHB}
+user = root
+password = p3test
+session_max = 8
+session_idle_timeout = 0
+shutdown_grace_seconds = 5
+heartbeat_listen_port = ${NOHB_HEART_PORT}
 be_offline_cycles = 3
 heartbeat_enabled = false
 EOF
 
-log "[配置] BE 端口 ${BE_PORT} / FE 心跳端口 ${FE_HEART_PORT}(会话 A 持有)"
-log "        并发会话 B 及以后:heartbeat_enabled = false(不绑心跳端口)"
+log "[配置] BE 端口 ${BE_PORT} / 主 fed MySQL 端口 ${MYSQL_PORT}(心跳 ${FE_HEART_PORT})"
+log "        所有 CLI 会话连同一个 fed(共享 catalog);nohb fed 端口 ${MYSQL_PORT_NOHB} 仅用于 FR-367"
 
 # ================================================================ SC-201
 log ""
 log "---------- SC-201 事务语义(提交 / 回滚 / 读己之写) ----------"
 start_fresh "" 64MB "be-sc201.log" || { log "无法启动 BE,测试中止"; exit 1; }
 
-out="$(run_sql_text "${FE_NOHB_CONF}" "SHOW BACKENDS; exit")"
-expect "${out}" "本会话未启用心跳监听" "heartbeat_enabled=false 时 SHOW BACKENDS 明确说明未监听(FR-367)"
-expect_absent "${out}" "BE 不可用" "关掉心跳时不得误报 BE 不可用"
+# FR-367:独立启动一个 heartbeat_enabled=false 的 fed,验证 SHOW BACKENDS 提示未监听
+# (主 fed 始终持有心跳端口;nohb fed 只做这一条断言,不参与其它会话)
+if start_fed "${NOHB_FED_CONF}" "fed-nohb.log"; then
+    NOHB_PID="${FED_PID_LAST}"
+    out="$(run_sql_text "${NOHB_FED_CONF}" "SHOW BACKENDS; exit")"
+    expect "${out}" "本会话未启用心跳监听" "heartbeat_enabled=false 时 SHOW BACKENDS 明确说明未监听(FR-367)"
+    expect_absent "${out}" "BE 不可用" "关掉心跳时不得误报 BE 不可用"
+    taskkill /F /PID "${NOHB_PID}" >/dev/null 2>&1 || true
+    sleep 1
+else
+    bad "nohb fed 启动失败,FR-367 未验"
+fi
 
 out="$(run_sql_file "${FE_CONF}" "${SQL_DIR}/21-txn-commit.sql")"
 expect "${out}" "OK, 事务已开始" "BEGIN 返回快照水位"
@@ -198,7 +257,7 @@ expect "${out}" "(2 rows)" "事务内读己之写看到 2 行"
 expect "${out}" "已提交" "COMMIT 成功"
 expect "${out}" "commit_ts" "COMMIT 返回 commit_ts"
 
-out="$(run_sql_text "${FE_NOHB_CONF}" "SELECT * FROM txn_t; exit")"
+out="$(run_sql_text "${FE_CONF}" "SELECT * FROM txn_t; exit")"
 expect "${out}" "(2 rows)" "另一个会话看到已提交的 2 行"
 expect "${out}" "| a" "另一会话读到 id=1 的值"
 
@@ -222,7 +281,7 @@ expect "${out}" "(1 row)" "同一主键不会出现两条记录"
 # ================================================================ SC-202
 log ""
 log "---------- SC-202 并发写写冲突 ----------"
-run_sql_text "${FE_NOHB_CONF}" "UPDATE txn_t SET name = 'orig' WHERE id = 1; exit" >/dev/null 2>&1
+run_sql_text "${FE_CONF}" "UPDATE txn_t SET name = 'orig' WHERE id = 1; exit" >/dev/null 2>&1
 
 AOUT="${TEST_DIR}/conflict-a.out"
 BOUT="${TEST_DIR}/conflict-b.out"
@@ -231,7 +290,7 @@ BOUT="${TEST_DIR}/conflict-b.out"
 A_PID=$!
 sleep 1
 ( sleep 4; echo "BEGIN;"; echo "UPDATE txn_t SET name = 'B' WHERE id = 1;"; sleep 6; echo "COMMIT;"; sleep 2; echo "exit" ) \
-    | java -Dfile.encoding=UTF-8 -cp "${CP}" com.wangyu.tangdb.client.Cli --config="$(cygpath -w "${FE_NOHB_CONF}")" >"${BOUT}" 2>&1 &
+    | java -Dfile.encoding=UTF-8 -cp "${CP}" com.wangyu.tangdb.client.Cli --config="$(cygpath -w "${FE_CONF}")" >"${BOUT}" 2>&1 &
 B_PID=$!
 wait "${A_PID}" 2>/dev/null || true
 wait "${B_PID}" 2>/dev/null || true
@@ -243,7 +302,7 @@ expect "${outB}" "写写冲突" "会话 B(后提交)得到明确冲突错误"
 expect "${outB}" "表 txn_t 主键 1 写写冲突" "冲突错误翻译成表名 + 主键"
 expect_absent "${outB}" "Exception in thread" "冲突错误不带 Java 堆栈"
 
-out="$(run_sql_text "${FE_NOHB_CONF}" "SELECT name FROM txn_t WHERE id = 1; exit")"
+out="$(run_sql_text "${FE_CONF}" "SELECT name FROM txn_t WHERE id = 1; exit")"
 expect "${out}" "| A" "数据库里是 A 的值(B 没有覆盖 A)"
 
 log "[并发] 写不同行都应成功"
@@ -254,13 +313,13 @@ BOUT2="${TEST_DIR}/parallel-b.out"
 A2_PID=$!
 sleep 1
 ( sleep 4; echo "BEGIN;"; echo "INSERT INTO txn_t VALUES (102, 'p2');"; sleep 2; echo "COMMIT;"; sleep 1; echo "exit" ) \
-    | java -Dfile.encoding=UTF-8 -cp "${CP}" com.wangyu.tangdb.client.Cli --config="$(cygpath -w "${FE_NOHB_CONF}")" >"${BOUT2}" 2>&1 &
+    | java -Dfile.encoding=UTF-8 -cp "${CP}" com.wangyu.tangdb.client.Cli --config="$(cygpath -w "${FE_CONF}")" >"${BOUT2}" 2>&1 &
 B2_PID=$!
 wait "${A2_PID}" 2>/dev/null || true
 wait "${B2_PID}" 2>/dev/null || true
 expect "$(cat "${AOUT2}")" "已提交" "并发写不同行:会话 A 成功"
 expect "$(cat "${BOUT2}")" "已提交" "并发写不同行:会话 B 成功(无冲突)"
-out="$(run_sql_text "${FE_NOHB_CONF}" "SELECT * FROM txn_t WHERE id IN (101, 102); exit")"
+out="$(run_sql_text "${FE_CONF}" "SELECT * FROM txn_t WHERE id IN (101, 102); exit")"
 expect "${out}" "(2 rows)" "并发写入的两行都存在"
 
 # ================================================================ SC-203 / SC-204
@@ -273,13 +332,13 @@ crash_case() { # crash_case <crash_point> <expect_visible:0|1>
     reset_data
     write_be_conf "" 64MB
     start_be "be-crash-seed.log" || { bad "崩溃场景准备阶段 BE 启动失败"; return; }
-    run_sql_text "${FE_NOHB_CONF}" "CREATE TABLE crash_t (id INT PRIMARY KEY, v VARCHAR(32)); exit" >/dev/null 2>&1
+    run_sql_text "${FE_CONF}" "CREATE TABLE crash_t (id INT PRIMARY KEY, v VARCHAR(32)); exit" >/dev/null 2>&1
     kill_be
 
     # 打开注入点,执行一条 INSERT,进程应在此处被立即杀掉。
     write_be_conf "${point}" 64MB
     start_be "be-crash-${point}.log" || { bad "注入点 ${point} 下 BE 启动失败"; return; }
-    run_sql_text "${FE_NOHB_CONF}" "INSERT INTO crash_t VALUES (1, 'x'); exit" >"${TEST_DIR}/crash-${point}-cli.out" 2>&1 || true
+    run_sql_text "${FE_CONF}" "INSERT INTO crash_t VALUES (1, 'x'); exit" >"${TEST_DIR}/crash-${point}-cli.out" 2>&1 || true
     if wait_be_dead; then
         ok "注入点 ${point}:BE 进程已立即退出"
     else
@@ -295,7 +354,7 @@ crash_case() { # crash_case <crash_point> <expect_visible:0|1>
     write_be_conf "" 64MB
     start_be "be-crash-${point}-recover.log" || { bad "注入点 ${point}:恢复启动失败"; return; }
     local out
-    out="$(run_sql_text "${FE_NOHB_CONF}" "SELECT * FROM crash_t; exit")"
+    out="$(run_sql_text "${FE_CONF}" "SELECT * FROM crash_t; exit")"
     if [ "${visible}" = "1" ]; then
         expect "${out}" "(1 row)" "注入点 ${point}:重启后该事务全部可见"
         expect "${out}" "| x" "注入点 ${point}:值与提交时一致"
@@ -304,7 +363,7 @@ crash_case() { # crash_case <crash_point> <expect_visible:0|1>
     fi
 
     local ts_before ts_after
-    out="$(run_sql_text "${FE_NOHB_CONF}" "BEGIN; INSERT INTO crash_t VALUES (2, 'after'); COMMIT; exit")"
+    out="$(run_sql_text "${FE_CONF}" "BEGIN; INSERT INTO crash_t VALUES (2, 'after'); COMMIT; exit")"
     ts_after="$(commit_ts_of "${out}")"
     if [ -n "${ts_after}" ]; then
         ok "注入点 ${point}:服务正常启动且新事务可提交(commit_ts=${ts_after})"
@@ -332,11 +391,11 @@ log "---------- SC-205 WAL 尾部截断 ----------"
 reset_data
 write_be_conf "" 64MB
 start_be "be-trunc.log" || bad "WAL 截断场景 BE 启动失败"
-run_sql_text "${FE_NOHB_CONF}" "CREATE TABLE trunc_t (id INT PRIMARY KEY, v VARCHAR(32)); exit" >/dev/null 2>&1
-run_sql_text "${FE_NOHB_CONF}" "INSERT INTO trunc_t VALUES (1, 'keep'); exit" >/dev/null 2>&1
+run_sql_text "${FE_CONF}" "CREATE TABLE trunc_t (id INT PRIMARY KEY, v VARCHAR(32)); exit" >/dev/null 2>&1
+run_sql_text "${FE_CONF}" "INSERT INTO trunc_t VALUES (1, 'keep'); exit" >/dev/null 2>&1
 WAL_FILE="$(ls "${DATA_DIR}/wal"/*.wal 2>/dev/null | sort | tail -1)"
 SIZE_BEFORE="$(wc -c < "${WAL_FILE}" | tr -d ' ')"
-run_sql_text "${FE_NOHB_CONF}" "INSERT INTO trunc_t VALUES (2, 'discard'); exit" >/dev/null 2>&1
+run_sql_text "${FE_CONF}" "INSERT INTO trunc_t VALUES (2, 'discard'); exit" >/dev/null 2>&1
 kill_be
 SIZE_AFTER="$(wc -c < "${WAL_FILE}" | tr -d ' ')"
 log "  [数据] 截断前 WAL 大小 ${SIZE_BEFORE},第二条批记录写入后 ${SIZE_AFTER}"
@@ -348,7 +407,7 @@ fi
 head -c "${SIZE_BEFORE}" "${WAL_FILE}" >"${WAL_FILE}.tmp" && mv "${WAL_FILE}.tmp" "${WAL_FILE}"
 log "  [注入] 已把 WAL 截断回 ${SIZE_BEFORE} 字节(去掉最后一条批记录)"
 start_be "be-trunc-recover.log" || bad "WAL 截断后 BE 启动失败"
-out="$(run_sql_text "${FE_NOHB_CONF}" "SELECT * FROM trunc_t; exit")"
+out="$(run_sql_text "${FE_CONF}" "SELECT * FROM trunc_t; exit")"
 expect "${out}" "| keep" "截断点之前的数据完好"
 expect_absent "${out}" "discard" "被截断的事务整体丢弃"
 expect "${out}" "(1 row)" "服务正常启动,只剩第一条"
@@ -359,10 +418,10 @@ log "---------- SC-206 序号不回退(数据只在 segment、旧 WAL 已回收)
 reset_data
 write_be_conf "" 1KB
 start_be "be-seq.log" || bad "序号场景 BE 启动失败"
-run_sql_text "${FE_NOHB_CONF}" "CREATE TABLE seq_t (id INT PRIMARY KEY, v VARCHAR(32)); exit" >/dev/null 2>&1
-run_sql_text "${FE_NOHB_CONF}" "INSERT INTO seq_t VALUES (1, 'a'), (2, 'a'), (3, 'a'), (4, 'a'), (5, 'a'); exit" >/dev/null 2>&1
+run_sql_text "${FE_CONF}" "CREATE TABLE seq_t (id INT PRIMARY KEY, v VARCHAR(32)); exit" >/dev/null 2>&1
+run_sql_text "${FE_CONF}" "INSERT INTO seq_t VALUES (1, 'a'), (2, 'a'), (3, 'a'), (4, 'a'), (5, 'a'); exit" >/dev/null 2>&1
 
-out="$(run_sql_text "${FE_NOHB_CONF}" "BEGIN; INSERT INTO seq_t VALUES (100, 'x'); COMMIT; exit")"
+out="$(run_sql_text "${FE_CONF}" "BEGIN; INSERT INTO seq_t VALUES (100, 'x'); COMMIT; exit")"
 TS_BEFORE="$(commit_ts_of "${out}")"
 if [ -n "${TS_BEFORE}" ]; then
     ok "崩溃前最后一个已提交事务 commit_ts=${TS_BEFORE}"
@@ -375,7 +434,7 @@ fi
 many=""
 for i in $(seq 200 260); do many="${many}(${i}, 'v'), "; done
 many="${many%%, }"
-run_sql_text "${FE_NOHB_CONF}" "INSERT INTO seq_t VALUES ${many}; exit" >/dev/null 2>&1
+run_sql_text "${FE_CONF}" "INSERT INTO seq_t VALUES ${many}; exit" >/dev/null 2>&1
 sleep 3
 WAL_COUNT="$(ls "${DATA_DIR}/wal"/*.wal 2>/dev/null | wc -l | tr -d ' ')"
 SEG_COUNT="$(ls "${DATA_DIR}/sst"/*.seg 2>/dev/null | wc -l | tr -d ' ')"
@@ -398,20 +457,20 @@ fi
 kill_be
 write_be_conf "" 1KB
 start_be "be-seq-recover.log" || bad "序号场景重启失败"
-out="$(run_sql_text "${FE_NOHB_CONF}" "BEGIN; INSERT INTO seq_t VALUES (999, 'z'); COMMIT; exit")"
+out="$(run_sql_text "${FE_CONF}" "BEGIN; INSERT INTO seq_t VALUES (999, 'z'); COMMIT; exit")"
 TS_AFTER="$(commit_ts_of "${out}")"
 if [ -n "${TS_AFTER}" ] && [ "${TS_AFTER}" -gt "${TS_BEFORE}" ] 2>/dev/null; then
     ok "重启后新事务 commit_ts=${TS_AFTER} > 崩溃前 ${TS_BEFORE}(序号不回退)"
 else
     bad "重启后 commit_ts(${TS_AFTER}) 没有大于崩溃前(${TS_BEFORE})"
 fi
-out="$(run_sql_text "${FE_NOHB_CONF}" "SELECT * FROM seq_t WHERE id = 999; exit")"
+out="$(run_sql_text "${FE_CONF}" "SELECT * FROM seq_t WHERE id = 999; exit")"
 expect "${out}" "| z" "重启后新提交的数据可读"
 
 # ================================================================ SC-207
 log ""
 log "---------- SC-207 快照稳定性(长事务挂住时并发写) ----------"
-run_sql_text "${FE_NOHB_CONF}" "CREATE TABLE snap_t (id INT PRIMARY KEY, name VARCHAR(32)); INSERT INTO snap_t VALUES (1, 'v1'); exit" >/dev/null 2>&1
+run_sql_text "${FE_CONF}" "CREATE TABLE snap_t (id INT PRIMARY KEY, name VARCHAR(32)); INSERT INTO snap_t VALUES (1, 'v1'); exit" >/dev/null 2>&1
 
 AOUT3="${TEST_DIR}/snapshot-a.out"
 BOUT3="${TEST_DIR}/snapshot-b.out"
@@ -420,7 +479,7 @@ BOUT3="${TEST_DIR}/snapshot-b.out"
 SA_PID=$!
 sleep 1
 ( sleep 4; echo "UPDATE snap_t SET name = 'v2' WHERE id = 1;"; sleep 8; echo "exit" ) \
-    | java -Dfile.encoding=UTF-8 -cp "${CP}" com.wangyu.tangdb.client.Cli --config="$(cygpath -w "${FE_NOHB_CONF}")" >"${BOUT3}" 2>&1 &
+    | java -Dfile.encoding=UTF-8 -cp "${CP}" com.wangyu.tangdb.client.Cli --config="$(cygpath -w "${FE_CONF}")" >"${BOUT3}" 2>&1 &
 SB_PID=$!
 wait "${SA_PID}" 2>/dev/null || true
 wait "${SB_PID}" 2>/dev/null || true
@@ -449,12 +508,12 @@ ddl_crash_case() { # ddl_crash_case <crash_point> <expect_exists:0|1>
     reset_data
     write_be_conf "" 64MB
     start_be "be-ddl-seed.log" || { bad "DDL 场景准备阶段 BE 启动失败"; return; }
-    run_sql_text "${FE_NOHB_CONF}" "CREATE TABLE seed_t (id INT PRIMARY KEY); exit" >/dev/null 2>&1
+    run_sql_text "${FE_CONF}" "CREATE TABLE seed_t (id INT PRIMARY KEY); exit" >/dev/null 2>&1
     kill_be
 
     write_be_conf "${point}" 64MB
     start_be "be-ddl-${point}.log" || { bad "DDL 注入点 ${point} 下 BE 启动失败"; return; }
-    run_sql_text "${FE_NOHB_CONF}" "CREATE TABLE ddl_t (id INT PRIMARY KEY, name VARCHAR(32)); exit" >"${TEST_DIR}/ddl-${point}.out" 2>&1 || true
+    run_sql_text "${FE_CONF}" "CREATE TABLE ddl_t (id INT PRIMARY KEY, name VARCHAR(32)); exit" >"${TEST_DIR}/ddl-${point}.out" 2>&1 || true
     wait_be_dead || true
     kill_be
 
@@ -462,10 +521,10 @@ ddl_crash_case() { # ddl_crash_case <crash_point> <expect_exists:0|1>
     start_be "be-ddl-${point}-recover.log" || { bad "DDL 注入点 ${point} 恢复启动失败"; return; }
 
     local tables desc
-    tables="$(run_sql_text "${FE_NOHB_CONF}" "SHOW TABLES; exit")"
+    tables="$(run_sql_text "${FE_CONF}" "SHOW TABLES; exit")"
     if [ "${exists}" = "1" ]; then
         expect "${tables}" "ddl_t" "DDL 记录已落盘 → 重启后表存在"
-        desc="$(run_sql_text "${FE_NOHB_CONF}" "DESC ddl_t; exit")"
+        desc="$(run_sql_text "${FE_CONF}" "DESC ddl_t; exit")"
         expect "${desc}" "id" "DDL 表的主键列存在"
         expect "${desc}" "name" "DDL 表的第二列存在"
         expect "${desc}" "YES" "主键标记存在(不是半套元数据)"
@@ -486,8 +545,8 @@ log ""
 log "---------- SC-209 P2/P1 回归 + 性能 ----------"
 kill_be
 
-log "[回归] bash scripts/p2-test.sh"
-(cd "${ROOT_DIR}" && bash scripts/p2-test.sh >"${TEST_DIR}/p2-regression.log" 2>&1)
+log "[回归] bash scripts/tests/p2-test.sh"
+(cd "${ROOT_DIR}" && bash scripts/tests/p2-test.sh >"${TEST_DIR}/p2-regression.log" 2>&1)
 P2_RC=$?
 P2_SUMMARY="$(grep -E '结果:PASS=' "${TEST_DIR}/p2-regression.log" | tail -1 || true)"
 log "  p2-test.sh 退出码 ${P2_RC};${P2_SUMMARY}"
@@ -498,8 +557,8 @@ else
     tail -30 "${TEST_DIR}/p2-regression.log" | tee -a "${REPORT}"
 fi
 
-log "[回归] bash scripts/crash-test.sh"
-(cd "${ROOT_DIR}" && bash scripts/crash-test.sh >"${TEST_DIR}/crash-regression.log" 2>&1)
+log "[回归] bash scripts/tests/crash-test.sh"
+(cd "${ROOT_DIR}" && bash scripts/tests/crash-test.sh >"${TEST_DIR}/crash-regression.log" 2>&1)
 CRASH_RC=$?
 CRASH_SUMMARY="$(grep -E '丢失 0 条|崩溃测试通过|崩溃测试失败' "${TEST_DIR}/crash-regression.log" | tail -2 | tr '\n' ' ' || true)"
 log "  crash-test.sh 退出码 ${CRASH_RC};${CRASH_SUMMARY}"
@@ -514,7 +573,7 @@ log "[性能] 单行 INSERT 延迟(与 SPEC-P2 SC-112 的 < 10ms 比较)"
 reset_data
 write_be_conf "" 64MB
 start_be "be-perf.log" || bad "性能场景 BE 启动失败"
-PERF_OUT="$(java -Dfile.encoding=UTF-8 -cp "${CP}" com.wangyu.tangdb.client.InsertLatencyBench "$(cygpath -w "${FE_NOHB_CONF}")" 1000 2>&1)"
+PERF_OUT="$(java -Dfile.encoding=UTF-8 -cp "${CP}" com.wangyu.tangdb.client.InsertLatencyBench "$(cygpath -w "${FE_CONF}")" 1000 2>&1)"
 log "  ${PERF_OUT}"
 P99="$(printf '%s' "${PERF_OUT}" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^p99=/) {gsub(/ms/,"",$i); split($i,a,"="); print a[2]}}')"
 if [ -n "${P99}" ]; then
@@ -562,6 +621,7 @@ fi
 
 # ================================================================ 收尾
 kill_be
+kill_fed
 
 log ""
 log "=================================================="

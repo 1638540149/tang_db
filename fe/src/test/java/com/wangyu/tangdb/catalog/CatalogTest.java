@@ -33,7 +33,7 @@ class CatalogTest {
         Catalog second = Catalog.open(kv);
         assertEquals(sizeAfterFirst, kv.size(), "再次启动不应重复写系统表");
         assertTrue(second.tables().isEmpty());
-        assertEquals(16, second.nextTableId());
+        assertEquals(64, second.nextTableId());
     }
 
     @Test
@@ -41,13 +41,13 @@ class CatalogTest {
         FakeKvStore kv = new FakeKvStore();
         Catalog catalog = Catalog.open(kv);
         TableMeta users = catalog.createTable("Users", userColumns());
-        assertEquals(16, users.id());
+        assertEquals(64, users.id());
         assertEquals("users", users.name(), "表名应统一转小写");
-        assertEquals(17, catalog.nextTableId());
+        assertEquals(65, catalog.nextTableId());
 
         Catalog reloaded = Catalog.open(kv);
         TableMeta loaded = reloaded.require("USERS");
-        assertEquals(16, loaded.id());
+        assertEquals(64, loaded.id());
         assertEquals(3, loaded.columnCount());
         assertEquals("id", loaded.primaryKey().name());
         assertEquals(DataType.BIGINT, loaded.primaryKey().type());
@@ -215,7 +215,7 @@ class CatalogTest {
 
         CatalogException e = assertThrows(CatalogException.class, () -> Catalog.open(kv));
         assertTrue(e.getMessage().contains("next_table_id"), e.getMessage());
-        assertTrue(e.getMessage().contains("16"), e.getMessage());
+        assertTrue(e.getMessage().contains("5"), e.getMessage());
     }
 
     @Test
