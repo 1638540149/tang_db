@@ -81,6 +81,11 @@ func run() error {
 		"port", cfg.Port,
 		"memtable_size", cfg.MemTableSize,
 		"max_txn_write_bytes", cfg.MaxTxnWriteBytes,
+		"query_batch_rows", cfg.QueryBatchRows,
+		"compaction_l0_files", cfg.CompactionL0Files,
+		"compaction_level_ratio", cfg.CompactionLevelRatio,
+		"compaction_level_max_bytes", cfg.CompactionLevelMaxBytes,
+		"compaction_bloom_enabled", cfg.CompactionBloomEnabled,
 	)
 
 	// FR-365:崩溃注入必须在启动日志里显眼告警(仅验收使用)。
@@ -89,9 +94,13 @@ func run() error {
 	}
 
 	engine, stats, err := store.OpenWithOptions(cfg.DataDir, store.Options{
-		MemtableSize:     cfg.MemTableSize,
-		MaxTxnWriteBytes: cfg.MaxTxnWriteBytes,
-		TestCrashPoint:   cfg.TestCrashPoint,
+		MemtableSize:            cfg.MemTableSize,
+		MaxTxnWriteBytes:        cfg.MaxTxnWriteBytes,
+		TestCrashPoint:          cfg.TestCrashPoint,
+		CompactionL0Files:       cfg.CompactionL0Files,
+		CompactionLevelRatio:    cfg.CompactionLevelRatio,
+		CompactionLevelMaxBytes: cfg.CompactionLevelMaxBytes,
+		BloomEnabled:            cfg.CompactionBloomEnabled,
 	})
 	if err != nil {
 		return fmt.Errorf("打开存储引擎失败: %w", err)

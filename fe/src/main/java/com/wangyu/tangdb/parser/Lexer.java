@@ -83,6 +83,24 @@ public final class Lexer {
                     advance();
                     tokens.add(new Token(TokenType.MINUS, "-", startLine, startCol));
                 }
+                case '+' -> {
+                    advance();
+                    tokens.add(new Token(TokenType.PLUS, "+", startLine, startCol));
+                }
+                case '/' -> {
+                    advance();
+                    tokens.add(new Token(TokenType.SLASH, "/", startLine, startCol));
+                }
+                case '%' -> {
+                    advance();
+                    tokens.add(new Token(TokenType.PERCENT, "%", startLine, startCol));
+                }
+                case ':' -> {
+                    if (peek(1) == '=') {
+                        throw error(startLine, startCol, "不支持 ':=',请用 '='");
+                    }
+                    throw error(startLine, startCol, "无法识别的字符 ':'");
+                }
                 case '=' -> {
                     advance();
                     tokens.add(new Token(TokenType.EQ, "=", startLine, startCol));

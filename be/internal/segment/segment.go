@@ -1,14 +1,16 @@
 // Package segment 实现列式 segment 文件的写入与读取。
 //
-// 文件布局(从文件头到文件尾):
+// 文件布局(v2,SPEC-P5 §5.1 / FR-563 ~ FR-570,从文件头到文件尾):
 //
-//	Index Block: 每 chunk 的首 key + key chunk 偏移 + value chunk 偏移
-//	ZoneMap:     每 chunk 的 key/value min/max 与行数
-//	Key Column:  所有 key chunk 依次排列(每 chunk 最多 4096 行)
-//	Value Column:所有 value chunk 依次排列
-//	Footer:      固定长度,位于文件末尾,含各区块偏移与校验和
+//	Chunk Area:  每条记录 = 一个 column chunk(键列 / 值列各一段)
+//	Index Block: 每 chunk 的首 key、min/max、chunk 偏移/长度/头长、行数、编码与字节统计
+//	Footer:      固定长度,位于文件末尾,含各区块偏移、总行数、编码命中数与校验和
 //
-// 本期使用原始编码(无压缩),但结构按列组织,便于 P5 替换编码方式。
+// 每个 chunk 自带:编码类型、行数、原始字节、压缩后字节、min/max、null_count、
+// validity 位图、可选布隆过滤、块内偏移数组(FR-568)。
+//
+// 压缩只作用在"保序编码后的字节"上:解压后逐字节相等,比较语义不变(INV-18)。
+// v1 文件(P1~P4 产生)仍按老布局读取,不需要清空数据目录。
 package segment
 
 import (
@@ -23,21 +25,31 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 const (
-	chunkRows  = 4096
-	magic      = "TANSEG01"
-	footerSize = 8 + 4 + 8*8 + 8 + 4 // magic + version + 8 offsets/lens + totalRows + checksum
-	version    = 1
+	chunkRows = 4096
+	magicV1   = "TANSEG01"
+	magicV2   = "TANSEG02"
+
+	// footerSizeV1 是旧布局的 footer 长度:magic + version + 8 个 offset/len + rows + crc。
+	footerSizeV1 = 8 + 4 + 8*8 + 8 + 4
+	// footerSizeV2:magic + version + 4 个 offset/len + rows + raw + comp + 5 个编码计数 + crc。
+	footerSizeV2 = 8 + 4 + 8*4 + 8 + 8 + 8 + 8*encodingCount + 4
+
+	formatV1 = 1
+	formatV2 = 2
+	version  = formatV2
 )
 
 var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 
 // Builder 将有序 KV 序列写入一个 segment 文件。
 type Builder struct {
-	path string
-	rows []kv
+	path        string
+	rows        []kv
+	bloomEnabled bool
 }
 
 type kv struct {
@@ -47,20 +59,30 @@ type kv struct {
 
 // Footer 是文件尾部的元信息。
 type Footer struct {
-	IndexBlockOffset  uint64
-	IndexBlockLen     uint64
-	ZoneMapOffset     uint64
-	ZoneMapLen        uint64
-	KeyColumnOffset   uint64
-	KeyColumnLen      uint64
+	Version          uint32
+	IndexBlockOffset uint64
+	IndexBlockLen    uint64
+	ChunkAreaOffset  uint64
+	ChunkAreaLen     uint64
+	TotalRows        uint64
+	RawBytes         uint64
+	CompBytes        uint64
+	EncodingCounts   [encodingCount]uint64
+
+	// 仅 v1 需要:两列各自的起点/总长(offset 相对列起点)。
 	ValueColumnOffset uint64
+	KeyColumnLen      uint64
 	ValueColumnLen    uint64
-	TotalRows         uint64
 }
 
-// NewBuilder 创建指定路径的 segment 构建器。
+// NewBuilder 创建指定路径的 segment 构建器(chunk 级布隆默认开启)。
 func NewBuilder(path string) *Builder {
-	return &Builder{path: path}
+	return &Builder{path: path, bloomEnabled: true}
+}
+
+// NewBloomAwareBuilder 按配置决定是否写 chunk 级布隆(compaction_bloom_enabled)。
+func NewBloomAwareBuilder(path string, bloomEnabled bool) *Builder {
+	return &Builder{path: path, bloomEnabled: bloomEnabled}
 }
 
 // Add 追加一条有序 KV。调用方须保证按 key 升序加入。
@@ -76,7 +98,6 @@ func (b *Builder) Finish() (*Footer, error) {
 	if len(b.rows) == 0 {
 		return nil, errors.New("segment: empty segment")
 	}
-
 	_ = os.MkdirAll(filepath.Dir(b.path), 0750)
 	tmp := b.path + ".tmp"
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0640)
@@ -85,11 +106,10 @@ func (b *Builder) Finish() (*Footer, error) {
 	}
 	defer os.Remove(tmp)
 
-	// 1. 收集 chunk 元信息,写入 column chunks 到内存。
 	numChunks := (len(b.rows) + chunkRows - 1) / chunkRows
-	chunks := make([]chunkInfo, numChunks)
-	keyColBuf := &bytes.Buffer{}
-	valueColBuf := &bytes.Buffer{}
+	entries := make([]indexEntry, numChunks)
+	chunkArea := &bytes.Buffer{}
+	footer := &Footer{Version: version, TotalRows: uint64(len(b.rows))}
 
 	for ci := 0; ci < numChunks; ci++ {
 		start := ci * chunkRows
@@ -97,91 +117,87 @@ func (b *Builder) Finish() (*Footer, error) {
 		if end > len(b.rows) {
 			end = len(b.rows)
 		}
-		info := &chunks[ci]
-		info.firstKey = append([]byte(nil), b.rows[start].key...)
-		info.keyOffset = uint64(keyColBuf.Len())
-		info.valueOffset = uint64(valueColBuf.Len())
-		info.rowCount = end - start
+		rows := end - start
+		keys := make([][]byte, rows)
+		values := make([][]byte, rows)
+		valid := make([]bool, rows)
+		for i := 0; i < rows; i++ {
+			keys[i] = b.rows[start+i].key
+			values[i] = b.rows[start+i].value
+			valid[i] = true
+		}
 
-		for i := start; i < end; i++ {
-			row := b.rows[i]
-			if i == start {
-				info.keyMin = append([]byte(nil), row.key...)
-				info.valueMin = append([]byte(nil), row.value...)
-			}
-			info.keyMax = append([]byte(nil), row.key...)
-			info.valueMax = append([]byte(nil), row.value...)
-			writeBytesWithLen(keyColBuf, row.key)
-			writeBytesWithLen(valueColBuf, row.value)
+		keyChunk, keyInfo, err := encodeColumnChunk(columnIDKey, keys, valid, b.bloomEnabled)
+		if err != nil {
+			return nil, fmt.Errorf("segment: encode key chunk %d: %w", ci, err)
+		}
+		keyOff := uint64(chunkArea.Len())
+		chunkArea.Write(keyChunk)
+
+		valueChunk, valueInfo, err := encodeColumnChunk(columnIDValue, values, valid, b.bloomEnabled)
+		if err != nil {
+			return nil, fmt.Errorf("segment: encode value chunk %d: %w", ci, err)
+		}
+		valueOff := uint64(chunkArea.Len())
+		chunkArea.Write(valueChunk)
+
+		footer.RawBytes += uint64(keyInfo.RawBytes + valueInfo.RawBytes)
+		footer.CompBytes += uint64(keyInfo.CompBytes + valueInfo.CompBytes)
+		footer.EncodingCounts[keyInfo.Encoding]++
+		footer.EncodingCounts[valueInfo.Encoding]++
+
+		entries[ci] = indexEntry{
+			firstKey:      append([]byte(nil), keys[0]...),
+			keyMin:        append([]byte(nil), keyInfo.Min...),
+			keyMax:        append([]byte(nil), keyInfo.Max...),
+			keyOffset:     keyOff,
+			keyLen:        len(keyChunk),
+			keyHeaderLen:  keyInfo.headerLen,
+			keyEnc:        keyInfo.Encoding,
+			keyRaw:        keyInfo.RawBytes,
+			keyComp:       keyInfo.CompBytes,
+			keyNull:       keyInfo.NullCount,
+			valueOffset:   valueOff,
+			valueLen:      len(valueChunk),
+			valueHeaderLen: valueInfo.headerLen,
+			valueEnc:      valueInfo.Encoding,
+			valueRaw:      valueInfo.RawBytes,
+			valueComp:     valueInfo.CompBytes,
+			valueNull:     valueInfo.NullCount,
+			rowCount:      rows,
 		}
 	}
 
-	// 2. 写入 Index Block。
+	chunkAreaOffset, err := f.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := f.Write(chunkArea.Bytes()); err != nil {
+		return nil, fmt.Errorf("segment: write chunk area: %w", err)
+	}
+
 	indexOffset, err := f.Seek(0, io.SeekCurrent)
 	if err != nil {
 		return nil, err
 	}
 	indexBuf := &bytes.Buffer{}
-	for _, c := range chunks {
-		writeBytesWithLen(indexBuf, c.firstKey)
-		binary.Write(indexBuf, binary.LittleEndian, c.keyOffset)
-		binary.Write(indexBuf, binary.LittleEndian, c.valueOffset)
+	for _, e := range entries {
+		writeIndexEntry(indexBuf, e)
 	}
 	if _, err := f.Write(indexBuf.Bytes()); err != nil {
 		return nil, fmt.Errorf("segment: write index: %w", err)
 	}
 
-	// 3. 写入 ZoneMap。
-	zoneOffset, err := f.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return nil, err
-	}
-	zoneBuf := &bytes.Buffer{}
-	for _, c := range chunks {
-		writeBytesWithLen(zoneBuf, c.keyMin)
-		writeBytesWithLen(zoneBuf, c.keyMax)
-		writeBytesWithLen(zoneBuf, c.valueMin)
-		writeBytesWithLen(zoneBuf, c.valueMax)
-		binary.Write(zoneBuf, binary.LittleEndian, uint32(c.rowCount))
-	}
-	if _, err := f.Write(zoneBuf.Bytes()); err != nil {
-		return nil, fmt.Errorf("segment: write zonemap: %w", err)
-	}
-
-	// 4. 写入 Key Column。
-	keyOffset, err := f.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := f.Write(keyColBuf.Bytes()); err != nil {
-		return nil, fmt.Errorf("segment: write key column: %w", err)
-	}
-
-	// 5. 写入 Value Column。
-	valueOffset, err := f.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := f.Write(valueColBuf.Bytes()); err != nil {
-		return nil, fmt.Errorf("segment: write value column: %w", err)
-	}
-
-	// 6. 写入 Footer。
-	footer := &Footer{
-		IndexBlockOffset:  uint64(indexOffset),
-		IndexBlockLen:     uint64(indexBuf.Len()),
-		ZoneMapOffset:     uint64(zoneOffset),
-		ZoneMapLen:        uint64(zoneBuf.Len()),
-		KeyColumnOffset:   uint64(keyOffset),
-		KeyColumnLen:      uint64(keyColBuf.Len()),
-		ValueColumnOffset: uint64(valueOffset),
-		ValueColumnLen:    uint64(valueColBuf.Len()),
-		TotalRows:         uint64(len(b.rows)),
-	}
-	if err := writeFooter(f, footer); err != nil {
+	footer.ChunkAreaOffset = uint64(chunkAreaOffset)
+	footer.ChunkAreaLen = uint64(chunkArea.Len())
+	footer.ValueColumnOffset = uint64(chunkAreaOffset)
+	footer.KeyColumnLen = uint64(chunkArea.Len())
+	footer.ValueColumnLen = uint64(chunkArea.Len())
+	footer.IndexBlockOffset = uint64(indexOffset)
+	footer.IndexBlockLen = uint64(indexBuf.Len())
+	if err := writeFooterV2(f, footer); err != nil {
 		return nil, fmt.Errorf("segment: write footer: %w", err)
 	}
-
 	if err := f.Sync(); err != nil {
 		return nil, fmt.Errorf("segment: fsync: %w", err)
 	}
@@ -194,15 +210,29 @@ func (b *Builder) Finish() (*Footer, error) {
 	return footer, nil
 }
 
-type chunkInfo struct {
-	firstKey    []byte
+// indexEntry 是 Index Block 里的一条(同时覆盖 v1/v2;v1 只有前几个字段有意义)。
+type indexEntry struct {
+	firstKey []byte
+	keyMin   []byte
+	keyMax   []byte
+
 	keyOffset   uint64
-	valueOffset uint64
-	rowCount    int
-	keyMin      []byte
-	keyMax      []byte
-	valueMin    []byte
-	valueMax    []byte
+	keyLen      int
+	keyHeaderLen int
+	keyEnc      Encoding
+	keyRaw      int
+	keyComp     int
+	keyNull     int
+
+	valueOffset    uint64
+	valueLen       int
+	valueHeaderLen int
+	valueEnc       Encoding
+	valueRaw       int
+	valueComp      int
+	valueNull      int
+
+	rowCount int
 }
 
 func writeBytesWithLen(w *bytes.Buffer, b []byte) {
@@ -212,41 +242,151 @@ func writeBytesWithLen(w *bytes.Buffer, b []byte) {
 	w.Write(b)
 }
 
-func writeFooter(f *os.File, footer *Footer) error {
-	buf := make([]byte, footerSize)
-	copy(buf[0:8], magic)
-	binary.LittleEndian.PutUint32(buf[8:12], version)
+func writeIndexEntry(w *bytes.Buffer, e indexEntry) {
+	writeBytesWithLen(w, e.firstKey)
+	writeBytesWithLen(w, e.keyMin)
+	writeBytesWithLen(w, e.keyMax)
+	binary.Write(w, binary.LittleEndian, e.keyOffset)
+	binary.Write(w, binary.LittleEndian, uint32(e.keyLen))
+	binary.Write(w, binary.LittleEndian, uint32(e.keyHeaderLen))
+	binary.Write(w, binary.LittleEndian, e.valueOffset)
+	binary.Write(w, binary.LittleEndian, uint32(e.valueLen))
+	binary.Write(w, binary.LittleEndian, uint32(e.valueHeaderLen))
+	binary.Write(w, binary.LittleEndian, uint32(e.rowCount))
+	w.WriteByte(byte(e.keyEnc))
+	w.WriteByte(byte(e.valueEnc))
+	binary.Write(w, binary.LittleEndian, uint32(e.keyRaw))
+	binary.Write(w, binary.LittleEndian, uint32(e.keyComp))
+	binary.Write(w, binary.LittleEndian, uint32(e.valueRaw))
+	binary.Write(w, binary.LittleEndian, uint32(e.valueComp))
+	binary.Write(w, binary.LittleEndian, uint32(e.keyNull))
+	binary.Write(w, binary.LittleEndian, uint32(e.valueNull))
+}
+
+func readIndexEntryV2(buf []byte, pos *int) (indexEntry, error) {
+	e := indexEntry{}
+	readBytes := func() ([]byte, error) {
+		if *pos+4 > len(buf) {
+			return nil, errors.New("segment: index entry truncated")
+		}
+		l := int(binary.LittleEndian.Uint32(buf[*pos:]))
+		*pos += 4
+		if *pos+l > len(buf) {
+			return nil, errors.New("segment: index entry truncated")
+		}
+		b := make([]byte, l)
+		copy(b, buf[*pos:*pos+l])
+		*pos += l
+		return b, nil
+	}
+	var err error
+	if e.firstKey, err = readBytes(); err != nil {
+		return e, err
+	}
+	if e.keyMin, err = readBytes(); err != nil {
+		return e, err
+	}
+	if e.keyMax, err = readBytes(); err != nil {
+		return e, err
+	}
+	need := func(n int) error {
+		if *pos+n > len(buf) {
+			return errors.New("segment: index entry truncated")
+		}
+		return nil
+	}
+	if err := need(24); err != nil {
+		return e, err
+	}
+	e.keyOffset = binary.LittleEndian.Uint64(buf[*pos:])
+	*pos += 8
+	e.keyLen = int(binary.LittleEndian.Uint32(buf[*pos:]))
+	*pos += 4
+	e.keyHeaderLen = int(binary.LittleEndian.Uint32(buf[*pos:]))
+	*pos += 4
+	e.valueOffset = binary.LittleEndian.Uint64(buf[*pos:])
+	*pos += 8
+	if err := need(4); err != nil {
+		return e, err
+	}
+	e.valueLen = int(binary.LittleEndian.Uint32(buf[*pos:]))
+	*pos += 4
+	if err := need(4); err != nil {
+		return e, err
+	}
+	e.valueHeaderLen = int(binary.LittleEndian.Uint32(buf[*pos:]))
+	*pos += 4
+	if err := need(4); err != nil {
+		return e, err
+	}
+	e.rowCount = int(binary.LittleEndian.Uint32(buf[*pos:]))
+	*pos += 4
+	if err := need(2); err != nil {
+		return e, err
+	}
+	e.keyEnc = Encoding(buf[*pos])
+	e.valueEnc = Encoding(buf[*pos+1])
+	*pos += 2
+	if !validEncoding(e.keyEnc) || !validEncoding(e.valueEnc) {
+		return e, fmt.Errorf("segment: index 编码非法(%d,%d)", e.keyEnc, e.valueEnc)
+	}
+	if err := need(24); err != nil {
+		return e, err
+	}
+	e.keyRaw = int(binary.LittleEndian.Uint32(buf[*pos:]))
+	*pos += 4
+	e.keyComp = int(binary.LittleEndian.Uint32(buf[*pos:]))
+	*pos += 4
+	e.valueRaw = int(binary.LittleEndian.Uint32(buf[*pos:]))
+	*pos += 4
+	e.valueComp = int(binary.LittleEndian.Uint32(buf[*pos:]))
+	*pos += 4
+	e.keyNull = int(binary.LittleEndian.Uint32(buf[*pos:]))
+	*pos += 4
+	e.valueNull = int(binary.LittleEndian.Uint32(buf[*pos:]))
+	*pos += 4
+	return e, nil
+}
+
+func writeFooterV2(f *os.File, footer *Footer) error {
+	buf := make([]byte, footerSizeV2)
+	copy(buf[0:8], magicV2)
+	binary.LittleEndian.PutUint32(buf[8:12], footer.Version)
 	binary.LittleEndian.PutUint64(buf[12:20], footer.IndexBlockOffset)
 	binary.LittleEndian.PutUint64(buf[20:28], footer.IndexBlockLen)
-	binary.LittleEndian.PutUint64(buf[28:36], footer.ZoneMapOffset)
-	binary.LittleEndian.PutUint64(buf[36:44], footer.ZoneMapLen)
-	binary.LittleEndian.PutUint64(buf[44:52], footer.KeyColumnOffset)
-	binary.LittleEndian.PutUint64(buf[52:60], footer.KeyColumnLen)
-	binary.LittleEndian.PutUint64(buf[60:68], footer.ValueColumnOffset)
-	binary.LittleEndian.PutUint64(buf[68:76], footer.ValueColumnLen)
-	binary.LittleEndian.PutUint64(buf[76:84], footer.TotalRows)
-	crc := crc32.Checksum(buf[:footerSize-4], castagnoli)
-	binary.LittleEndian.PutUint32(buf[footerSize-4:], crc)
+	binary.LittleEndian.PutUint64(buf[28:36], footer.ChunkAreaOffset)
+	binary.LittleEndian.PutUint64(buf[36:44], footer.ChunkAreaLen)
+	binary.LittleEndian.PutUint64(buf[44:52], footer.TotalRows)
+	binary.LittleEndian.PutUint64(buf[52:60], footer.RawBytes)
+	binary.LittleEndian.PutUint64(buf[60:68], footer.CompBytes)
+	pos := 68
+	for _, n := range footer.EncodingCounts {
+		binary.LittleEndian.PutUint64(buf[pos:pos+8], n)
+		pos += 8
+	}
+	crc := crc32.Checksum(buf[:footerSizeV2-4], castagnoli)
+	binary.LittleEndian.PutUint32(buf[footerSizeV2-4:], crc)
 	_, err := f.Write(buf)
 	return err
 }
 
 // Reader 打开一个 segment 文件进行读取。
 type Reader struct {
-	path    string
-	file    *os.File
-	footer  *Footer
+	path   string
+	file   *os.File
+	footer *Footer
+	format int
+
 	index   []indexEntry
-	zoneMap []zoneEntry
+	zoneMap []zoneEntry // v1 兼容
+
+	statMu        sync.Mutex
+	chunkTouches  int
+	headerTouches int
+	bytesRead     int64
 }
 
-type indexEntry struct {
-	firstKey    []byte
-	keyOffset   uint64
-	valueOffset uint64
-}
-
-type zoneEntry struct {
+type zoneEntry struct { // 仅 v1
 	keyMin   []byte
 	keyMax   []byte
 	valueMin []byte
@@ -254,7 +394,7 @@ type zoneEntry struct {
 	rowCount uint32
 }
 
-// Open 打开 segment 文件。
+// Open 打开 segment 文件(v1 与 v2 都支持)。
 func Open(path string) (*Reader, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -265,23 +405,30 @@ func Open(path string) (*Reader, error) {
 		f.Close()
 		return nil, err
 	}
-	if info.Size() < int64(footerSize) {
+	if info.Size() < int64(footerSizeV1) {
 		f.Close()
 		return nil, fmt.Errorf("segment: file too small %s", path)
 	}
-	footer, err := readFooter(f, info.Size())
+	footer, format, err := readFooter(f, info.Size())
 	if err != nil {
 		f.Close()
 		return nil, err
 	}
-	r := &Reader{path: path, file: f, footer: footer}
-	if err := r.loadIndex(); err != nil {
-		r.Close()
-		return nil, err
-	}
-	if err := r.loadZoneMap(); err != nil {
-		r.Close()
-		return nil, err
+	r := &Reader{path: path, file: f, footer: footer, format: format}
+	if format == formatV1 {
+		if err := r.loadIndexV1(); err != nil {
+			r.Close()
+			return nil, err
+		}
+		if err := r.loadZoneMapV1(); err != nil {
+			r.Close()
+			return nil, err
+		}
+	} else {
+		if err := r.loadIndexV2(); err != nil {
+			r.Close()
+			return nil, err
+		}
 	}
 	return r, nil
 }
@@ -302,14 +449,78 @@ func (r *Reader) Path() string { return r.path }
 // Footer 返回文件 footer 副本。
 func (r *Reader) Footer() Footer { return *r.footer }
 
+// Format 返回文件格式版本(1 或 2)。
+func (r *Reader) Format() int { return r.format }
+
 // Get 按 key 查找 value;不存在时 ok=false。
 func (r *Reader) Get(key []byte) (value []byte, ok bool, err error) {
+	if r.format == formatV1 {
+		return r.getV1(key)
+	}
+	return r.getV2(key)
+}
+
+// getV2 走 Index Block 二分 → 块头布隆 → 块内二分,不做块内线性查找(FR-568 / FR-569)。
+func (r *Reader) getV2(key []byte) ([]byte, bool, error) {
+	if len(r.index) == 0 {
+		return nil, false, nil
+	}
+	// 找到第一个 keyMax >= target 的 chunk。
+	ci := sort.Search(len(r.index), func(i int) bool {
+		return bytes.Compare(r.index[i].keyMax, key) >= 0
+	})
+	if ci >= len(r.index) {
+		return nil, false, nil
+	}
+	e := r.index[ci]
+	if bytes.Compare(key, e.keyMin) < 0 || bytes.Compare(key, e.keyMax) > 0 {
+		return nil, false, nil
+	}
+	// 读 chunk 头做布隆过滤(误判不漏行)。
+	header, err := r.readAt(r.footer.ChunkAreaOffset+e.keyOffset, e.keyHeaderLen, true)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(header) >= 5 {
+		// bloom 在块头里;parse 出 bloom 段(不读压缩数据)。
+		if !bloomAllows(header, key) {
+			return nil, false, nil
+		}
+	}
+	keyChunk, err := r.readAt(r.footer.ChunkAreaOffset+e.keyOffset, e.keyLen, false)
+	if err != nil {
+		return nil, false, err
+	}
+	keyInfo, keys, err := decodeColumnChunk(keyChunk, columnIDKey)
+	if err != nil {
+		return nil, false, err
+	}
+	pos := sort.Search(len(keys), func(i int) bool { return bytes.Compare(keys[i], key) >= 0 })
+	if pos >= len(keys) || !bytes.Equal(keys[pos], key) {
+		return nil, false, nil
+	}
+	valueChunk, err := r.readAt(r.footer.ValueColumnOffset+e.valueOffset, e.valueLen, false)
+	if err != nil {
+		return nil, false, err
+	}
+	_, values, err := decodeColumnChunk(valueChunk, columnIDValue)
+	if err != nil {
+		return nil, false, err
+	}
+	if pos >= len(values) {
+		return nil, false, fmt.Errorf("segment: value chunk 行数不足(key 命中第 %d 行,值 %d 行)",
+			pos, len(values))
+	}
+	_ = keyInfo
+	return values[pos], true, nil
+}
+
+func (r *Reader) getV1(key []byte) ([]byte, bool, error) {
 	for i, z := range r.zoneMap {
-		// ZoneMap 过滤:只有 key 落在 [keyMin, keyMax] 区间才需要查该 chunk。
 		if bytes.Compare(key, z.keyMin) < 0 || bytes.Compare(key, z.keyMax) > 0 {
 			continue
 		}
-		val, found, err := r.searchChunk(i, key)
+		val, found, err := r.searchChunkV1(i, key)
 		if err != nil {
 			return nil, false, err
 		}
@@ -320,72 +531,67 @@ func (r *Reader) Get(key []byte) (value []byte, ok bool, err error) {
 	return nil, false, nil
 }
 
-func (r *Reader) searchChunk(chunkIdx int, key []byte) ([]byte, bool, error) {
+func (r *Reader) searchChunkV1(chunkIdx int, key []byte) ([]byte, bool, error) {
 	entry := r.index[chunkIdx]
 	zone := r.zoneMap[chunkIdx]
-
-	// 读取 key chunk。
-	keyChunk, err := r.readColumnBlock(r.footer.KeyColumnOffset+entry.keyOffset, r.keyChunkLen(chunkIdx))
+	keyChunk, err := r.readAt(r.footer.ChunkAreaOffset+entry.keyOffset, entry.keyLen, false)
 	if err != nil {
 		return nil, false, err
 	}
-	// 读取 value chunk。
-	valueChunk, err := r.readColumnBlock(r.footer.ValueColumnOffset+entry.valueOffset, r.valueChunkLen(chunkIdx))
+	valueChunk, err := r.readAt(r.footer.ValueColumnOffset+entry.valueOffset, entry.valueLen, false)
 	if err != nil {
 		return nil, false, err
 	}
-
 	keys := decodeBytesSeq(keyChunk)
 	values := decodeBytesSeq(valueChunk)
 	if len(keys) != int(zone.rowCount) || len(values) != int(zone.rowCount) {
 		return nil, false, fmt.Errorf("segment: chunk %d row count mismatch", chunkIdx)
 	}
-	for i := 0; i < len(keys); i++ {
-		cmp := bytes.Compare(key, keys[i])
-		if cmp == 0 {
-			return values[i], true, nil
-		}
-		if cmp < 0 {
-			break
-		}
+	pos := sort.Search(len(keys), func(i int) bool { return bytes.Compare(keys[i], key) >= 0 })
+	if pos < len(keys) && bytes.Equal(keys[pos], key) {
+		return values[pos], true, nil
 	}
 	return nil, false, nil
 }
 
-// keyChunkLen 计算某 chunk 的 key 列块长度。
-func (r *Reader) keyChunkLen(idx int) uint64 {
-	start := r.index[idx].keyOffset
-	var end uint64
-	if idx+1 < len(r.index) {
-		end = r.index[idx+1].keyOffset
-	} else {
-		end = r.footer.KeyColumnLen
-	}
-	return end - start
-}
-
-// valueChunkLen 计算某 chunk 的 value 列块长度。
-func (r *Reader) valueChunkLen(idx int) uint64 {
-	start := r.index[idx].valueOffset
-	var end uint64
-	if idx+1 < len(r.index) {
-		end = r.index[idx+1].valueOffset
-	} else {
-		end = r.footer.ValueColumnLen
-	}
-	return end - start
-}
-
-// readColumnBlock 从文件偏移处读取指定长度的字节。
-func (r *Reader) readColumnBlock(offset, length uint64) ([]byte, error) {
+// readAt 读取指定长度;track 为 true 时记作"只读了头部"。
+func (r *Reader) readAt(offset uint64, length int, headerOnly bool) ([]byte, error) {
 	buf := make([]byte, length)
 	if _, err := r.file.ReadAt(buf, int64(offset)); err != nil {
-		return nil, fmt.Errorf("segment: read column block at %d: %w", offset, err)
+		return nil, fmt.Errorf("segment: read block at %d: %w", offset, err)
 	}
+	r.statMu.Lock()
+	if headerOnly {
+		r.headerTouches++
+	} else {
+		r.chunkTouches++
+	}
+	r.bytesRead += int64(length)
+	r.statMu.Unlock()
 	return buf, nil
 }
 
-func (r *Reader) loadIndex() error {
+func (r *Reader) loadIndexV2() error {
+	buf := make([]byte, r.footer.IndexBlockLen)
+	if _, err := r.file.ReadAt(buf, int64(r.footer.IndexBlockOffset)); err != nil {
+		return fmt.Errorf("segment: read index: %w", err)
+	}
+	r.index = nil
+	pos := 0
+	for pos < len(buf) {
+		e, err := readIndexEntryV2(buf, &pos)
+		if err != nil {
+			return err
+		}
+		r.index = append(r.index, e)
+	}
+	if len(r.index) == 0 {
+		return errors.New("segment: 空 index block")
+	}
+	return nil
+}
+
+func (r *Reader) loadIndexV1() error {
 	buf := make([]byte, r.footer.IndexBlockLen)
 	if _, err := r.file.ReadAt(buf, int64(r.footer.IndexBlockOffset)); err != nil {
 		return fmt.Errorf("segment: read index: %w", err)
@@ -413,9 +619,15 @@ func (r *Reader) loadIndex() error {
 	return nil
 }
 
-func (r *Reader) loadZoneMap() error {
-	buf := make([]byte, r.footer.ZoneMapLen)
-	if _, err := r.file.ReadAt(buf, int64(r.footer.ZoneMapOffset)); err != nil {
+func (r *Reader) loadZoneMapV1() error {
+	// v1: ZoneMap 紧接在 Index Block 之后。
+	zoneOffset := r.footer.IndexBlockOffset + r.footer.IndexBlockLen
+	zoneLen := r.footer.ChunkAreaLen // v1 里 ChunkAreaLen 复用为 ZoneMapLen
+	if zoneLen == 0 {
+		return nil
+	}
+	buf := make([]byte, zoneLen)
+	if _, err := r.file.ReadAt(buf, int64(zoneOffset)); err != nil {
 		return fmt.Errorf("segment: read zonemap: %w", err)
 	}
 	r.zoneMap = nil
@@ -437,20 +649,16 @@ func (r *Reader) loadZoneMap() error {
 		}
 		var err error
 		z := zoneEntry{}
-		z.keyMin, err = readField()
-		if err != nil {
+		if z.keyMin, err = readField(); err != nil {
 			return err
 		}
-		z.keyMax, err = readField()
-		if err != nil {
+		if z.keyMax, err = readField(); err != nil {
 			return err
 		}
-		z.valueMin, err = readField()
-		if err != nil {
+		if z.valueMin, err = readField(); err != nil {
 			return err
 		}
-		z.valueMax, err = readField()
-		if err != nil {
+		if z.valueMax, err = readField(); err != nil {
 			return err
 		}
 		if pos+4 > len(buf) {
@@ -459,38 +667,122 @@ func (r *Reader) loadZoneMap() error {
 		z.rowCount = binary.LittleEndian.Uint32(buf[pos : pos+4])
 		pos += 4
 		r.zoneMap = append(r.zoneMap, z)
+		// 补齐 v1 index 的 keyMin/keyMax/rowCount 以便统一迭代器。
+		idx := len(r.zoneMap) - 1
+		if idx < len(r.index) {
+			r.index[idx].keyMin = z.keyMin
+			r.index[idx].keyMax = z.keyMax
+			r.index[idx].rowCount = int(z.rowCount)
+			r.index[idx].keyEnc = EncRaw
+			r.index[idx].valueEnc = EncRaw
+		}
+	}
+	// v1 的 chunk 长度在 index 里没有记录,由相邻 chunk 起点差推出来。
+	for i := range r.index {
+		if i+1 < len(r.index) {
+			r.index[i].keyLen = int(r.index[i+1].keyOffset - r.index[i].keyOffset)
+			r.index[i].valueLen = int(r.index[i+1].valueOffset - r.index[i].valueOffset)
+		} else {
+			r.index[i].keyLen = int(r.footer.KeyColumnLen - r.index[i].keyOffset)
+			r.index[i].valueLen = int(r.footer.ValueColumnLen - r.index[i].valueOffset)
+		}
 	}
 	return nil
 }
 
-func readFooter(f *os.File, size int64) (*Footer, error) {
-	buf := make([]byte, footerSize)
-	if _, err := f.ReadAt(buf, size-int64(footerSize)); err != nil {
-		return nil, fmt.Errorf("segment: read footer: %w", err)
+// ---------------------------------------------------------------- 诊断(FR-566)
+
+// SegmentStats 是一个 segment 文件的真实字节统计。
+type SegmentStats struct {
+	Path      string
+	Format    int
+	Rows      int
+	Chunks    int
+	RawBytes  uint64
+	CompBytes uint64
+	Ratio     float64
+	Encodings map[string]int
+}
+
+// Stats 返回该文件的真实统计(读自 Index Block 与 Footer)。
+func (r *Reader) Stats() SegmentStats {
+	st := SegmentStats{
+		Path:      r.path,
+		Format:    r.format,
+		Rows:      len(r.index) * chunkRows,
+		Chunks:    len(r.index),
+		RawBytes:  r.footer.RawBytes,
+		CompBytes: r.footer.CompBytes,
+		Encodings: map[string]int{},
 	}
-	if string(buf[0:8]) != magic {
-		return nil, fmt.Errorf("segment: bad magic %q", buf[0:8])
+	total := 0
+	for _, e := range r.index {
+		total += e.rowCount
+		st.Encodings[e.keyEnc.String()]++
+		st.Encodings[e.valueEnc.String()]++
 	}
-	ver := binary.LittleEndian.Uint32(buf[8:12])
-	if ver != version {
-		return nil, fmt.Errorf("segment: unsupported version %d", ver)
+	st.Rows = total
+	if r.format == formatV1 {
+		// v1 无压缩:原始=压缩(含 4 字节长度前缀)。
+		var raw uint64
+		for _, e := range r.index {
+			raw += uint64(e.keyLen + e.valueLen)
+		}
+		st.RawBytes, st.CompBytes = raw, raw
 	}
-	crcStored := binary.LittleEndian.Uint32(buf[footerSize-4:])
-	crcComputed := crc32.Checksum(buf[:footerSize-4], castagnoli)
-	if crcStored != crcComputed {
-		return nil, errors.New("segment: footer checksum mismatch")
+	if st.CompBytes > 0 {
+		st.Ratio = float64(st.RawBytes) / float64(st.CompBytes)
 	}
-	return &Footer{
-		IndexBlockOffset:  binary.LittleEndian.Uint64(buf[12:20]),
-		IndexBlockLen:     binary.LittleEndian.Uint64(buf[20:28]),
-		ZoneMapOffset:     binary.LittleEndian.Uint64(buf[28:36]),
-		ZoneMapLen:        binary.LittleEndian.Uint64(buf[36:44]),
-		KeyColumnOffset:   binary.LittleEndian.Uint64(buf[44:52]),
-		KeyColumnLen:      binary.LittleEndian.Uint64(buf[52:60]),
-		ValueColumnOffset: binary.LittleEndian.Uint64(buf[60:68]),
-		ValueColumnLen:    binary.LittleEndian.Uint64(buf[68:76]),
-		TotalRows:         binary.LittleEndian.Uint64(buf[76:84]),
-	}, nil
+	return st
+}
+
+// ChunkTouches/HeaderTouches/BytesRead 是读放大观测口径(INV 观测清单)。
+func (r *Reader) ChunkTouches() int {
+	r.statMu.Lock()
+	defer r.statMu.Unlock()
+	return r.chunkTouches
+}
+
+// HeaderTouches 返回只读了块头的次数。
+func (r *Reader) HeaderTouches() int {
+	r.statMu.Lock()
+	defer r.statMu.Unlock()
+	return r.headerTouches
+}
+
+// BytesRead 返回累计读取字节数。
+func (r *Reader) BytesRead() int64 {
+	r.statMu.Lock()
+	defer r.statMu.Unlock()
+	return r.bytesRead
+}
+
+// ResetStats 清零读统计。
+func (r *Reader) ResetStats() {
+	r.statMu.Lock()
+	r.chunkTouches = 0
+	r.headerTouches = 0
+	r.bytesRead = 0
+	r.statMu.Unlock()
+}
+
+// bloomAllows 从 chunk 头里取布隆段并判断;头部残缺时保守返回 true。
+func bloomAllows(header []byte, key []byte) bool {
+	info, err := parseChunkHeader(header, columnIDKey)
+	if err != nil {
+		return true
+	}
+	if len(info.bloomBits) == 0 {
+		return true
+	}
+	// 重新拼出 bloom 段([k][mBytes][bits])以便复用 bloomContains。
+	bloom := make([]byte, 0, 5+len(info.bloomBits))
+	bloom = append(bloom, byte(info.bloomK))
+	var m [4]byte
+	binary.LittleEndian.PutUint32(m[:], uint32(len(info.bloomBits)))
+	bloom = append(bloom, m[:]...)
+	bloom = append(bloom, info.bloomBits...)
+	return bloomContains(bloom, key)
 }
 
 func decodeBytesSeq(data []byte) [][]byte {
@@ -507,10 +799,81 @@ func decodeBytesSeq(data []byte) [][]byte {
 		}
 		b := make([]byte, l)
 		copy(b, data[pos:pos+l])
-		out = append(out, b)
 		pos += l
+		out = append(out, b)
 	}
 	return out
+}
+
+// ---------------------------------------------------------------- Footer 读写(v1/v2)
+
+func readFooter(f *os.File, size int64) (*Footer, int, error) {
+	tail := make([]byte, 8)
+	if _, err := f.ReadAt(tail, size-8); err != nil {
+		return nil, 0, fmt.Errorf("segment: read footer tail: %w", err)
+	}
+	// 两个 magic 都以 "TANSEG0" 开头;用倒数第 8 字节所在位置判断不了,
+	// 因此先按 v2 长度尝试,失败再按 v1(旧文件尾部 magic 在固定偏移)。
+	if size >= int64(footerSizeV2) {
+		buf := make([]byte, footerSizeV2)
+		if _, err := f.ReadAt(buf, size-int64(footerSizeV2)); err == nil && string(buf[0:8]) == magicV2 {
+			ver := binary.LittleEndian.Uint32(buf[8:12])
+			if ver != formatV2 {
+				return nil, 0, fmt.Errorf("segment: unsupported version %d", ver)
+			}
+			crcStored := binary.LittleEndian.Uint32(buf[footerSizeV2-4:])
+			crcComputed := crc32.Checksum(buf[:footerSizeV2-4], castagnoli)
+			if crcStored != crcComputed {
+				return nil, 0, errors.New("segment: footer checksum mismatch")
+			}
+			ft := &Footer{
+				Version:          ver,
+				IndexBlockOffset: binary.LittleEndian.Uint64(buf[12:20]),
+				IndexBlockLen:    binary.LittleEndian.Uint64(buf[20:28]),
+				ChunkAreaOffset:  binary.LittleEndian.Uint64(buf[28:36]),
+				ChunkAreaLen:     binary.LittleEndian.Uint64(buf[36:44]),
+				TotalRows:        binary.LittleEndian.Uint64(buf[44:52]),
+				RawBytes:         binary.LittleEndian.Uint64(buf[52:60]),
+				CompBytes:        binary.LittleEndian.Uint64(buf[60:68]),
+			}
+			pos := 68
+			for i := 0; i < encodingCount; i++ {
+				ft.EncodingCounts[i] = binary.LittleEndian.Uint64(buf[pos : pos+8])
+				pos += 8
+			}
+			return ft, formatV2, nil
+		}
+	}
+
+	buf := make([]byte, footerSizeV1)
+	if _, err := f.ReadAt(buf, size-int64(footerSizeV1)); err != nil {
+		return nil, 0, fmt.Errorf("segment: read footer: %w", err)
+	}
+	if string(buf[0:8]) != magicV1 {
+		return nil, 0, fmt.Errorf("segment: bad magic %q", buf[0:8])
+	}
+	ver := binary.LittleEndian.Uint32(buf[8:12])
+	if ver != 1 {
+		return nil, 0, fmt.Errorf("segment: unsupported version %d", ver)
+	}
+	crcStored := binary.LittleEndian.Uint32(buf[footerSizeV1-4:])
+	crcComputed := crc32.Checksum(buf[:footerSizeV1-4], castagnoli)
+	if crcStored != crcComputed {
+		return nil, 0, errors.New("segment: footer checksum mismatch")
+	}
+	// v1 布局:Index/ZoneMap/KeyColumn/ValueColumn 四组 offset+len,再 rows。
+	ft := &Footer{
+		Version:           ver,
+		IndexBlockOffset:  binary.LittleEndian.Uint64(buf[12:20]),
+		IndexBlockLen:     binary.LittleEndian.Uint64(buf[20:28]),
+		ChunkAreaOffset:   binary.LittleEndian.Uint64(buf[44:52]), // KeyColumnOffset
+		ChunkAreaLen:      binary.LittleEndian.Uint64(buf[36:44]), // ZoneMapLen
+		ValueColumnOffset: binary.LittleEndian.Uint64(buf[60:68]), // ValueColumnOffset
+		KeyColumnLen:      binary.LittleEndian.Uint64(buf[52:60]),
+		ValueColumnLen:    binary.LittleEndian.Uint64(buf[68:76]),
+		TotalRows:         binary.LittleEndian.Uint64(buf[76:84]),
+	}
+	return ft, formatV1, nil
 }
 
 // ParseName 解析 segment 文件名,例如 000045.seg -> 45。
@@ -550,4 +913,30 @@ func ListNumbers(dir string) ([]uint64, error) {
 	}
 	sort.Slice(nums, func(i, j int) bool { return nums[i] > nums[j] })
 	return nums, nil
+}
+
+// FirstKey 返回该 segment 的第一条 key(完整 key,含版本段)。
+func (r *Reader) FirstKey() []byte {
+	if len(r.index) == 0 {
+		return nil
+	}
+	return r.index[0].firstKey
+}
+
+// LastKey 返回该 segment 的最后一条 key(完整 key,含版本段)。
+func (r *Reader) LastKey() []byte {
+	if len(r.index) == 0 {
+		return nil
+	}
+	return r.index[len(r.index)-1].keyMax
+}
+
+// ContainsRange 判断 [first,last] 与 segment 的 key 范围是否重叠。
+func (r *Reader) ContainsRange(first, last []byte) bool {
+	if len(r.index) == 0 || first == nil || last == nil {
+		return false
+	}
+	segFirst := r.index[0].firstKey
+	segLast := r.index[len(r.index)-1].keyMax
+	return bytes.Compare(last, segFirst) >= 0 && bytes.Compare(first, segLast) <= 0
 }

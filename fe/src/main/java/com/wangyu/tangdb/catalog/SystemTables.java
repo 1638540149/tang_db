@@ -49,10 +49,13 @@ public final class SystemTables {
     public static final long SYS_DATABASES = 3;
     public static final long SYS_COUNTERS = 4;
     public static final long SYS_INDEXES = 5;
+    /** SPEC-P5 §5.3 / FR-614:CSV 导入任务与断点状态。 */
+    public static final long SYS_IMPORT_STATE = 6;
 
-    /** 系统表 ID 登记表(FR-426 / K70 / FR-473):不在其中的 ID 即用户表。 */
+    /** 系统表 ID 登记表(FR-426 / K70 / FR-473 / SPEC-P5 FR-614):不在其中的 ID 即用户表。 */
     public static final Set<Long> REGISTERED_IDS =
-            Set.of(SYS_TABLES, SYS_COLUMNS, SYS_DATABASES, SYS_COUNTERS, SYS_INDEXES);
+            Set.of(SYS_TABLES, SYS_COLUMNS, SYS_DATABASES, SYS_COUNTERS, SYS_INDEXES,
+                    SYS_IMPORT_STATE);
 
     /** 预留区上界(6~63 预留给后续元数据族,当前未登记)。 */
     public static final long RESERVED_MAX_TABLE_ID = 63;
@@ -134,6 +137,30 @@ public final class SystemTables {
                     new Column("created_at", DataType.VARCHAR, 64, false, false, 7)),
             true);
 
+    /**
+     * SPEC-P5 §5.3 / FR-614:导入任务状态表。
+     *
+     * <p>在规约 §5.3 的字段基础上补了 {@code status} / {@code error_summary} /
+     * {@code total_rows_estimate},用于 E-04 任务模型(task_id / status / progress / error_summary)。</p>
+     */
+    public static final TableMeta IMPORT_STATE = new TableMeta(
+            SYS_IMPORT_STATE, "sys_import_state", TableMeta.STATE_ACTIVE, "",
+            List.of(
+                    new Column("import_id", DataType.VARCHAR, 128, false, true, 0),
+                    new Column("table_id", DataType.BIGINT, 0, false, false, 1),
+                    new Column("table_name", DataType.VARCHAR, 64, false, false, 2),
+                    new Column("file_path", DataType.VARCHAR, MAX_VARCHAR, false, false, 3),
+                    new Column("file_size", DataType.BIGINT, 0, false, false, 4),
+                    new Column("file_mtime", DataType.BIGINT, 0, false, false, 5),
+                    new Column("last_offset", DataType.BIGINT, 0, false, false, 6),
+                    new Column("last_row_no", DataType.BIGINT, 0, false, false, 7),
+                    new Column("committed_rows", DataType.BIGINT, 0, false, false, 8),
+                    new Column("total_rows_estimate", DataType.BIGINT, 0, false, false, 9),
+                    new Column("status", DataType.VARCHAR, 16, false, false, 10),
+                    new Column("error_summary", DataType.VARCHAR, MAX_VARCHAR, true, false, 11),
+                    new Column("updated_at", DataType.VARCHAR, 64, false, false, 12)),
+            true);
+
     private SystemTables() {
     }
 
@@ -204,6 +231,22 @@ public final class SystemTables {
     }
 
     /** sys_indexes 行(§5.4 的列顺序)。 */
+    /** sys_import_state 的主键编码:import_id 的 VARCHAR 保序编码。 */
+    public static byte[] importStateKey(String importId) {
+        return KeyCodec.systemRowKey(SYS_IMPORT_STATE, KeyCodec.encodePrimaryKey(DataType.VARCHAR, importId));
+    }
+
+    /** sys_import_state 行(列顺序与 {@link #IMPORT_STATE} 一致)。 */
+    public static byte[] encodeImportStateRow(String importId, long tableId, String tableName,
+                                              String filePath, long fileSize, long fileMtime,
+                                              long lastOffset, long lastRowNo, long committedRows,
+                                              long totalRowsEstimate, String status,
+                                              String errorSummary, String updatedAt) {
+        return RowCodec.encode(IMPORT_STATE, new Object[]{
+                importId, tableId, tableName, filePath, fileSize, fileMtime, lastOffset,
+                lastRowNo, committedRows, totalRowsEstimate, status, errorSummary, updatedAt});
+    }
+
     public static byte[] encodeIndexRow(com.wangyu.tangdb.storage.IndexMeta index) {
         return RowCodec.encode(INDEXES, new Object[]{
                 index.tableId(),

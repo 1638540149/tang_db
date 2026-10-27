@@ -140,6 +140,17 @@ public final class RowCodec {
                     pos += len;
                     break;
                 }
+                case JSON: {
+                    require(data, pos, 4);
+                    int len = readLe4Int(data, pos);
+                    pos += 4;
+                    require(data, pos, len);
+                    byte[] raw = new byte[len];
+                    System.arraycopy(data, pos, raw, 0, len);
+                    values[i] = raw;
+                    pos += len;
+                    break;
+                }
                 default:
                     throw new StoreException("不支持的列类型: " + column.type());
             }
@@ -169,6 +180,12 @@ public final class RowCodec {
                 System.arraycopy(raw, 0, buf, pos, raw.length);
                 return pos + raw.length;
             }
+            case JSON: {
+                byte[] raw = (byte[]) value;
+                pos = writeLe4(buf, pos, raw.length);
+                System.arraycopy(raw, 0, buf, pos, raw.length);
+                return pos + raw.length;
+            }
             default:
                 throw new StoreException("不支持的列类型: " + column.type());
         }
@@ -182,6 +199,8 @@ public final class RowCodec {
             }
             if (v instanceof String s) {
                 n += 4 + s.getBytes(StandardCharsets.UTF_8).length;
+            } else if (v instanceof byte[] b) {
+                n += 4 + b.length;
             } else if (v instanceof Double || v instanceof Long) {
                 n += 8;
             } else if (v instanceof Integer || v instanceof LocalDate) {

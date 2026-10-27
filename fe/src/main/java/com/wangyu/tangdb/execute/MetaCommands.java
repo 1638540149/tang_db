@@ -134,14 +134,16 @@ public final class MetaCommands {
             if (!matchesLike(table.name(), show.like())) {
                 continue;
             }
+            Executor.TableSize size = executor == null ? null : executor.tableSize(table);
+            long dataLength = size == null ? 0L : size.compressedBytes();
             rows.add(new Object[]{
                     table.name(),                    // Name
                     "InnoDB",                        // Engine(K93:仅为客户端兼容)
                     10L,                             // Version
                     "Dynamic",                       // Row_format
-                    null,                            // Rows(不扫全表,K95)
+                    null,                            // Rows(不扫全表,K95;FR-567 只要求 DATA_LENGTH)
                     null,                            // Avg_row_length
-                    null,                            // Data_length
+                    dataLength,                      // Data_length(FR-567:真实压缩字节)
                     null,                            // Max_data_length
                     null,                            // Index_length
                     null,                            // Data_free
@@ -176,6 +178,17 @@ public final class MetaCommands {
         String ddl = "CREATE DATABASE `" + db + "` /*!40100 DEFAULT CHARACTER SET utf8mb4 */";
         return new Result.Table(List.of("Database", "Create Database"),
                 List.<Object[]>of(new Object[]{db, ddl}));
+    }
+
+    /** SHOW WARNINGS:GROUP_CONCAT 截断等告警(边界 63)。 */
+    private Result warnings() {
+        List<Object[]> rows = new ArrayList<>();
+        if (executor != null) {
+            for (String message : executor.warningMessages()) {
+                rows.add(new Object[]{"Warning", 1260L, message});
+            }
+        }
+        return new Result.Table(List.of("Level", "Code", "Message"), rows);
     }
 
     /** SHOW CREATE TABLE 的输出必须能被本项目 parser 原样吃回去(FR-529 / K96 / SC-338)。 */
@@ -236,9 +249,11 @@ public final class MetaCommands {
             case COLLATION -> showCollation(show.like());
             case CHARACTER_SET -> showCharacterSet(show.like());
             case GRANTS -> showGrants();
-            case WARNINGS, ERRORS -> new Result.Table(List.of("Level", "Code", "Message"),
+            case WARNINGS -> warnings();
+            case ERRORS -> new Result.Table(List.of("Level", "Code", "Message"),
                     new ArrayList<>());
-            case WARNING_COUNT -> oneRow("@@session.warning_count", 0L);
+            case WARNING_COUNT -> oneRow("@@session.warning_count",
+                    executor == null ? 0L : (long) executor.warningCount());
             case ERROR_COUNT -> oneRow("@@session.error_count", 0L);
             case TRIGGERS -> new Result.Table(List.of("Trigger", "Event", "Table", "Statement",
                     "Timing", "Created", "sql_mode", "Definer", "character_set_client",
@@ -623,13 +638,23 @@ public final class MetaCommands {
         List<Object[]> rows = new ArrayList<>();
         for (String db : catalog.databases()) {
             for (TableMeta table : catalog.tables(db)) {
+                Executor.TableSize size = executor == null ? null : executor.tableSize(table);
                 rows.add(new Object[]{"def", db, table.name(), "BASE TABLE", "InnoDB",
-                        10L, "Dynamic", null, "utf8mb4_general_ci", table.createdAt()});
+                        10L, "Dynamic",
+                        size == null ? null : size.rows(),
+                        null,
+                        size == null ? null : size.compressedBytes(),
+                        null, null, null, null,
+                        "utf8mb4_general_ci", table.createdAt(),
+                        null, null, null, null, null});
             }
         }
         return new VTable("TABLES", cols(c("TABLE_CATALOG"), c("TABLE_SCHEMA"), c("TABLE_NAME"),
                 c("TABLE_TYPE"), c("ENGINE"), n("VERSION"), c("ROW_FORMAT"), n("TABLE_ROWS"),
-                c("TABLE_COLLATION"), c("CREATE_TIME")), rows);
+                n("AVG_ROW_LENGTH"), n("DATA_LENGTH"), n("MAX_DATA_LENGTH"), n("INDEX_LENGTH"),
+                n("DATA_FREE"), n("AUTO_INCREMENT"), c("TABLE_COLLATION"), c("CREATE_TIME"),
+                n("UPDATE_TIME"), n("CHECK_TIME"), n("CHECKSUM"), c("CREATE_OPTIONS"),
+                c("TABLE_COMMENT")), rows);
     }
 
     private VTable columnsTable() {
@@ -767,6 +792,7 @@ public final class MetaCommands {
             case VARCHAR -> "varchar";
             case DATE -> "date";
             case BOOLEAN -> "tinyint";
+            case JSON -> "json";
         };
     }
 

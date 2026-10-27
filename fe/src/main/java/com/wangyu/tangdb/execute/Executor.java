@@ -6,9 +6,11 @@ import com.wangyu.tangdb.catalog.SystemTables;
 import com.wangyu.tangdb.parser.Ast;
 import com.wangyu.tangdb.planner.Plan;
 import com.wangyu.tangdb.planner.Planner;
+import com.wangyu.tangdb.query.QueryEngine;
 import com.wangyu.tangdb.session.Session;
 import com.wangyu.tangdb.session.SessionManager;
 import com.wangyu.tangdb.storage.Column;
+import com.wangyu.tangdb.storage.ColumnarCodec;
 import com.wangyu.tangdb.storage.ConflictException;
 import com.wangyu.tangdb.storage.IndexCodec;
 import com.wangyu.tangdb.storage.IndexMeta;
@@ -28,7 +30,9 @@ import com.wangyu.tangdb.txn.WriteSet;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -79,6 +83,13 @@ public final class Executor {
     /** 最近一次索引扫描的统计(FR-512):扫了多少索引项、回表多少次。 */
     private long lastIndexEntriesScanned;
     private long lastTableLookups;
+
+    // ---- P5:查询引擎参数(§5.4)与 SHOW WARNINGS 计数 ----
+    private int queryBatchRows = 1024;
+    private long sortSpillBytes = 64L * 1024 * 1024;
+    private java.nio.file.Path sortTmpDir = java.nio.file.Path.of("tmp", "fe-sort");
+    private boolean vectorized = true;
+    private final List<String> warnings = new ArrayList<>();
     /** 当前 DML 是否维护了索引(用于把 max_txn_write_bytes 错误说明成"含索引写入",FR-493)。 */
     private boolean currentStatementWritesIndexes;
 
@@ -100,6 +111,35 @@ public final class Executor {
             this.indexBackfillBatch = indexBackfillBatch;
         }
         return this;
+    }
+
+    /** 配置查询引擎(§5.4:query_batch_rows / sort_spill_bytes)。 */
+    public Executor withQueryOptions(int batchRows, long spillBytes, String tmpDir) {
+        if (batchRows > 0) {
+            this.queryBatchRows = batchRows;
+        }
+        if (spillBytes > 0) {
+            this.sortSpillBytes = spillBytes;
+        }
+        if (tmpDir != null && !tmpDir.isBlank()) {
+            this.sortTmpDir = java.nio.file.Path.of(tmpDir);
+        }
+        return this;
+    }
+
+    /** 测试用:切换向量化 / 逐行路径(FR-576 对拍)。 */
+    public Executor withVectorized(boolean enabled) {
+        this.vectorized = enabled;
+        return this;
+    }
+
+    /** SHOW WARNINGS 的口径(边界 63)。 */
+    public int warningCount() {
+        return warnings.size();
+    }
+
+    public List<String> warningMessages() {
+        return List.copyOf(warnings);
     }
 
     public TxnState txnState() {
@@ -204,6 +244,12 @@ public final class Executor {
         if (statement instanceof Ast.ShowTableStatus show) {
             return meta().showTableStatus(show);
         }
+        if (statement instanceof Ast.ShowSegments show) {
+            return showSegments(show);
+        }
+        if (statement instanceof Ast.ShowImportTasks) {
+            return showImportTasks();
+        }
         if (statement instanceof Ast.ShowCreateTable show) {
             return meta().showCreateTable(show);
         }
@@ -223,13 +269,16 @@ public final class Executor {
             return describe(describe);
         }
         if (statement instanceof Ast.Insert insert) {
-            return runDml(() -> insert(insert));
+            return insert(insert);
         }
         if (statement instanceof Ast.Update update) {
             return runDml(() -> update(update));
         }
         if (statement instanceof Ast.Delete delete) {
             return runDml(() -> delete(delete));
+        }
+        if (statement instanceof Ast.SelectQuery query) {
+            return selectQuery(query);
         }
         if (statement instanceof Ast.Select select) {
             return select(select);
@@ -610,6 +659,160 @@ public final class Executor {
         return out;
     }
 
+    // ------------------------------------------------------------ SHOW SEGMENTS / DATA_LENGTH
+
+    /** 一个列(键列 / 值列)的列式压缩统计。 */
+    public record ColumnSize(String column, long rows, int chunks,
+                             long rawBytes, long compressedBytes,
+                             Map<String, Integer> encodings) {
+    }
+
+    /** 一张表的列式压缩统计(口径与 SHOW SEGMENTS / DATA_LENGTH 一致)。 */
+    public record TableSize(long rows, List<ColumnSize> columns) {
+        public long compressedBytes() {
+            long n = 0;
+            for (ColumnSize c : columns) {
+                n += c.compressedBytes();
+            }
+            return n;
+        }
+
+        public long rawBytes() {
+            long n = 0;
+            for (ColumnSize c : columns) {
+                n += c.rawBytes();
+            }
+            return n;
+        }
+
+        public int chunks() {
+            return columns.isEmpty() ? 0 : columns.get(0).chunks();
+        }
+    }
+
+    private record CachedSize(long atMillis, TableSize size) {
+    }
+
+    private final Map<Long, CachedSize> sizeCache = new HashMap<>();
+    private static final long SIZE_CACHE_MILLIS = 2000L;
+
+    /**
+     * 计算一张表的列式字节统计(SPEC-P5 FR-566 / FR-567)。
+     *
+     * <p>BE 只暴露 KV,不暴露 segment 文件布局;FE 也不能读 BE 数据目录(边界铁律)。
+     * 因此这里按 **BE 完全相同的一套编码算法**({@link ColumnarCodec},chunk = 4096 行)
+     * 对同一份逻辑 key/value 字节做统计。真 per-file 统计需要新增 gRPC RPC,已在验收报告登记。</p>
+     */
+    public TableSize tableSize(TableMeta table) {
+        long now = System.currentTimeMillis();
+        CachedSize cached = sizeCache.get(table.id());
+        if (cached != null && now - cached.atMillis() < SIZE_CACHE_MILLIS) {
+            return cached.size();
+        }
+
+        ReadView view = currentView(null);
+        List<KeyValue> kvs = view.scan(KeyCodec.tableRangeStart(table.id()),
+                KeyCodec.tableRangeEnd(table.id()), 0);
+        List<byte[]> keys = new ArrayList<>();
+        List<byte[]> values = new ArrayList<>();
+        for (KeyValue row : kvs) {
+            if (KeyCodec.indexId(row.key()) != KeyCodec.INDEX_ID_PRIMARY) {
+                continue;
+            }
+            byte[] raw = row.value();
+            if (raw != null && raw.length > 0 && raw[0] == RowCodec.FORMAT_TOMBSTONE) {
+                continue;
+            }
+            keys.add(row.key());
+            values.add(raw == null ? EMPTY : raw);
+        }
+
+        List<ColumnSize> columns = new ArrayList<>(2);
+        columns.add(columnSize("key", keys, true));
+        columns.add(columnSize("value", values, false));
+        TableSize size = new TableSize(keys.size(), List.copyOf(columns));
+        sizeCache.put(table.id(), new CachedSize(now, size));
+        return size;
+    }
+
+    private static ColumnSize columnSize(String name, List<byte[]> values, boolean keyColumn) {
+        long raw = 0;
+        long comp = 0;
+        Map<String, Integer> encodings = new LinkedHashMap<>();
+        int chunks = 0;
+        for (int from = 0; from < values.size(); from += ColumnarCodec.CHUNK_ROWS) {
+            int to = Math.min(values.size(), from + ColumnarCodec.CHUNK_ROWS);
+            ColumnarCodec.Encoded encoded = ColumnarCodec.chooseBest(values.subList(from, to));
+            raw += encoded.rawBytes();
+            comp += encoded.compressedBytes();
+            encodings.merge(encoded.encoding().name(), 1, Integer::sum);
+            chunks++;
+        }
+        // BE 的完整 key = 用户键 + 8 字节版本段;版本段近似不可压缩,按原字节计入。
+        if (keyColumn) {
+            long versionBytes = (long) values.size() * KeyCodec.VERSION_BYTES;
+            raw += versionBytes;
+            comp += versionBytes;
+        }
+        return new ColumnSize(name, values.size(), chunks, raw, comp, encodings);
+    }
+
+    /** SHOW SEGMENTS(FR-566):每张表 × 每列一行,数字与 DATA_LENGTH 同口径。 */
+    private Result showSegments(Ast.ShowSegments show) {
+        List<TableMeta> tables = new ArrayList<>();
+        if (show.table() != null) {
+            tables.add(requireTable(show.database(), show.table()));
+        } else {
+            tables.addAll(catalog.tables(resolveDatabase(show.database())));
+        }
+        List<Object[]> rows = new ArrayList<>();
+        for (TableMeta table : tables) {
+            TableSize size = tableSize(table);
+            for (ColumnSize column : size.columns()) {
+                double ratio = column.compressedBytes() == 0
+                        ? 0.0 : (double) column.rawBytes() / column.compressedBytes();
+                rows.add(new Object[]{
+                        "table:" + table.id() + ":" + table.name(),
+                        column.column(),
+                        column.rows(),
+                        column.chunks(),
+                        column.rawBytes(),
+                        column.compressedBytes(),
+                        String.format(java.util.Locale.ROOT, "%.2f", ratio),
+                        encodingText(column.encodings())
+                });
+            }
+        }
+        return new Result.Table(List.of("segment", "column", "rows", "chunks",
+                "raw_bytes", "compressed_bytes", "ratio", "encodings"), rows);
+    }
+
+    /** SHOW IMPORT TASKS(FR-614):task_id / status / progress / error_summary。 */
+    private Result showImportTasks() {
+        List<Object[]> rows = new ArrayList<>();
+        for (com.wangyu.tangdb.catalog.ImportState.Task task
+                : com.wangyu.tangdb.catalog.ImportState.load(kv)) {
+            rows.add(new Object[]{task.importId(), task.tableName(), task.status(),
+                    task.progress(), task.errorSummary(), task.updatedAt()});
+        }
+        return new Result.Table(List.of("task_id", "table_name", "status", "progress",
+                "error_summary", "updated_at"), rows);
+    }
+
+    private static String encodingText(Map<String, Integer> encodings) {
+        if (encodings.isEmpty()) {
+            return "-";
+        }
+        StringBuilder sb = new StringBuilder();
+        for (Map.Entry<String, Integer> e : encodings.entrySet()) {
+            if (sb.length() > 0) {
+                sb.append(",");
+            }
+            sb.append(e.getKey()).append("=").append(e.getValue());
+        }
+        return sb.toString();
+    }
+
     // ------------------------------------------------------------ EXPLAIN
 
     /** EXPLAIN 与实际执行共用 {@link #planFor},不另写一套推算逻辑(FR-517)。 */
@@ -618,6 +821,17 @@ public final class Executor {
         TableMeta table;
         Plan plan;
         Ast.Condition where;
+        if (inner instanceof Ast.SelectQuery query) {
+            QueryEngine.Options options = new QueryEngine.Options(currentDatabase,
+                    queryBatchRows, sortSpillBytes, sortTmpDir, vectorized);
+            QueryEngine engine = new QueryEngine(kv, catalog, currentView(null), options,
+                    message -> warnings.add(message));
+            List<Object[]> planRows = new ArrayList<>();
+            for (String line : engine.explain(query.body())) {
+                planRows.add(new String[]{line});
+            }
+            return new Result.Table(List.of("plan"), planRows);
+        }
         if (inner instanceof Ast.Select select) {
             table = requireTable(select.database(), select.table());
             where = select.where();
@@ -744,7 +958,21 @@ public final class Executor {
 
     // ------------------------------------------------------------ DML
 
+    /**
+     * CSV 导入专用批量插入(K110):跳过"主键已存在"的逐行检查,整批写入。
+     *
+     * <p>语义等价于 INSERT OR IGNORE:同一主键重复写入相同内容幂等,不会产生重复行。
+     * 唯一索引仍然逐行查重(约束不能因为导入而放松)。</p>
+     */
+    public Result importInsert(Ast.Insert insert) {
+        return runDml(() -> insertInternal(insert, true));
+    }
+
     private Result insert(Ast.Insert insert) {
+        return runDml(() -> insertInternal(insert, false));
+    }
+
+    private Result insertInternal(Ast.Insert insert, boolean bulkImport) {
         TableMeta table = requireTable(insert.database(), insert.table());
         if (insert.rows().isEmpty()) {
             throw new StoreException("INSERT 至少需要一组 VALUES");
@@ -791,17 +1019,24 @@ public final class Executor {
             }
             Object[] values = new Object[table.columnCount()];
             for (int j = 0; j < targets.size(); j++) {
-                values[targets.get(j).ordinal()] = Values.coerce(literals.get(j), targets.get(j));
+                try {
+                    values[targets.get(j).ordinal()] = Values.coerce(literals.get(j), targets.get(j));
+                } catch (StoreException e) {
+                    throw new StoreException("第 " + (k + 1) + " 组(列 "
+                            + targets.get(j).name() + "): " + e.getMessage(), e.code(), e);
+                }
             }
             Object pkValue = values[pk.ordinal()];
             if (pkValue == null) {
                 throw new StoreException("主键列 " + pk.name() + " 不能为 NULL");
             }
             byte[] key = KeyCodec.rowKey(table.id(), pk.type(), pkValue);
-            byte[] existing = view.get(key);
-            if (existing != null && !isTombstone(table, existing)) {
-                throw new StoreException("第 " + (k + 1) + " 组主键冲突(表 " + table.name()
-                        + ",主键 " + Values.display(pkValue) + ")", SqlError.ER_DUP_ENTRY);
+            if (!bulkImport) {
+                byte[] existing = view.get(key);
+                if (existing != null && !isTombstone(table, existing)) {
+                    throw new StoreException("第 " + (k + 1) + " 组主键冲突(表 " + table.name()
+                            + ",主键 " + Values.display(pkValue) + ")", SqlError.ER_DUP_ENTRY);
+                }
             }
             // 索引项与行记录进同一个写集(最终同一条批记录,FR-483 / K89)。
             stageInsertIndexes(table, indexes, values, pkValue, view, local);
@@ -986,6 +1221,15 @@ public final class Executor {
     }
 
     // ------------------------------------------------------------ SELECT
+
+    /** P5 查询(表达式 / 聚合 / JOIN / 子查询 / 排序)。 */
+    private Result selectQuery(Ast.SelectQuery query) {
+        QueryEngine.Options options = new QueryEngine.Options(currentDatabase,
+                queryBatchRows, sortSpillBytes, sortTmpDir, vectorized);
+        QueryEngine engine = new QueryEngine(kv, catalog, currentView(null), options,
+                message -> warnings.add(message));
+        return engine.execute(query.body());
+    }
 
     /** 无 FROM 的字面量投影(FR-560):一行,列名为字面量文本。 */
     private Result selectLiterals(Ast.SelectLiterals literals) {

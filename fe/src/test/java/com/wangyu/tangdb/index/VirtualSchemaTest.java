@@ -162,14 +162,17 @@ class VirtualSchemaTest {
     }
 
     @Test
-    void orderByAndCountOnUserTablesAreRejectedAsP5() {
-        for (String sql : List.of(
-                "SELECT * FROM t ORDER BY id",
-                "SELECT COUNT(*) FROM t")) {
-            SqlError e = assertThrows(SqlError.class, () -> engine.execute(session, sql), sql);
-            assertEquals(SqlError.ER_NOT_SUPPORTED_YET, e.code(), sql);
-            assertTrue(e.getMessage().contains("P5"), e.getMessage());
-        }
+    void orderByAndCountOnUserTablesWorkSinceP5() {
+        // SPEC-P5 §2.2 / §10 规约回填:用户表 ORDER BY 与 COUNT(*) 从本期起真支持。
+        Result.Table ordered = (Result.Table) engine.execute(session,
+                "SELECT id FROM t ORDER BY id DESC");
+        assertEquals(List.of(2, 1), List.of(
+                ((Number) ordered.rows().get(0)[0]).intValue(),
+                ((Number) ordered.rows().get(1)[0]).intValue()));
+
+        Result.Table count = (Result.Table) engine.execute(session,
+                "SELECT COUNT(*) AS c FROM t");
+        assertEquals(2L, count.rows().get(0)[0]);
     }
 
     @Test

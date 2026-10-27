@@ -8,7 +8,7 @@ import (
 
 // Iterator 是 segment 的有序迭代器。
 //
-// 它以 chunk 为单位按需读取(每次最多 chunkRows 行),不会把整个文件读进内存,
+// 以 chunk 为单位按需读取(每次最多 chunkRows 行),不会把整个文件读进内存,
 // 因此可以直接支撑流式 Scan。
 type Iterator struct {
 	r      *Reader
@@ -36,15 +36,23 @@ func (it *Iterator) First() {
 }
 
 // Seek 定位到第一个 key >= target 的位置。
+//
+// v2:对 Index Block 的 keyMax 二分(v1:对 ZoneMap 二分),块内再用 sort.Search 二分。
 func (it *Iterator) Seek(target []byte) {
 	if it.err != nil {
 		return
 	}
-	// 用 ZoneMap 的 keyMax 跳过整块不可能包含 target 的 chunk。
-	idx := sort.Search(len(it.r.zoneMap), func(i int) bool {
-		return bytes.Compare(it.r.zoneMap[i].keyMax, target) >= 0
+	keyMax := func(i int) []byte {
+		if it.r.format == formatV1 {
+			return it.r.zoneMap[i].keyMax
+		}
+		return it.r.index[i].keyMax
+	}
+	n := len(it.r.index)
+	idx := sort.Search(n, func(i int) bool {
+		return bytes.Compare(keyMax(i), target) >= 0
 	})
-	if idx >= len(it.r.zoneMap) {
+	if idx >= n {
 		it.valid = false
 		return
 	}
@@ -56,7 +64,6 @@ func (it *Iterator) Seek(target []byte) {
 		return bytes.Compare(it.keys[i], target) >= 0
 	})
 	if pos >= len(it.keys) {
-		// 理论上不会发生(keyMax >= target),保守地推进到下一块。
 		it.pos = len(it.keys)
 		it.advanceChunk()
 		return
@@ -100,7 +107,7 @@ func (it *Iterator) Next() {
 func (it *Iterator) Err() error { return it.err }
 
 func (it *Iterator) advanceChunk() {
-	if it.chunk+1 >= len(it.r.zoneMap) {
+	if it.chunk+1 >= len(it.r.index) {
 		it.valid = false
 		return
 	}
@@ -113,24 +120,37 @@ func (it *Iterator) advanceChunk() {
 }
 
 func (it *Iterator) loadChunk(idx int) error {
-	zone := it.r.zoneMap[idx]
 	entry := it.r.index[idx]
-
-	keyChunk, err := it.r.readColumnBlock(
-		it.r.footer.KeyColumnOffset+entry.keyOffset, it.r.keyChunkLen(idx))
+	keyChunk, err := it.r.readAt(it.r.footer.ChunkAreaOffset+entry.keyOffset, entry.keyLen, false)
 	if err != nil {
 		return err
 	}
-	valueChunk, err := it.r.readColumnBlock(
-		it.r.footer.ValueColumnOffset+entry.valueOffset, it.r.valueChunkLen(idx))
+	valueChunk, err := it.r.readAt(it.r.footer.ValueColumnOffset+entry.valueOffset, entry.valueLen, false)
 	if err != nil {
 		return err
 	}
 
-	keys := decodeBytesSeq(keyChunk)
-	values := decodeBytesSeq(valueChunk)
-	if len(keys) != int(zone.rowCount) || len(values) != int(zone.rowCount) {
-		return fmt.Errorf("segment: chunk %d row count mismatch", idx)
+	var keys, values [][]byte
+	if it.r.format == formatV2 {
+		keyInfo, decodedKeys, err := decodeColumnChunk(keyChunk, columnIDKey)
+		if err != nil {
+			return err
+		}
+		_, decodedValues, err := decodeColumnChunk(valueChunk, columnIDValue)
+		if err != nil {
+			return err
+		}
+		if keyInfo.Rows != entry.rowCount || len(decodedValues) != entry.rowCount {
+			return fmt.Errorf("segment: chunk %d 行数不一致(index %d)",
+				idx, entry.rowCount)
+		}
+		keys, values = decodedKeys, decodedValues
+	} else {
+		keys = decodeBytesSeq(keyChunk)
+		values = decodeBytesSeq(valueChunk)
+		if len(keys) != entry.rowCount || len(values) != entry.rowCount {
+			return fmt.Errorf("segment: chunk %d row count mismatch", idx)
+		}
 	}
 	it.chunk = idx
 	it.keys = keys

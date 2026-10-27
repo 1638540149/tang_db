@@ -13,6 +13,7 @@ package exec
 import (
 	"bytes"
 	"container/heap"
+	"sync"
 
 	"github.com/1638540149/tang_db/be/internal/memtable"
 	"github.com/1638540149/tang_db/be/internal/segment"
@@ -49,6 +50,9 @@ type Scanner struct {
 	key     []byte
 	value   []byte
 	err     error
+
+	releaseOnce sync.Once
+	release     func()
 }
 
 // NewScanner 创建扫描器。cursors 必须按"新 → 旧"排列,顺序决定同 key 的取舍。
@@ -61,6 +65,31 @@ func NewScanner(cursors []Cursor, start, end []byte, limit int) *Scanner {
 	}
 }
 
+// NewScannerWithRelease 创建一个扫描器:结束时(用完 / Close)调用一次 release。
+// store 用它实现 segment 引用计数,保证正在读的旧文件不会被 compaction 删除。
+func NewScannerWithRelease(cursors []Cursor, start, end []byte, limit int, release func()) *Scanner {
+	s := NewScanner(cursors, start, end, limit)
+	s.release = release
+	return s
+}
+
+// Close 释放扫描器持有的资源(可重复调用)。
+func (s *Scanner) Close() {
+	s.releaseOnce.Do(func() {
+		if s.release != nil {
+			s.release()
+		}
+	})
+	if !s.done {
+		s.done = true
+	}
+}
+
+func (s *Scanner) finish() {
+	s.done = true
+	s.Close()
+}
+
 // Next 前进到满足条件的下一条记录。返回 false 表示扫描结束或出错。
 func (s *Scanner) Next() bool {
 	if s.done {
@@ -70,12 +99,12 @@ func (s *Scanner) Next() bool {
 		s.started = true
 		if err := s.init(); err != nil {
 			s.err = err
-			s.done = true
+			s.finish()
 			return false
 		}
 	}
 	if s.limit > 0 && s.emitted >= s.limit {
-		s.done = true
+		s.finish()
 		return false
 	}
 
@@ -83,7 +112,7 @@ func (s *Scanner) Next() bool {
 		top := s.h[0]
 		key := top.c.Key()
 		if len(s.end) > 0 && bytes.Compare(key, s.end) >= 0 {
-			s.done = true
+			s.finish()
 			return false
 		}
 		s.key = key
@@ -95,7 +124,7 @@ func (s *Scanner) Next() bool {
 			item.c.Next()
 			if err := item.c.Err(); err != nil {
 				s.err = err
-				s.done = true
+				s.finish()
 				return false
 			}
 			if item.c.Valid() {
@@ -106,15 +135,15 @@ func (s *Scanner) Next() bool {
 		s.emitted++
 		if err := s.firstErr(); err != nil {
 			s.err = err
-			s.done = true
+			s.finish()
 			return false
 		}
 		if s.limit > 0 && s.emitted >= s.limit {
-			s.done = true
+			s.finish()
 		}
 		return true
 	}
-	s.done = true
+	s.finish()
 	return false
 }
 

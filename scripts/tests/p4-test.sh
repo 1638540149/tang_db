@@ -22,8 +22,8 @@
 #   SC-339 / SC-340 图形客户端(仅人工项,脚本只做环境探测,不伪造回显)
 #   SC-341 未支持语句降级(1235 / 1146 且连接不断)
 #   SC-342 分页三种写法一致(LIMIT n / off,n / n OFFSET off;越界空集;DML LIMIT 1235)
-#   SC-343 虚拟表多列排序(三列有序;用户表 ORDER BY 仍 1235)
-#   SC-344 COUNT(*) 别名(别名即列名;无别名仍 COUNT(*);用户表仍 1235)
+#   SC-343 虚拟表多列排序(三列有序;用户表 ORDER BY 自 P5 起已支持)
+#   SC-344 COUNT(*) 别名(别名即列名;无别名仍 COUNT(*);用户表自 P5 起已支持)
 #   SC-345 单包多语句(3 条合成一包不报错;字符串内分号不切;中途语法错只回该条、后续不执行)
 #   SC-346 SHOW PROCEDURE/FUNCTION/FUNC STATUS(11 列空集;LIKE/WHERE 无匹配仍空集,CODE=0)
 #   SC-347 客户端盘点剩余缺口(SELECT 1 字面量投影 / SHOW COUNT(*) WARNINGS|ERRORS /
@@ -859,10 +859,11 @@ OUT="$(mysql_code "SELECT * FROM information_schema.no_such_table")"
 expect "${OUT}" "CODE=1146" "未知虚拟表 → 1146"
 OUT="$(mysql_code "SELECT * FROM information_schema.TABLES JOIN information_schema.COLUMNS")"
 expect "${OUT}" "CODE=1235" "虚拟表 JOIN → 1235(不给半对结果)"
+# SPEC-P5 起用户表 COUNT(*) / ORDER BY 真支持,这里改为断言行为正确(不再 1235)。
 OUT="$(mysql_code "SELECT COUNT(*) FROM demo")"
-expect "${OUT}" "CODE=1235" "用户表上的 COUNT(*) 明确报不支持(归 P5)"
+expect "${OUT}" "CODE=0" "用户表 COUNT(*) 已支持(P5 兑现)"
 OUT="$(mysql_code "SELECT * FROM demo ORDER BY id")"
-expect "${OUT}" "CODE=1235" "用户表上的 ORDER BY 明确报不支持(归 P5)"
+expect "${OUT}" "CODE=0" "用户表 ORDER BY 已支持(P5 兑现)"
 OUT="$(mysql_code "ALTER TABLE demo ADD COLUMN x INT")"
 if printf '%s' "${OUT}" | grep -q "CODE=[1-9]"; then ok "ALTER TABLE 明确报错(未支持,不静默执行)"; else bad "ALTER TABLE 未被拒绝"; fi
 OUT="$(mysql_code "SHOW CREATE TABLE no_such_table")"
@@ -968,7 +969,7 @@ if [ "${ROWS}" = "4" ]; then ok "虚拟表分页 LIMIT 0,4 生效"; else bad "�
 NAVICAT_OUT="$(run_sql_text "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME FROM information_schema.COLUMNS ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION LIMIT 0,50; exit")"
 expect_absent "${NAVICAT_OUT}" "错误" "Navicat 式三列排序 + LIMIT 0,50 不再报错"
 expect "${NAVICAT_OUT}" "COLUMN_NAME" "Navicat 式三列排序返回正确列"
-expect "$(mysql_code "SELECT * FROM ord_a ORDER BY id, code")" "CODE=1235" "用户表多列 ORDER BY 仍报 1235(边界不破)"
+expect "$(mysql_code "SELECT * FROM ord_a ORDER BY id, code")" "CODE=0" "用户表多列 ORDER BY 已支持(P5 兑现)"
 
 # ================================================================ SC-344 COUNT(*) 别名
 
@@ -991,8 +992,8 @@ expect "${OUT}" "COLS=support_ndb" "不带 AS 时别名仍是结果列名"
 OUT="$(mysql_code "SELECT COUNT(*) FROM information_schema.ENGINES WHERE Engine = 'ndbcluster'")"
 expect "${OUT}" "COLS=COUNT(*)" "无别名时列名仍为 COUNT(*)"
 
-expect "$(mysql_code "SELECT COUNT(*) AS c FROM h_alias")" "CODE=1235" "用户表上的 COUNT(*) AS c 仍报 1235(H-5)"
-expect "$(mysql_code "SELECT COUNT(*) FROM h_alias")" "CODE=1235" "用户表上的 COUNT(*) 仍报 1235(H-5)"
+expect "$(mysql_code "SELECT COUNT(*) AS c FROM h_alias")" "CODE=0" "用户表 COUNT(*) AS c 已支持(P5 兑现)"
+expect "$(mysql_code "SELECT COUNT(*) FROM h_alias")" "CODE=0" "用户表 COUNT(*) 已支持(P5 兑现)"
 
 # ================================================================ SC-345 单包多语句
 

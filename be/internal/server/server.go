@@ -115,6 +115,7 @@ func (s *TangDbServer) Scan(req *pb.ScanRequest, stream pb.TangDb_ScanServer) er
 	}
 
 	sc := s.engine.NewMVCCScanner(req.StartKey, req.EndKey, req.Snapshot, limit)
+	defer sc.Close()
 	batch := make([]*pb.Kv, 0, batchRows)
 
 	send := func(status pb.StatusCode, message string) error {
@@ -162,7 +163,8 @@ func (s *TangDbServer) Scan(req *pb.ScanRequest, stream pb.TangDb_ScanServer) er
 //
 // 未提交的写集不在 BE:这里不做任何 I/O,只发号 + 读一次水位。
 func (s *TangDbServer) BeginTxn(ctx context.Context, req *pb.BeginTxnRequest) (*pb.BeginTxnResponse, error) {
-	snapshot := s.engine.MaxCommittedTS()
+	// G-3 / INV-7:登记活跃快照,compaction 的 GC 水位不会越过它。
+	snapshot := s.engine.BeginSnapshot()
 	txnID := s.nextTxnID.Add(1)
 	s.txnMu.Lock()
 	s.txns[txnID] = snapshot
@@ -229,8 +231,12 @@ func (s *TangDbServer) CommitTxn(ctx context.Context, req *pb.CommitTxnRequest) 
 
 	if req.TxnId != 0 {
 		s.txnMu.Lock()
+		snapshot, known := s.txns[req.TxnId]
 		delete(s.txns, req.TxnId)
 		s.txnMu.Unlock()
+		if known {
+			s.engine.ReleaseSnapshot(snapshot)
+		}
 	}
 	return &pb.CommitTxnResponse{
 		Status:   pb.StatusCode_OK,
@@ -243,8 +249,12 @@ func (s *TangDbServer) CommitTxn(ctx context.Context, req *pb.CommitTxnRequest) 
 func (s *TangDbServer) AbortTxn(ctx context.Context, req *pb.AbortTxnRequest) (*pb.AbortTxnResponse, error) {
 	if req.TxnId != 0 {
 		s.txnMu.Lock()
+		snapshot, known := s.txns[req.TxnId]
 		delete(s.txns, req.TxnId)
 		s.txnMu.Unlock()
+		if known {
+			s.engine.ReleaseSnapshot(snapshot)
+		}
 	}
 	return &pb.AbortTxnResponse{Status: pb.StatusCode_OK, Message: "OK"}, nil
 }

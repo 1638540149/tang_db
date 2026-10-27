@@ -33,6 +33,9 @@ var crashPoints = map[string]bool{
 	"after_fsync":    true,
 	"after_memtable": true,
 	"before_ok":      true,
+	// SPEC-P5 ★P5-2:compaction 中途强杀的两个注入点。
+	"compaction_after_write":    true,
+	"compaction_after_manifest": true,
 }
 
 // 心跳相关默认值(见 P2 规约 FR-160)。
@@ -40,6 +43,17 @@ const (
 	DefaultFeHost                   = "127.0.0.1"
 	DefaultFePort                   = 9091
 	DefaultHeartbeatIntervalSeconds = 3
+)
+
+// P5 compaction 与列式编码默认值(SPEC-P5 §5.4)。
+const (
+	DefaultQueryBatchRows        = 1024
+	DefaultCompactionL0Files     = 4
+	DefaultCompactionLevelRatio  = 10
+	DefaultCompactionLevelMax    = 256 * 1024 * 1024
+	DefaultCompactionBloom       = true
+	DefaultSortSpillBytes  int64 = 64 * 1024 * 1024
+	DefaultCSVImportBatchRows    = 5000
 )
 
 // Config 是 BE 的启动配置。
@@ -56,6 +70,15 @@ type Config struct {
 	TestCrashPoint string
 	// MaxTxnWriteBytes 单事务写入量上限(默认 64MB)。
 	MaxTxnWriteBytes int64
+
+	// ---- P5(§5.4)----
+	QueryBatchRows          int   // 向量化批行数
+	CompactionL0Files       int   // L0 触发合并的文件数
+	CompactionLevelRatio    int   // 层容量比
+	CompactionLevelMaxBytes int64 // 单层容量上限
+	CompactionBloomEnabled  bool  // chunk 级布隆过滤
+	SortSpillBytes          int64 // 排序溢写阈值
+	CSVImportBatchRows      int   // CSV 导入批大小
 }
 
 // Default 返回内置默认配置。
@@ -69,6 +92,13 @@ func Default() Config {
 		HeartbeatIntervalSeconds: DefaultHeartbeatIntervalSeconds,
 		TestCrashPoint:           "",
 		MaxTxnWriteBytes:         DefaultMaxTxnWriteBytes,
+		QueryBatchRows:           DefaultQueryBatchRows,
+		CompactionL0Files:        DefaultCompactionL0Files,
+		CompactionLevelRatio:     DefaultCompactionLevelRatio,
+		CompactionLevelMaxBytes:  DefaultCompactionLevelMax,
+		CompactionBloomEnabled:   DefaultCompactionBloom,
+		SortSpillBytes:           DefaultSortSpillBytes,
+		CSVImportBatchRows:       DefaultCSVImportBatchRows,
 	}
 }
 
@@ -156,6 +186,48 @@ func Parse(r io.Reader) (Config, error) {
 				return Config{}, fmt.Errorf("第 %d 行 max_txn_write_bytes 无效:%v", lineNo, err)
 			}
 			cfg.MaxTxnWriteBytes = size
+		case "query_batch_rows":
+			n, err := strconv.Atoi(value)
+			if err != nil || n < 1 || n > 1_000_000 {
+				return Config{}, fmt.Errorf("第 %d 行 query_batch_rows 无效:%q(应为 1-1000000)", lineNo, value)
+			}
+			cfg.QueryBatchRows = n
+		case "compaction_l0_files":
+			n, err := strconv.Atoi(value)
+			if err != nil || n < 2 || n > 1000 {
+				return Config{}, fmt.Errorf("第 %d 行 compaction_l0_files 无效:%q(应为 2-1000)", lineNo, value)
+			}
+			cfg.CompactionL0Files = n
+		case "compaction_level_ratio":
+			n, err := strconv.Atoi(value)
+			if err != nil || n < 2 || n > 1000 {
+				return Config{}, fmt.Errorf("第 %d 行 compaction_level_ratio 无效:%q(应为 2-1000)", lineNo, value)
+			}
+			cfg.CompactionLevelRatio = n
+		case "compaction_level_max_bytes":
+			size, err := ParseSize(value)
+			if err != nil {
+				return Config{}, fmt.Errorf("第 %d 行 compaction_level_max_bytes 无效:%v", lineNo, err)
+			}
+			cfg.CompactionLevelMaxBytes = size
+		case "compaction_bloom_enabled":
+			b, err := strconv.ParseBool(value)
+			if err != nil {
+				return Config{}, fmt.Errorf("第 %d 行 compaction_bloom_enabled 无效:%q(应为 true/false)", lineNo, value)
+			}
+			cfg.CompactionBloomEnabled = b
+		case "sort_spill_bytes":
+			size, err := ParseSize(value)
+			if err != nil {
+				return Config{}, fmt.Errorf("第 %d 行 sort_spill_bytes 无效:%v", lineNo, err)
+			}
+			cfg.SortSpillBytes = size
+		case "csv_import_batch_rows":
+			n, err := strconv.Atoi(value)
+			if err != nil || n < 1 || n > 10_000_000 {
+				return Config{}, fmt.Errorf("第 %d 行 csv_import_batch_rows 无效:%q(应为 1-10000000)", lineNo, value)
+			}
+			cfg.CSVImportBatchRows = n
 		default:
 			return Config{}, fmt.Errorf("第 %d 行未知配置项:%q", lineNo, key)
 		}

@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# tang_db CSV 批量导入(SPEC-P5 H 组 / FR-605 ~ FR-608 / FR-614 / I26)
+#
+# 独立命令,不塞进常驻服务进程;写入走与普通 DML 相同的通道:
+#   Executor → 一条批记录 → WAL 追加 → fsync → memtable → 才返回成功
+#
+# 用法:
+#   scripts/tools/csv-import --table orders --file /path/to/orders.csv [--db default] [--batch 5000]
+#
+# 断点续传:进度写进 sys_import_state,重跑同一命令从断点继续;重复行按主键去重(K110)。
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+FE_DIR="${ROOT_DIR}/fe"
+CALLER_DIR="$(pwd)"
+
+# 相对路径按“调用者当前目录”解释(脚本内部要 cd 到 fe 编译)。
+ARGS=()
+while [ $# -gt 0 ]; do
+    if { [ "$1" = "--file" ] || [ "$1" = "--config" ]; } && [ $# -ge 2 ]; then
+        flag="$1"
+        f="$2"
+        case "$f" in
+            /*|[A-Za-z]:[\/]*) ;;
+            *) f="${CALLER_DIR}/${f}" ;;
+        esac
+        ARGS+=("$flag" "$(cygpath -w "${f}")")
+        shift 2
+        continue
+    fi
+    ARGS+=("$1")
+    shift
+done
+
+cd "${FE_DIR}"
+mvn.cmd -q test-compile >/dev/null
+
+CP_FILE="${FE_DIR}/target/fe-runtime-cp.txt"
+if [ ! -s "${CP_FILE}" ]; then
+    mvn.cmd -q dependency:build-classpath -Dmdep.outputFile="$(cygpath -w "${CP_FILE}")" -DincludeScope=runtime >/dev/null
+fi
+
+SEP=";"
+case "$(uname -s)" in
+    Linux*|Darwin*) SEP=":" ;;
+esac
+
+CLASSES_WIN="$(cygpath -w "${FE_DIR}/target/classes")"
+exec java -Dfile.encoding=UTF-8 -Dsun.stdout.encoding=UTF-8 \
+    -cp "${CLASSES_WIN}${SEP}$(cat "${CP_FILE}")" \
+    com.wangyu.tangdb.tools.CsvImport "${ARGS[@]}"

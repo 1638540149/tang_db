@@ -72,6 +72,17 @@ public final class Values {
                     }
                 }
                 throw typeMismatch(column);
+            case JSON: {
+                // JSON 列写入:接受 JSON 文本或已编码字节;非法文档明确报错(边界 61)。
+                if (literal instanceof byte[] raw) {
+                    return raw;
+                }
+                if (!(literal instanceof String s)) {
+                    throw typeMismatch(column);
+                }
+                return com.wangyu.tangdb.query.JsonCodec.encode(
+                        com.wangyu.tangdb.query.JsonCodec.parseText(s));
+            }
             default:
                 throw typeMismatch(column);
         }
@@ -193,6 +204,8 @@ public final class Values {
                     return;
                 }
                 throw typeMismatch(column);
+            case JSON:
+                return; // JSON 只允许通过 json_extract 使用;直接比较不参与路径选择
             default:
                 throw typeMismatch(column);
         }
@@ -241,6 +254,8 @@ public final class Values {
                     throw typeMismatch(column);
                 }
                 return Boolean.compare((Boolean) columnValue, b);
+            case JSON:
+                throw typeMismatch(column);
             default:
                 throw typeMismatch(column);
         }
@@ -294,6 +309,10 @@ public final class Values {
         }
         if (value instanceof Boolean b) {
             return b ? "true" : "false";
+        }
+        if (value instanceof byte[] raw) {
+            return com.wangyu.tangdb.query.JsonCodec.toText(
+                    com.wangyu.tangdb.query.JsonCodec.decode(raw));
         }
         return value.toString();
     }

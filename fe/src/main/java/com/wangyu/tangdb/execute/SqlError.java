@@ -37,6 +37,14 @@ public final class SqlError extends RuntimeException {
     public static final int ER_NO_SUCH_THREAD = 1094;      // KILL 的会话 id 不存在(SPEC-P4 FR-541)
     public static final int ER_QUERY_INTERRUPTED = 1317;   // 会话已被 KILL
 
+    // SPEC-P5 查询语义补充码(与 MySQL 同名同号)。
+    public static final int ER_NON_UNIQ_ERROR = 1052;         // 列名不明确
+    public static final int ER_WRONG_FIELD_WITH_GROUP = 1055; // 非分组非聚合列(FR-586)
+    public static final int ER_MIX_OF_GROUP_FUNC_AND_FIELDS = 1140; // 聚合与普通列混用
+    public static final int ER_WRONG_ARGUMENTS = 1210;        // 函数参数 / 类型不可比较
+    public static final int ER_SUBQUERY_NO_1_ROW = 1242;      // 标量子查询返回多行(K108)
+    public static final int ER_WRONG_VALUE_COUNT_ON_ROW = 1136; // 列数不符
+
     private final int code;
     private final String sqlState;
 
@@ -97,6 +105,12 @@ public final class SqlError extends RuntimeException {
             case ER_CANT_DROP_FIELD_OR_KEY -> "42000";
             case ER_NO_SUCH_THREAD -> "HY000";
             case ER_QUERY_INTERRUPTED -> "70100";
+            case ER_NON_UNIQ_ERROR -> "23000";
+            case ER_WRONG_FIELD_WITH_GROUP -> "42000";
+            case ER_MIX_OF_GROUP_FUNC_AND_FIELDS -> "42000";
+            case ER_WRONG_ARGUMENTS -> "HY000";
+            case ER_SUBQUERY_NO_1_ROW -> "21000";
+            case ER_WRONG_VALUE_COUNT_ON_ROW -> "21S01";
             default -> "HY000";
         };
     }

@@ -44,6 +44,9 @@ public final class SqlEngine {
     private final boolean heartbeatEnabled;
     private final String user;
     private final int indexBackfillBatch;
+    private final int queryBatchRows;
+    private final long sortSpillBytes;
+    private final String sortTmpDir;
 
     public SqlEngine(KvStore kv, Catalog catalog, SessionManager sessions,
                      BackendRegistry backends, boolean heartbeatEnabled, String user) {
@@ -60,6 +63,27 @@ public final class SqlEngine {
         this.heartbeatEnabled = heartbeatEnabled;
         this.user = user == null ? "" : user;
         this.indexBackfillBatch = indexBackfillBatch > 0 ? indexBackfillBatch : 1000;
+        this.queryBatchRows = 1024;
+        this.sortSpillBytes = 64L * 1024 * 1024;
+        this.sortTmpDir = "tmp/fe-sort";
+    }
+
+    /** SPEC-P5 §5.4:查询引擎参数(query_batch_rows / sort_spill_bytes / sort_tmp_dir)。 */
+    public SqlEngine(KvStore kv, Catalog catalog, SessionManager sessions,
+                     BackendRegistry backends, boolean heartbeatEnabled, String user,
+                     int indexBackfillBatch, int queryBatchRows, long sortSpillBytes,
+                     String sortTmpDir) {
+        this.kv = kv;
+        this.catalog = catalog;
+        this.sessions = sessions;
+        this.backends = backends;
+        this.heartbeatEnabled = heartbeatEnabled;
+        this.user = user == null ? "" : user;
+        this.indexBackfillBatch = indexBackfillBatch > 0 ? indexBackfillBatch : 1000;
+        this.queryBatchRows = queryBatchRows > 0 ? queryBatchRows : 1024;
+        this.sortSpillBytes = sortSpillBytes > 0 ? sortSpillBytes : 64L * 1024 * 1024;
+        this.sortTmpDir = sortTmpDir == null || sortTmpDir.isBlank()
+                ? "tmp/fe-sort" : sortTmpDir;
     }
 
     /**
@@ -115,6 +139,11 @@ public final class SqlEngine {
         try {
             return executor.execute(Parser.parse(statement));
         } catch (ParseException e) {
+            String parseMessage = e.getMessage() == null ? "" : e.getMessage();
+            if (parseMessage.contains("归 P6") || parseMessage.contains("归 P12")
+                    || parseMessage.contains("相关子查询")) {
+                throw new SqlError(SqlError.ER_NOT_SUPPORTED_YET, "42000", parseMessage);
+            }
             if (upper.startsWith("SHOW ")) {
                 throw new SqlError(SqlError.ER_NOT_SUPPORTED_YET, "42000",
                         "不支持的 SHOW 语句:" + e.getMessage());
@@ -226,9 +255,13 @@ public final class SqlEngine {
 
     private Executor executor(Session session) {
         if (session == null) {
-            return new Executor(kv, catalog).attachServer(sessions, user, 0, indexBackfillBatch);
+            return new Executor(kv, catalog)
+                    .withQueryOptions(queryBatchRows, sortSpillBytes, sortTmpDir)
+                    .attachServer(sessions, user, 0, indexBackfillBatch);
         }
-        return session.executor().attachServer(sessions, user, session.id(), indexBackfillBatch);
+        return session.executor()
+                .withQueryOptions(queryBatchRows, sortSpillBytes, sortTmpDir)
+                .attachServer(sessions, user, session.id(), indexBackfillBatch);
     }
 
     // ------------------------------------------------------------ 连接期兼容语句(§5.5)

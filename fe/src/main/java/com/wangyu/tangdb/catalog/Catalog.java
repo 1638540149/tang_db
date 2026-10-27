@@ -489,7 +489,10 @@ public final class Catalog {
             }
             if (!IndexCodec.indexable(column.type())) {
                 throw new CatalogException("列 " + column.name() + " 的类型 " + column.typeName()
-                        + " 不支持索引(只允许 INT / BIGINT / VARCHAR / DATE / BOOLEAN)");
+                        + (column.type() == DataType.JSON
+                        ? " 不支持索引(JSON 列不建任何索引,FR-611)"
+                        : " 不支持索引(只允许 INT / BIGINT / VARCHAR / DATE / BOOLEAN)"),
+                        column.type() == DataType.JSON ? SqlError.ER_NOT_SUPPORTED_YET : 0);
             }
 
             String name = (rawName == null || rawName.isBlank())
@@ -776,6 +779,8 @@ public final class Catalog {
         ensureTable(SystemTables.COUNTERS);
         // P4 FR-474:老目录(没有 sys_indexes)在这里被**幂等补齐**,format_version 不变。
         ensureTable(SystemTables.INDEXES);
+        // SPEC-P5 FR-614:导入任务状态表同样幂等补齐。
+        ensureTable(SystemTables.IMPORT_STATE);
         if (kv.get(SystemTables.counterKey(SystemTables.COUNTER_NEXT_TABLE_ID)) == null) {
             kv.put(SystemTables.counterKey(SystemTables.COUNTER_NEXT_TABLE_ID),
                     SystemTables.encodeCounterRow(SystemTables.COUNTER_NEXT_TABLE_ID,
@@ -1159,8 +1164,12 @@ public final class Catalog {
             if (c.primaryKey()) {
                 pkCount++;
                 if (!c.type().canBePrimaryKey()) {
+                    int code = c.type() == DataType.JSON
+                            ? SqlError.ER_NOT_SUPPORTED_YET : 0;
                     throw new CatalogException("主键类型不支持: " + c.typeName()
-                            + "(只允许 INT / BIGINT / VARCHAR / DATE)");
+                            + (c.type() == DataType.JSON
+                            ? "(JSON 列不得做主键,FR-611)"
+                            : "(只允许 INT / BIGINT / VARCHAR / DATE)"), code);
                 }
             }
             normalized.add(new Column(c.name(), c.type(), c.length(), !c.primaryKey(),

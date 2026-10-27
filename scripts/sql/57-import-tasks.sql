@@ -1,0 +1,2 @@
+-- SPEC-P5 H 组:导入任务元数据(FR-614)
+SHOW IMPORT TASKS;

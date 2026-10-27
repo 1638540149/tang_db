@@ -19,10 +19,10 @@ public final class Ast {
     /** 一条语句。 */
     public sealed interface Statement permits CreateTable, DropTable, TruncateTable,
             ShowTables, ShowDatabases, ShowIndexes, ShowIndexDetails, ShowSimple, ShowTableStatus,
-            ShowCreateTable, ShowCreateDatabase, ShowColumns, Describe,
+            ShowSegments, ShowCreateTable, ShowCreateDatabase, ShowColumns, Describe,
             Insert, Update, Delete, Select, SelectLiterals, Explain, Kill,
             Begin, Commit, Rollback, CreateDatabase, DropDatabase, Use,
-            CreateIndex, DropIndex {
+            CreateIndex, DropIndex, SelectQuery, ShowImportTasks {
     }
 
     // ------------------------------------------------------------ P3.5:库
@@ -137,6 +137,14 @@ public final class Ast {
 
     /** SHOW TABLE STATUS [FROM db] [LIKE pat]。 */
     public record ShowTableStatus(String database, String like) implements Statement {
+    }
+
+    /** SHOW IMPORT TASKS:CSV 导入任务列表(FR-614;常驻任务归 P9)。 */
+    public record ShowImportTasks() implements Statement {
+    }
+
+    /** SHOW SEGMENTS [FROM <tbl>]:自有诊断语句(FR-566),给出列式压缩真实统计。 */
+    public record ShowSegments(String database, String table) implements Statement {
     }
 
     /** SHOW CREATE TABLE <t>:输出可 round-trip 的 DDL(K96)。 */
@@ -268,4 +276,122 @@ public final class Ast {
 
     public record Or(Condition left, Condition right) implements Condition {
     }
+
+    // ============================================================ SPEC-P5:表达式与查询
+
+    /**
+     * P5 表达式(SPEC-P5 FR-593 ~ FR-598 / FR-609 ~ FR-613)。
+     *
+     * <p>老的 {@link Condition} 只覆盖"列 op 常量"这一窄子集,继续服务 P2~P4 路径;
+     * P5 的复杂查询(表达式 / 函数 / 聚合 / JOIN / 子查询)走这棵新的表达式树。</p>
+     */
+    public sealed interface Expr permits Lit, Col, Arith, Neg, Not, Cmp, LogicalAnd, LogicalOr,
+            IsNull, Like, Between, InExpr, InSubquery, ScalarSubquery, Func, Case, Cast {
+    }
+
+    /** 字面量;text 保留原文用于表达式投影的列名(K107)。 */
+    public record Lit(Object value, String text) implements Expr {
+    }
+
+    /** 列引用:qualifier 为表别名 / 表名,null 表示未限定。 */
+    public record Col(String qualifier, String name) implements Expr {
+    }
+
+    public enum ArithOp {
+        ADD("+"), SUB("-"), MUL("*"), DIV("/"), MOD("%");
+
+        private final String text;
+
+        ArithOp(String text) {
+            this.text = text;
+        }
+
+        public String text() {
+            return text;
+        }
+    }
+
+    public record Arith(ArithOp op, Expr left, Expr right) implements Expr {
+    }
+
+    public record Neg(Expr operand) implements Expr {
+    }
+
+    public record Not(Expr operand) implements Expr {
+    }
+
+    public record Cmp(Op op, Expr left, Expr right) implements Expr {
+    }
+
+    public record LogicalAnd(Expr left, Expr right) implements Expr {
+    }
+
+    public record LogicalOr(Expr left, Expr right) implements Expr {
+    }
+
+    public record IsNull(Expr operand, boolean negated) implements Expr {
+    }
+
+    /** LIKE 模式;escape 为转义字符(默认反斜杠,ESCAPE '' 表示不转义)。 */
+    public record Like(Expr operand, Expr pattern, String escape) implements Expr {
+    }
+
+    public record Between(Expr operand, Expr lower, Expr upper, boolean negated) implements Expr {
+    }
+
+    public record InExpr(Expr operand, List<Expr> values, boolean negated) implements Expr {
+    }
+
+    public record InSubquery(Expr operand, QueryBody query, boolean negated) implements Expr {
+    }
+
+    public record ScalarSubquery(QueryBody query) implements Expr {
+    }
+
+    /** 函数 / 聚合:name 统一大写;star 仅 COUNT(*) 使用。 */
+    public record Func(String name, List<Expr> args, boolean distinct, boolean star) implements Expr {
+    }
+
+    public record Case(Expr base, List<When> whens, Expr otherwise) implements Expr {
+    }
+
+    public record When(Expr condition, Expr result) {
+    }
+
+    public record Cast(Expr operand, DataType type) implements Expr {
+    }
+
+    // ------------------------------------------------------------ SELECT(完整形态)
+
+    /** 投影项:star = true 时 expr 为 null;starQualifier 非空表示 {@code t.*}。 */
+    public record SelectItem(Expr expr, String alias, boolean star, String starQualifier) {
+    }
+
+    public enum JoinType {
+        INNER, LEFT, CROSS
+    }
+
+    /** FROM 里的一个表或子查询;alias 为本查询内使用的名字。 */
+    public record FromItem(String database, String table, String alias, QueryBody subquery) {
+    }
+
+    public record Join(JoinType type, FromItem right, Expr on) {
+    }
+
+    public record FromClause(FromItem first, List<Join> joins) {
+    }
+
+    public record OrderItem(Expr expr, boolean descending) {
+    }
+
+    /** 一条完整查询(不含 EXPLAIN 外壳)。 */
+    public record QueryBody(List<SelectItem> items, FromClause from, Expr where,
+                            List<Expr> groupBy, Expr having, List<OrderItem> orderBy,
+                            Integer limit, Integer offset) {
+    }
+
+    /** P5 的 SELECT 语句;执行入口与老 {@link Select} 分开,但共用同一套语义。 */
+    public record SelectQuery(QueryBody body) implements Statement {
+    }
+
 }

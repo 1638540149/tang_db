@@ -9,7 +9,9 @@ public enum DataType {
     DOUBLE(3, "DOUBLE"),
     VARCHAR(4, "VARCHAR"),
     DATE(5, "DATE"),
-    BOOLEAN(6, "BOOLEAN");
+    BOOLEAN(6, "BOOLEAN"),
+    /** P5:BSON 式二进制 JSON(FR-609);不能做主键 / 索引(FR-611)。 */
+    JSON(7, "JSON");
 
     private final int code;
     private final String sqlName;

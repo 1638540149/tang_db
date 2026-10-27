@@ -250,17 +250,20 @@ class SqlEngineTest {
     }
 
     @Test
-    void countStarOnUserTableStillRejectedWith1235() {
+    void countStarOnUserTableWorksSinceP5() {
+        // SPEC-P5 §2.2 / §10 规约回填:用户表 COUNT(*) 从本期起真支持(不再是 1235)。
         engine.execute(session, "CREATE TABLE cnt (id INT PRIMARY KEY)");
         engine.execute(session, "INSERT INTO cnt (id) VALUES (1)");
 
-        SqlError withAlias = assertThrows(SqlError.class, () -> engine.execute(session,
-                "SELECT COUNT(*) AS c FROM cnt"));
-        assertEquals(SqlError.ER_NOT_SUPPORTED_YET, withAlias.code());
+        Result.Table withAlias = (Result.Table) engine.execute(session,
+                "SELECT COUNT(*) AS c FROM cnt");
+        assertEquals(List.of("c"), withAlias.columns());
+        assertEquals(1L, withAlias.rows().get(0)[0]);
 
-        SqlError withoutAlias = assertThrows(SqlError.class, () -> engine.execute(session,
-                "SELECT COUNT(*) FROM cnt"));
-        assertEquals(SqlError.ER_NOT_SUPPORTED_YET, withoutAlias.code());
+        Result.Table withoutAlias = (Result.Table) engine.execute(session,
+                "SELECT COUNT(*) FROM cnt");
+        assertEquals(List.of("COUNT(*)"), withoutAlias.columns());
+        assertEquals(1L, withoutAlias.rows().get(0)[0]);
     }
 
     // ------------------------------------------------------------ P4 H 组:单包多语句(FR-556 ~ FR-558)

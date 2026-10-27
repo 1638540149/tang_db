@@ -71,6 +71,7 @@ func (e *Engine) getSnapshot(userKey []byte, snapshot uint64) ([]byte, bool, err
 		found   bool
 	)
 	sc := e.newScanner(userKey, prefixUpperBound(userKey), 0)
+	defer sc.Close()
 	for sc.Next() {
 		uk, ts, err := SplitVersion(sc.Key())
 		if err != nil {
@@ -100,6 +101,7 @@ func (e *Engine) latestVersionTS(userKey []byte) (uint64, bool, error) {
 		found  bool
 	)
 	sc := e.newScanner(userKey, prefixUpperBound(userKey), 0)
+	defer sc.Close()
 	for sc.Next() {
 		uk, ts, err := SplitVersion(sc.Key())
 		if err != nil {
@@ -178,6 +180,13 @@ func (e *Engine) NewMVCCScanner(start, end []byte, snapshot uint64, limit int) *
 	return newMVCCScanner(e.newScanner(start, nil, 0), end, snapshot, limit)
 }
 
+// Close 释放底层扫描器持有的 segment 引用(可重复调用)。
+func (s *MVCCScanner) Close() {
+	if s.sc != nil {
+		s.sc.Close()
+	}
+}
+
 // Next 前进到下一个对快照可见的用户键。返回 false 表示结束或出错。
 func (s *MVCCScanner) Next() bool {
 	if s.done {
@@ -185,6 +194,7 @@ func (s *MVCCScanner) Next() bool {
 	}
 	if s.limit > 0 && s.emitted >= s.limit {
 		s.done = true
+		s.Close()
 		return false
 	}
 
@@ -207,6 +217,7 @@ func (s *MVCCScanner) Next() bool {
 					return true
 				}
 				s.done = true
+				s.Close()
 				return false
 			}
 			fullKey, value = s.sc.Key(), s.sc.Value()
@@ -220,11 +231,12 @@ func (s *MVCCScanner) Next() bool {
 		}
 
 		if len(s.end) > 0 && bytes.Compare(userKey, s.end) >= 0 {
-			s.done = true
 			if groupKey != nil && visible {
 				s.emit(groupKey, chosen)
 				return true
 			}
+			s.done = true
+			s.Close()
 			return false
 		}
 

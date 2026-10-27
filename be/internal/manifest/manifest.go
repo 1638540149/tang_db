@@ -33,9 +33,12 @@ type Manifest struct {
 	Version       uint64   `json:"version"`
 	FormatVersion uint64   `json:"format_version"` // P3 起固定为 2
 	LastCommitTS  uint64   `json:"last_commit_ts"` // 已落盘数据中的最大 commit_ts
-	Segments      []uint64 `json:"segments"`       // 有效 segment 编号(按创建顺序,旧到新)
-	NextSegment   uint64   `json:"next_segment"`   // 下一个 segment 编号
-	NextWAL       uint64   `json:"next_wal"`       // 下一个 WAL 编号
+	Segments      []uint64 `json:"segments"`       // 有效 segment 编号(按创建顺序,旧到新;与 Levels 的并集保持一致)
+	// Levels 是 leveled compaction 的分层视图(SPEC-P5 FR-599):Levels[0]=L0(可重叠),
+	// Levels[1+] 层内 key 范围不重叠。老 MANIFEST 没有该字段时,启动时把所有 segment 视为 L0。
+	Levels      [][]uint64 `json:"levels,omitempty"`
+	NextSegment uint64     `json:"next_segment"` // 下一个 segment 编号
+	NextWAL     uint64     `json:"next_wal"`     // 下一个 WAL 编号
 }
 
 // Registry 管理 CURRENT 与 MANIFEST 文件的原子更新。

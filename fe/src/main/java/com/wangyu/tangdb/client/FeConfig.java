@@ -40,6 +40,13 @@ public final class FeConfig {
     /** 建索引回填批量(SPEC-P4 K84)。 */
     public static final int DEFAULT_INDEX_BACKFILL_BATCH = 1000;
 
+    // ---- SPEC-P5 §5.4 ----
+    public static final int DEFAULT_QUERY_BATCH_ROWS = 1024;
+    public static final long DEFAULT_SORT_SPILL_BYTES = 64L * 1024 * 1024;
+    public static final int DEFAULT_CSV_IMPORT_BATCH_ROWS = 5000;
+    /** FE 自己的排序临时目录(放在 BE 数据目录下会穿透 FE/BE 边界,故放在 FE 侧)。 */
+    public static final String DEFAULT_SORT_TMP_DIR = "tmp/fe-sort";
+
     private final String beHost;
     private final int bePort;
     private final int heartbeatListenPort;
@@ -53,11 +60,16 @@ public final class FeConfig {
     private final String user;
     private final String password;
     private final int indexBackfillBatch;
+    private final int queryBatchRows;
+    private final long sortSpillBytes;
+    private final String sortTmpDir;
+    private final int csvImportBatchRows;
 
     private FeConfig(String beHost, int bePort, int heartbeatListenPort, int beOfflineCycles,
                      boolean heartbeatEnabled, String mode, int mysqlPort, int sessionMax,
                      int sessionIdleTimeout, int shutdownGraceSeconds, String user, String password,
-                     int indexBackfillBatch) {
+                     int indexBackfillBatch, int queryBatchRows, long sortSpillBytes,
+                     String sortTmpDir, int csvImportBatchRows) {
         this.beHost = beHost;
         this.bePort = bePort;
         this.heartbeatListenPort = heartbeatListenPort;
@@ -71,6 +83,10 @@ public final class FeConfig {
         this.user = user;
         this.password = password;
         this.indexBackfillBatch = indexBackfillBatch;
+        this.queryBatchRows = queryBatchRows;
+        this.sortSpillBytes = sortSpillBytes;
+        this.sortTmpDir = sortTmpDir;
+        this.csvImportBatchRows = csvImportBatchRows;
     }
 
     /** 内置默认配置。 */
@@ -79,7 +95,8 @@ public final class FeConfig {
                 DEFAULT_HEARTBEAT_LISTEN_PORT, DEFAULT_BE_OFFLINE_CYCLES, true,
                 "fed", DEFAULT_MYSQL_PORT, DEFAULT_SESSION_MAX, DEFAULT_SESSION_IDLE_TIMEOUT,
                 DEFAULT_SHUTDOWN_GRACE_SECONDS, DEFAULT_USER, DEFAULT_PASSWORD,
-                DEFAULT_INDEX_BACKFILL_BATCH);
+                DEFAULT_INDEX_BACKFILL_BATCH, DEFAULT_QUERY_BATCH_ROWS, DEFAULT_SORT_SPILL_BYTES,
+                DEFAULT_SORT_TMP_DIR, DEFAULT_CSV_IMPORT_BATCH_ROWS);
     }
 
     /** 直接用给定取值构造配置(供程序化使用与测试)。 */
@@ -100,7 +117,8 @@ public final class FeConfig {
                 validatePort(heartbeatListenPort, "heartbeat_listen_port"),
                 Math.max(1, beOfflineCycles), heartbeatEnabled,
                 d.mode, d.mysqlPort, d.sessionMax, d.sessionIdleTimeout, d.shutdownGraceSeconds,
-                d.user, d.password, d.indexBackfillBatch);
+                d.user, d.password, d.indexBackfillBatch, d.queryBatchRows, d.sortSpillBytes,
+                d.sortTmpDir, d.csvImportBatchRows);
     }
 
     public String beHost() {
@@ -166,6 +184,26 @@ public final class FeConfig {
         return indexBackfillBatch;
     }
 
+    /** 向量化批行数(SPEC-P5 §5.4 / FR-571)。 */
+    public int queryBatchRows() {
+        return queryBatchRows;
+    }
+
+    /** 排序溢写阈值(SPEC-P5 §5.4 / FR-580)。 */
+    public long sortSpillBytes() {
+        return sortSpillBytes;
+    }
+
+    /** FE 排序临时目录(K114,K114 的 BE 路径会穿透边界)。 */
+    public String sortTmpDir() {
+        return sortTmpDir;
+    }
+
+    /** CSV 导入批大小(SPEC-P5 §5.4 / FR-607)。 */
+    public int csvImportBatchRows() {
+        return csvImportBatchRows;
+    }
+
     /**
      * 加载配置文件。
      *
@@ -208,6 +246,10 @@ public final class FeConfig {
         String user = d.user;
         String password = d.password;
         int indexBackfillBatch = d.indexBackfillBatch;
+        int queryBatchRows = d.queryBatchRows;
+        long sortSpillBytes = d.sortSpillBytes;
+        String sortTmpDir = d.sortTmpDir;
+        int csvImportBatchRows = d.csvImportBatchRows;
 
         for (int i = 0; i < lines.size(); i++) {
             String line = lines.get(i);
@@ -249,6 +291,12 @@ public final class FeConfig {
                 case "password" -> password = value;
                 case "index_backfill_batch" ->
                         indexBackfillBatch = parseInt(key, value, path, i + 1, 1, 1_000_000);
+                case "query_batch_rows" ->
+                        queryBatchRows = parseInt(key, value, path, i + 1, 1, 1_000_000);
+                case "sort_spill_bytes" -> sortSpillBytes = parseSize(key, value, path, i + 1);
+                case "sort_tmp_dir" -> sortTmpDir = requireNonBlank(value, path, i + 1);
+                case "csv_import_batch_rows" ->
+                        csvImportBatchRows = parseInt(key, value, path, i + 1, 1, 10_000_000);
                 default -> throw new IllegalArgumentException(
                         path + " 第 " + (i + 1) + " 行未知配置项: " + key);
             }
@@ -256,7 +304,7 @@ public final class FeConfig {
 
         return new FeConfig(host, port, heartbeatPort, offlineCycles, heartbeatEnabled,
                 mode, mysqlPort, sessionMax, sessionIdleTimeout, shutdownGraceSeconds, user, password,
-                indexBackfillBatch);
+                indexBackfillBatch, queryBatchRows, sortSpillBytes, sortTmpDir, csvImportBatchRows);
     }
 
     private static String parseMode(String raw, String path, int lineNo) {
@@ -266,6 +314,34 @@ public final class FeConfig {
         }
         throw new IllegalArgumentException(path + " 第 " + lineNo + " 行 mode 无效: " + raw
                 + "(应为 fed / cli)");
+    }
+
+    /** 解析 64MB / 1KB / 1024 这类容量。 */
+    private static long parseSize(String key, String raw, String path, int lineNo) {
+        String v = raw.trim().toUpperCase(java.util.Locale.ROOT);
+        long unit = 1;
+        if (v.endsWith("MB")) {
+            unit = 1024L * 1024;
+            v = v.substring(0, v.length() - 2);
+        } else if (v.endsWith("KB")) {
+            unit = 1024;
+            v = v.substring(0, v.length() - 2);
+        } else if (v.endsWith("GB")) {
+            unit = 1024L * 1024 * 1024;
+            v = v.substring(0, v.length() - 2);
+        } else if (v.endsWith("B")) {
+            v = v.substring(0, v.length() - 1);
+        }
+        try {
+            long n = Long.parseLong(v.trim());
+            if (n <= 0) {
+                throw new NumberFormatException("必须大于 0");
+            }
+            return n * unit;
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException(path + " 第 " + lineNo + " 行 " + key
+                    + " 无效: " + raw + "(示例: 64MB / 1KB / 1024)");
+        }
     }
 
     private static boolean parseBoolean(String key, String raw, String path, int lineNo) {

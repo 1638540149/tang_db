@@ -95,8 +95,12 @@ public final class Fed implements AutoCloseable {
 
         // ④ 会话层 + 执行入口 + 协议监听
         SessionManager sessions = new SessionManager(config.sessionMax(), config.sessionIdleTimeout());
+        // K114:启动时清理上次崩溃残留的排序临时文件(FE 侧目录,不碰 BE 数据目录)。
+        com.wangyu.tangdb.query.Sorter.cleanTempDir(
+                java.nio.file.Path.of(config.sortTmpDir()));
         SqlEngine engine = new SqlEngine(client, catalog, sessions, registry,
-                config.heartbeatEnabled(), config.user(), config.indexBackfillBatch());
+                config.heartbeatEnabled(), config.user(), config.indexBackfillBatch(),
+                config.queryBatchRows(), config.sortSpillBytes(), config.sortTmpDir());
         byte[] storedHash = NativePassword.deriveStoredHash(config.password());
 
         MysqlServer mysqlServer;

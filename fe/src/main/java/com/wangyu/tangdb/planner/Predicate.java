@@ -127,7 +127,9 @@ public sealed interface Predicate {
                 Values.checkComparable(column, literal);
                 literals.add(literal);
             }
-            return new In(column.ordinal(), column, List.copyOf(literals));
+            // IN 列表允许出现 NULL(三值逻辑),所以不用 List.copyOf(它会拒绝 null)。
+            return new In(column.ordinal(), column,
+                    java.util.Collections.unmodifiableList(new ArrayList<>(literals)));
         }
         throw new CatalogException("不支持的 WHERE 条件");
     }
