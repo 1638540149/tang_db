@@ -2,11 +2,16 @@ package com.wangyu.tangdb.execute;
 
 import com.wangyu.tangdb.catalog.Catalog;
 import com.wangyu.tangdb.catalog.CatalogException;
+import com.wangyu.tangdb.catalog.SystemTables;
 import com.wangyu.tangdb.parser.Ast;
 import com.wangyu.tangdb.planner.Plan;
 import com.wangyu.tangdb.planner.Planner;
+import com.wangyu.tangdb.session.Session;
+import com.wangyu.tangdb.session.SessionManager;
 import com.wangyu.tangdb.storage.Column;
 import com.wangyu.tangdb.storage.ConflictException;
+import com.wangyu.tangdb.storage.IndexCodec;
+import com.wangyu.tangdb.storage.IndexMeta;
 import com.wangyu.tangdb.storage.KeyCodec;
 import com.wangyu.tangdb.storage.KeyValue;
 import com.wangyu.tangdb.storage.KvStore;
@@ -22,10 +27,15 @@ import com.wangyu.tangdb.txn.TxnState;
 import com.wangyu.tangdb.txn.WriteSet;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.function.Supplier;
+import java.util.logging.Logger;
 
 /**
  * 语句执行器:DDL 走 catalog,DML/SELECT 走 BE 的 Get/Scan + FE 侧过滤。
@@ -39,6 +49,10 @@ import java.util.function.Supplier;
  * </ul>
  */
 public final class Executor {
+
+    private static final Logger LOG = Logger.getLogger(Executor.class.getName());
+
+    private static final byte[] EMPTY = new byte[0];
 
     private final KvStore kv;
     private final Catalog catalog;
@@ -56,9 +70,36 @@ public final class Executor {
     private Transaction implicit;
     private boolean implicitCommitted;
 
+    // ---- P4:SHOW / information_schema / KILL 需要的服务器侧上下文(可为空) ----
+    private SessionManager sessions;
+    private String user = "";
+    private long sessionId;
+    private int indexBackfillBatch = 1000;
+
+    /** 最近一次索引扫描的统计(FR-512):扫了多少索引项、回表多少次。 */
+    private long lastIndexEntriesScanned;
+    private long lastTableLookups;
+    /** 当前 DML 是否维护了索引(用于把 max_txn_write_bytes 错误说明成"含索引写入",FR-493)。 */
+    private boolean currentStatementWritesIndexes;
+
     public Executor(KvStore kv, Catalog catalog) {
         this.kv = kv;
         this.catalog = catalog;
+    }
+
+    /**
+     * 注入服务器侧上下文(SPEC-P4 FR-512 / FR-541):SHOW PROCESSLIST、KILL、回填批量。
+     * 单元测试里不注入也能工作(相关命令返回空集或明确报错)。
+     */
+    public Executor attachServer(SessionManager sessions, String user, long sessionId,
+                                 int indexBackfillBatch) {
+        this.sessions = sessions;
+        this.user = user == null ? "" : user;
+        this.sessionId = sessionId;
+        if (indexBackfillBatch > 0) {
+            this.indexBackfillBatch = indexBackfillBatch;
+        }
+        return this;
     }
 
     public TxnState txnState() {
@@ -122,6 +163,17 @@ public final class Executor {
             requireNoTransaction("CREATE TABLE");
             return createTable(create);
         }
+        if (statement instanceof Ast.CreateIndex create) {
+            requireNoTransaction("CREATE INDEX");
+            return createIndex(create);
+        }
+        if (statement instanceof Ast.DropIndex drop) {
+            requireNoTransaction("DROP INDEX");
+            String db = resolveDatabase(drop.database());
+            IndexMeta index = catalog.dropIndex(db, drop.table(), drop.name());
+            return new Result.Message("OK, 索引 " + index.name() + " 已删除(表 "
+                    + drop.table().toLowerCase() + ")");
+        }
         if (statement instanceof Ast.DropTable drop) {
             requireNoTransaction("DROP TABLE");
             String db = resolveDatabase(drop.database());
@@ -134,11 +186,38 @@ public final class Executor {
             TableMeta table = catalog.truncateTable(db, truncate.table());
             return new Result.Message("OK, 表 " + table.name() + " 已清空(新表 ID " + table.id() + ")");
         }
-        if (statement instanceof Ast.ShowTables) {
-            return showTables();
+        if (statement instanceof Ast.ShowTables show) {
+            return meta().showTables(show);
         }
         if (statement instanceof Ast.ShowDatabases) {
             return showDatabases();
+        }
+        if (statement instanceof Ast.ShowIndexes show) {
+            return meta().showIndexes(show);
+        }
+        if (statement instanceof Ast.ShowIndexDetails show) {
+            return meta().showIndexDetails(show);
+        }
+        if (statement instanceof Ast.ShowSimple show) {
+            return meta().showSimple(show);
+        }
+        if (statement instanceof Ast.ShowTableStatus show) {
+            return meta().showTableStatus(show);
+        }
+        if (statement instanceof Ast.ShowCreateTable show) {
+            return meta().showCreateTable(show);
+        }
+        if (statement instanceof Ast.ShowCreateDatabase show) {
+            return meta().showCreateDatabase(show);
+        }
+        if (statement instanceof Ast.ShowColumns show) {
+            return meta().showColumns(show);
+        }
+        if (statement instanceof Ast.Explain explain) {
+            return explain(explain);
+        }
+        if (statement instanceof Ast.Kill kill) {
+            return kill(kill);
         }
         if (statement instanceof Ast.Describe describe) {
             return describe(describe);
@@ -154,6 +233,9 @@ public final class Executor {
         }
         if (statement instanceof Ast.Select select) {
             return select(select);
+        }
+        if (statement instanceof Ast.SelectLiterals literals) {
+            return selectLiterals(literals);
         }
         throw new CatalogException("不支持的语句");
     }
@@ -250,25 +332,48 @@ public final class Executor {
         return 0;
     }
 
-    /** 把 BE 回的冲突用户键翻译成"表 t 主键 x 写写冲突"(FR-333 / FR-359)。 */
+    /**
+     * 把 BE 回的冲突用户键翻译成用户可读错误(FR-333 / FR-359 / K78 / K80):
+     * 唯一索引冲突统一报 1062(并发触发时不带已有主键,只说"并发写入冲突")。
+     */
     private StoreException translateConflict(ConflictException e) {
         byte[] key = e.conflictKey();
         if (key == null) {
             return new StoreException("写写冲突(该行在本事务开始后被其它事务修改,请重试)");
         }
         long tableId = KeyCodec.tableId(key);
+        int indexId = KeyCodec.indexId(key);
         TableMeta table = catalog.findById(tableId);
-        if (table != null) {
+        if (table != null && indexId != 0) {
+            IndexMeta index = catalog.findIndex(tableId, indexId);
+            if (index != null && index.unique()) {
+                String valueText = "?";
+                try {
+                    Column column = table.column(index.columnName());
+                    if (column != null) {
+                        valueText = displayLiteral(IndexCodec.decodeValue(column.type(), key, 8).value());
+                    }
+                } catch (RuntimeException ignored) {
+                    // 解码失败也不把内部 key 十六进制打给用户。
+                }
+                return new StoreException("唯一索引 " + index.name() + " 冲突(表 " + table.name()
+                        + ",列 " + index.columnName() + " = " + valueText
+                        + ",并发写入冲突)", SqlError.ER_DUP_ENTRY);
+            }
+        }
+        if (table != null && indexId == 0) {
             try {
                 Object pkValue = KeyCodec.decodePrimaryKey(table, key);
                 return new StoreException("表 " + table.name() + " 主键 " + Values.display(pkValue)
-                        + " 写写冲突(该行在本事务开始后被其它事务修改,请重试)");
+                        + " 写写冲突(该行在本事务开始后被其它事务修改,请重试)",
+                        SqlError.ER_LOCK_DEADLOCK);
             } catch (RuntimeException ignored) {
                 // 解码失败就退回到不含主键的文案,绝不把内部 key 十六进制打给用户。
             }
         }
         return new StoreException("表 ID " + tableId
-                + " 的某一行写写冲突(该行在本事务开始后被其它事务修改,请重试)");
+                + " 的某一行写写冲突(该行在本事务开始后被其它事务修改,请重试)",
+                SqlError.ER_LOCK_DEADLOCK);
     }
 
     // ------------------------------------------------------------ 读视图
@@ -320,20 +425,29 @@ public final class Executor {
             columns.add(new Column(def.name(), def.type(), def.length(), def.nullable(),
                     def.primaryKey(), i));
         }
+        List<Catalog.IndexSpec> specs = new ArrayList<>(create.inlineIndexes().size());
+        for (Ast.InlineIndex inline : create.inlineIndexes()) {
+            specs.add(new Catalog.IndexSpec(inline.name(), inline.column(), inline.unique()));
+        }
         String db = resolveDatabase(create.database());
-        TableMeta table = catalog.createTable(db, create.table(), columns);
-        return new Result.Message("OK, 表 " + table.name() + " 已创建(表 ID " + table.id() + ")");
+        TableMeta table = catalog.createTable(db, create.table(), columns, specs);
+        StringBuilder text = new StringBuilder("OK, 表 " + table.name() + " 已创建(表 ID " + table.id() + ")");
+        List<IndexMeta> indexes = catalog.indexes(table.id());
+        if (!indexes.isEmpty()) {
+            text.append(";内联索引 ");
+            for (int i = 0; i < indexes.size(); i++) {
+                if (i > 0) {
+                    text.append(", ");
+                }
+                text.append(indexes.get(i).name());
+            }
+        }
+        return new Result.Message(text.toString());
     }
 
-    private Result showTables() {
-        // 当前库可能已被别人 DROP(边界 4):先校验存在,不存在报 1049。
-        catalog.requireDatabase(currentDatabase);
-        List<TableMeta> tables = catalog.tables(currentDatabase);
-        List<Object[]> rows = new ArrayList<>(tables.size());
-        for (TableMeta table : tables) {
-            rows.add(new Object[]{table.name(), table.id(), table.createdAt()});
-        }
-        return new Result.Table(List.of("table_name", "table_id", "created_at"), rows);
+    /** 兼容方法:MetaCommands 需要当前执行器来取会话当前库。 */
+    private MetaCommands meta() {
+        return new MetaCommands(catalog, this, sessions, user);
     }
 
     /** SHOW DATABASES:列出全部库(含 default),由 FE 内存直接回答(FR-201 / FR-422)。 */
@@ -363,6 +477,269 @@ public final class Executor {
     /** 解析表名:限定名取指定库,未限定取当前库;不存在抛 1146。 */
     private TableMeta requireTable(String database, String table) {
         return catalog.require(resolveDatabase(database), table);
+    }
+
+    // ------------------------------------------------------------ 索引 DDL 与回填
+
+    /**
+     * CREATE [UNIQUE] INDEX(FR-456 ~ FR-470):
+     * 空表直接 ACTIVE;非空表先落 BUILDING 元数据,再分批回填,最后单独写 ACTIVE。
+     */
+    private Result createIndex(Ast.CreateIndex create) {
+        String db = resolveDatabase(create.database());
+        TableMeta table = catalog.require(db, create.table());
+        IndexMeta index = catalog.createIndex(db, create.table(), create.name(),
+                create.column(), create.unique());
+        boolean resumed = false;
+        if (index.state() == IndexMeta.STATE_BUILDING) {
+            resumed = index.buildCursor() != null && !index.buildCursor().isBlank();
+            try {
+                index = backfill(index, table);
+            } catch (RuntimeException e) {
+                // FR-469:唯一冲突等"定义级失败"→ 索引转 DROPPED,不留半成品;
+                // 但进程崩溃 / BE 不可用属于"回填中断"(FR-469 前半段),必须保持 BUILDING 以便续做。
+                if (e instanceof StoreException se && se.code() == SqlError.ER_DUP_ENTRY
+                        || e instanceof CatalogException) {
+                    try {
+                        catalog.updateIndexState(index, IndexMeta.STATE_DROPPED);
+                    } catch (RuntimeException ignored) {
+                        // 状态写入失败不掩盖原始错误。
+                    }
+                }
+                throw e;
+            }
+        }
+        return new Result.Message("OK, " + (index.unique() ? "唯一索引 " : "索引 ") + index.name()
+                + " 已创建(索引 ID " + index.indexId() + ",状态 " + index.stateName()
+                + (resumed ? ",从游标续做" : "") + ")");
+    }
+
+    /**
+     * 分批回填(FR-467 / FR-468 / K84 / K85):默认 1000 行/批,K89 保证回填期间的新写入
+     * 也进索引,因此转 ACTIVE 前不需要增量补扫。
+     */
+    private IndexMeta backfill(IndexMeta index, TableMeta table) {
+        Column indexColumn = IndexCodec.indexColumn(table, index);
+        Column pk = table.primaryKey();
+        IndexMeta current = index;
+        byte[] start = current.buildCursor().isBlank()
+                ? KeyCodec.tableRangeStart(table.id())
+                : KeyCodec.concat(KeyCodec.tableRangeStart(table.id()),
+                        hexToBytes(current.buildCursor()), KeyCodec.afterAllVersions());
+
+        int batch = Math.max(1, indexBackfillBatch);
+        while (true) {
+            List<KeyValue> rows = kv.scan(start, KeyCodec.tableRangeEnd(table.id()), batch);
+            if (rows.isEmpty()) {
+                break;
+            }
+            TreeMap<byte[], byte[]> staged = new TreeMap<>(Arrays::compareUnsigned);
+            byte[] lastPkEncoded = null;
+            for (KeyValue row : rows) {
+                if (KeyCodec.indexId(row.key()) != KeyCodec.INDEX_ID_PRIMARY) {
+                    continue; // 索引项不是回填输入
+                }
+                RowCodec.Decoded decoded = RowCodec.decode(table, row.value());
+                byte[] pkEncoded = Arrays.copyOfRange(row.key(), 8, row.key().length);
+                lastPkEncoded = pkEncoded;
+                if (decoded.tombstone()) {
+                    continue;
+                }
+                Object[] values = decoded.values();
+                Object columnValue = values[indexColumn.ordinal()];
+                if (columnValue == null) {
+                    continue; // K79
+                }
+                Object pkValue = values[pk.ordinal()];
+                byte[] indexKey = IndexCodec.entryKey(table, index, columnValue, pkValue);
+                if (index.unique()) {
+                    byte[] previous = staged.containsKey(indexKey) ? staged.get(indexKey) : kv.get(indexKey);
+                    if (previous != null && !IndexCodec.isTombstone(table, previous)) {
+                        Object previousPk = KeyCodec.decodePrimaryKeyValue(pk.type(), previous);
+                        if (!Objects.equals(previousPk, pkValue)) {
+                            throw new StoreException("唯一索引 " + index.name() + " 回填失败:列 "
+                                    + indexColumn.name() + " 的值 " + displayLiteral(columnValue)
+                                    + " 重复(主键 " + Values.display(previousPk) + " 与 "
+                                    + Values.display(pkValue) + ")", SqlError.ER_DUP_ENTRY);
+                        }
+                        continue; // 崩溃后重扫到已回填的同一行 → 幂等跳过
+                    }
+                    staged.put(indexKey, IndexCodec.entryValue(table, index, pkValue));
+                } else {
+                    staged.put(indexKey, EMPTY);
+                }
+            }
+            List<KeyValue> writes = new ArrayList<>(staged.size());
+            for (Map.Entry<byte[], byte[]> entry : staged.entrySet()) {
+                writes.add(new KeyValue(entry.getKey(), entry.getValue()));
+            }
+            if (lastPkEncoded == null) {
+                break; // 只有索引项/无主键行(理论上不会发生)
+            }
+            String cursorHex = toHex(lastPkEncoded);
+            current = catalog.advanceBackfill(current, cursorHex, writes);
+            start = KeyCodec.concat(KeyCodec.tableRangeStart(table.id()), lastPkEncoded,
+                    KeyCodec.afterAllVersions());
+        }
+        // FR-470:转 ACTIVE 的记录最后写,ACTIVE 是不可逆的对外承诺。
+        return catalog.updateIndexState(current, IndexMeta.STATE_ACTIVE);
+    }
+
+    private static String toHex(byte[] bytes) {
+        StringBuilder sb = new StringBuilder(bytes.length * 2);
+        for (byte b : bytes) {
+            sb.append(String.format("%02X", b & 0xFF));
+        }
+        return sb.toString();
+    }
+
+    private static byte[] hexToBytes(String hex) {
+        String s = hex.trim();
+        if ((s.length() & 1) != 0) {
+            throw new CatalogException("回填游标不是合法十六进制: " + hex);
+        }
+        byte[] out = new byte[s.length() / 2];
+        for (int i = 0; i < out.length; i++) {
+            int hi = Character.digit(s.charAt(i * 2), 16);
+            int lo = Character.digit(s.charAt(i * 2 + 1), 16);
+            if (hi < 0 || lo < 0) {
+                throw new CatalogException("回填游标不是合法十六进制: " + hex);
+            }
+            out[i] = (byte) ((hi << 4) | lo);
+        }
+        return out;
+    }
+
+    // ------------------------------------------------------------ EXPLAIN
+
+    /** EXPLAIN 与实际执行共用 {@link #planFor},不另写一套推算逻辑(FR-517)。 */
+    private Result explain(Ast.Explain explain) {
+        Ast.Statement inner = explain.statement();
+        TableMeta table;
+        Plan plan;
+        Ast.Condition where;
+        if (inner instanceof Ast.Select select) {
+            table = requireTable(select.database(), select.table());
+            where = select.where();
+        } else if (inner instanceof Ast.Update update) {
+            table = requireTable(update.database(), update.table());
+            where = update.where();
+        } else if (inner instanceof Ast.Delete delete) {
+            table = requireTable(delete.database(), delete.table());
+            where = delete.where();
+        } else {
+            throw new SqlError(SqlError.ER_NOT_SUPPORTED_YET, "42000",
+                    "不支持解释该语句(EXPLAIN 只支持 SELECT / UPDATE / DELETE)");
+        }
+        plan = planFor(table, where);
+
+        List<Object[]> rows = new ArrayList<>();
+        rows.add(new String[]{"访问路径: " + explainLabel(plan)});
+        rows.add(new String[]{"表: " + table.name()});
+        if (plan.index() != null) {
+            IndexMeta index = plan.index();
+            rows.add(new String[]{"索引: " + index.name() + "(列 " + index.columnName()
+                    + (index.unique() ? ",唯一" : "") + ",索引 ID " + index.indexId() + ")"});
+        }
+        rows.add(new String[]{"key 范围: " + explainRange(plan)});
+        rows.add(new String[]{"残余过滤: " + (where == null ? "无" : formatCondition(where))
+                + "(由 FE 按谓词执行)"});
+        rows.add(new String[]{"扫描方式: " + describeScan(plan)});
+        return new Result.Table(List.of("plan"), rows);
+    }
+
+    private static String explainLabel(Plan plan) {
+        return switch (plan.kind()) {
+            case POINT, POINTS -> "PRIMARY POINT";
+            case RANGE -> plan.fullScan() ? "TABLE SCAN" : "PRIMARY RANGE";
+            case INDEX_POINT -> "INDEX POINT";
+            case INDEX_RANGE -> "INDEX RANGE";
+        };
+    }
+
+    private static String explainRange(Plan plan) {
+        switch (plan.kind()) {
+            case POINT, POINTS -> {
+                StringBuilder sb = new StringBuilder();
+                List<byte[]> keys = plan.pointKeys();
+                for (int i = 0; i < keys.size() && i < 4; i++) {
+                    if (i > 0) {
+                        sb.append(", ");
+                    }
+                    sb.append(IndexCodec.hex(keys.get(i), 24));
+                }
+                if (keys.size() > 4) {
+                    sb.append(" …共 ").append(keys.size()).append(" 个点");
+                }
+                return sb.toString();
+            }
+            case RANGE, INDEX_POINT, INDEX_RANGE -> {
+                return "[" + IndexCodec.hex(plan.start(), 24) + ", "
+                        + IndexCodec.hex(plan.end(), 24) + ")";
+            }
+        }
+        return "";
+    }
+
+    private static String describeScan(Plan plan) {
+        return switch (plan.kind()) {
+            case POINT, POINTS -> "主键点查(Get)";
+            case RANGE -> plan.fullScan() ? "全表有序扫描(Scan)" : "主键范围扫描(Scan)";
+            case INDEX_POINT, INDEX_RANGE -> "索引区间扫描 + 逐行回表(二次校验)";
+        };
+    }
+
+    private static String formatCondition(Ast.Condition condition) {
+        if (condition instanceof Ast.Compare cmp) {
+            return cmp.column() + " " + cmp.op().text() + " " + displayLiteral(cmp.value());
+        }
+        if (condition instanceof Ast.In in) {
+            StringBuilder sb = new StringBuilder(in.column()).append(" IN (");
+            for (int i = 0; i < in.values().size(); i++) {
+                if (i > 0) {
+                    sb.append(", ");
+                }
+                sb.append(displayLiteral(in.values().get(i)));
+            }
+            return sb.append(')').toString();
+        }
+        if (condition instanceof Ast.And and) {
+            return "(" + formatCondition(and.left()) + " AND " + formatCondition(and.right()) + ")";
+        }
+        if (condition instanceof Ast.Or or) {
+            return "(" + formatCondition(or.left()) + " OR " + formatCondition(or.right()) + ")";
+        }
+        return "?";
+    }
+
+    private static String displayLiteral(Object value) {
+        if (value == null) {
+            return "NULL";
+        }
+        if (value instanceof String s) {
+            return "'" + s.replace("'", "''") + "'";
+        }
+        return Values.display(value);
+    }
+
+    // ------------------------------------------------------------ KILL
+
+    /** KILL [CONNECTION] <id>(FR-541 / K97):回滚目标会话未提交事务并注销,且落日志。 */
+    private Result kill(Ast.Kill kill) {
+        if (sessions == null) {
+            throw new SqlError(SqlError.ER_NO_SUCH_THREAD, "HY000",
+                    "会话 id " + kill.id() + " 不存在");
+        }
+        Session target = sessions.get(kill.id());
+        if (target == null) {
+            throw new SqlError(SqlError.ER_NO_SUCH_THREAD, "HY000",
+                    "会话 id " + kill.id() + " 不存在");
+        }
+        LOG.info("KILL 会话: killer_session=" + sessionId + " target_session=" + kill.id());
+        target.kill();
+        target.executor().rollbackOnDisconnect();
+        sessions.remove(kill.id());
+        return new Result.Message("OK, 会话 " + kill.id() + " 已断开");
     }
 
     // ------------------------------------------------------------ DML
@@ -402,6 +779,8 @@ public final class Executor {
 
         WriteSet local = new WriteSet();
         ReadView view = currentView(local);
+        List<IndexMeta> indexes = writableIndexes(table);
+        currentStatementWritesIndexes = !indexes.isEmpty();
 
         int written = 0;
         for (int k = 0; k < insert.rows().size(); k++) {
@@ -424,6 +803,8 @@ public final class Executor {
                 throw new StoreException("第 " + (k + 1) + " 组主键冲突(表 " + table.name()
                         + ",主键 " + Values.display(pkValue) + ")", SqlError.ER_DUP_ENTRY);
             }
+            // 索引项与行记录进同一个写集(最终同一条批记录,FR-483 / K89)。
+            stageInsertIndexes(table, indexes, values, pkValue, view, local);
             local.put(key, RowCodec.encode(table, values));
             written++;
         }
@@ -431,7 +812,50 @@ public final class Executor {
         return affected(written);
     }
 
+    /** 插入一行时维护所有 ACTIVE / BUILDING 索引;唯一索引先查重(FR-484 / K80)。 */
+    private void stageInsertIndexes(TableMeta table, List<IndexMeta> indexes, Object[] values,
+                                    Object pkValue, ReadView view, WriteSet local) {
+        Column pk = table.primaryKey();
+        for (IndexMeta index : indexes) {
+            Column column = IndexCodec.indexColumn(table, index);
+            Object columnValue = values[column.ordinal()];
+            if (columnValue == null) {
+                continue; // K79:NULL 行不入索引
+            }
+            byte[] indexKey = IndexCodec.entryKey(table, index, columnValue, pkValue);
+            if (index.unique()) {
+                checkUniqueFree(table, index, column, columnValue, indexKey, view, local);
+                local.put(indexKey, IndexCodec.entryValue(table, index, pkValue));
+            } else {
+                local.put(indexKey, EMPTY);
+            }
+        }
+        if (pk == null) {
+            throw new StoreException("表 " + table.name() + " 没有主键");
+        }
+    }
+
+    /** 唯一冲突即拒(1062),信息带索引名 + 列名 + 值 + 已有主键(K80)。 */
+    private void checkUniqueFree(TableMeta table, IndexMeta index, Column column, Object columnValue,
+                                 byte[] indexKey, ReadView view, WriteSet local) {
+        byte[] current = local.get(indexKey);
+        if (current == null) {
+            current = view.get(indexKey);
+        }
+        if (current == null || IndexCodec.isTombstone(table, current)) {
+            return;
+        }
+        Column pk = table.primaryKey();
+        Object existingPk = KeyCodec.decodePrimaryKeyValue(pk.type(), current);
+        throw new StoreException("唯一索引 " + index.name() + " 冲突(表 " + table.name()
+                + ",列 " + column.name() + " = " + displayLiteral(columnValue)
+                + ",已有主键 " + Values.display(existingPk) + ")", SqlError.ER_DUP_ENTRY);
+    }
+
     private Result update(Ast.Update update) {
+        if (update.limit() != null) {
+            throw MetaCommands.notSupported("UPDATE ... LIMIT 不支持(不做半实现;请用 WHERE 精确限定)");
+        }
         TableMeta table = requireTable(update.database(), update.table());
 
         int[] targetIndexes = new int[update.assignments().size()];
@@ -453,12 +877,15 @@ public final class Executor {
 
         WriteSet local = new WriteSet();
         ReadView view = currentView(local);
+        List<IndexMeta> indexes = writableIndexes(table);
+        currentStatementWritesIndexes = !indexes.isEmpty();
         int[] count = {0};
-        forEachMatch(Planner.access(table, update.where()), table, view, (key, values) -> {
+        forEachMatch(planFor(table, update.where()), table, view, (key, values) -> {
             Object[] updated = values.clone();
             for (int i = 0; i < targetIndexes.length; i++) {
                 updated[targetIndexes[i]] = targetValues[i];
             }
+            stageUpdateIndexes(table, indexes, values, updated, view, local);
             local.put(key, RowCodec.encode(table, updated));
             count[0]++;
             return true;
@@ -467,14 +894,62 @@ public final class Executor {
         return affected(count[0]);
     }
 
+    /**
+     * UPDATE 的索引维护(FR-485 ~ FR-487):只处理值真的变了的索引列;
+     * 旧项写墓碑、新项写入,与主键更新同批。未改索引列不产生任何索引写入(FR-486)。
+     */
+    private void stageUpdateIndexes(TableMeta table, List<IndexMeta> indexes,
+                                    Object[] oldValues, Object[] newValues,
+                                    ReadView view, WriteSet local) {
+        Column pk = table.primaryKey();
+        Object pkValue = newValues[pk.ordinal()];
+        for (IndexMeta index : indexes) {
+            Column column = IndexCodec.indexColumn(table, index);
+            Object oldValue = oldValues[column.ordinal()];
+            Object newValue = newValues[column.ordinal()];
+            if (Objects.equals(oldValue, newValue)) {
+                continue;
+            }
+            if (oldValue != null) {
+                byte[] oldKey = IndexCodec.entryKey(table, index, oldValue, pkValue);
+                local.put(oldKey, IndexCodec.tombstone(table.id()));
+            }
+            if (newValue == null) {
+                continue; // 改成 NULL:该行从索引里消失(K79 / 边界 10)
+            }
+            byte[] newKey = IndexCodec.entryKey(table, index, newValue, pkValue);
+            if (index.unique()) {
+                checkUniqueFree(table, index, column, newValue, newKey, view, local);
+                local.put(newKey, IndexCodec.entryValue(table, index, pkValue));
+            } else {
+                local.put(newKey, EMPTY);
+            }
+        }
+    }
+
     private Result delete(Ast.Delete delete) {
+        if (delete.limit() != null) {
+            throw MetaCommands.notSupported("DELETE ... LIMIT 不支持(不做半实现;请用 WHERE 精确限定)");
+        }
         TableMeta table = requireTable(delete.database(), delete.table());
 
         WriteSet local = new WriteSet();
         ReadView view = currentView(local);
+        List<IndexMeta> indexes = writableIndexes(table);
+        currentStatementWritesIndexes = !indexes.isEmpty();
+        Column pk = table.primaryKey();
         int[] count = {0};
-        forEachMatch(Planner.access(table, delete.where()), table, view, (key, values) -> {
+        forEachMatch(planFor(table, delete.where()), table, view, (key, values) -> {
             local.put(key, RowCodec.encodeTombstone(table.id()));
+            for (IndexMeta index : indexes) {
+                Column column = IndexCodec.indexColumn(table, index);
+                Object columnValue = values[column.ordinal()];
+                if (columnValue == null) {
+                    continue;
+                }
+                byte[] indexKey = IndexCodec.entryKey(table, index, columnValue, values[pk.ordinal()]);
+                local.put(indexKey, IndexCodec.tombstone(table.id()));
+            }
             count[0]++;
             return true;
         });
@@ -500,35 +975,83 @@ public final class Executor {
             }
         } catch (ConflictException e) {
             throw translateConflict(e);
+        } catch (StoreException e) {
+            String message = e.getMessage();
+            if (currentStatementWritesIndexes && message != null
+                    && message.contains("写入量超过上限") && !message.contains("含索引写入")) {
+                throw new StoreException(message + "(含索引写入)", e.code());
+            }
+            throw e;
         }
     }
 
     // ------------------------------------------------------------ SELECT
 
+    /** 无 FROM 的字面量投影(FR-560):一行,列名为字面量文本。 */
+    private Result selectLiterals(Ast.SelectLiterals literals) {
+        List<String> names = new ArrayList<>(literals.items().size());
+        Object[] row = new Object[literals.items().size()];
+        for (int i = 0; i < literals.items().size(); i++) {
+            Ast.LiteralItem item = literals.items().get(i);
+            names.add(item.name());
+            row[i] = item.value();
+        }
+        return new Result.Table(names, List.<Object[]>of(row));
+    }
+
     private Result select(Ast.Select select) {
+        if (select.countStar()) {
+            throw MetaCommands.notSupported("用户表上的 COUNT(*) 不支持(归 P5);"
+                    + "虚拟表 information_schema.* 上可用");
+        }
+        if (!select.orderBy().isEmpty()) {
+            throw MetaCommands.notSupported("用户表上的 ORDER BY 不支持(归 P5);"
+                    + "虚拟表 information_schema.* 上支持多列 ORDER BY");
+        }
         TableMeta table = requireTable(select.database(), select.table());
-        Plan plan = Planner.access(table, select.where());
+        Plan plan = planFor(table, select.where());
         Planner.Projection projection = Planner.projection(table, select);
 
         List<Object[]> rows = new ArrayList<>();
         if (select.limit() != null && select.limit() == 0) {
             return new Result.Table(projection.names(), rows);
         }
-        int limit = select.limit() == null ? Integer.MAX_VALUE : select.limit();
-        // 事务内:固定快照 + 读己之写;事务外:最新已提交(FR-343)。
+        Integer limit = select.limit();
+        int offset = select.offset() == null ? 0 : select.offset();
+        // 分页语义(FR-551):先过滤(forEachMatch 已按计划 + 残余谓词过滤)→ 再跳过 offset
+        // → 再截断 count。索引路径与全表扫路径都经过这里,行为天然一致(FR-552)。
+        int[] skipped = {0};
+        // 事务内:固定快照 + 读己之写;事务外:最新已提交(FR-343 / FR-500 / FR-510)。
         ReadView view = currentView(null);
         forEachMatch(plan, table, view, (key, values) -> {
-            if (rows.size() >= limit) {
-                return false;
+            if (skipped[0] < offset) {
+                skipped[0]++;
+                return true;
             }
             Object[] projected = new Object[projection.indexes().length];
             for (int i = 0; i < projection.indexes().length; i++) {
                 projected[i] = values[projection.indexes()[i]];
             }
             rows.add(projected);
-            return rows.size() < limit;
+            return limit == null || rows.size() < limit;
         });
         return new Result.Table(projection.names(), rows);
+    }
+
+    /** 与执行共用同一个计划构造入口(FR-517):查询、DML、EXPLAIN 都走这里。 */
+    private Plan planFor(TableMeta table, Ast.Condition where) {
+        return Planner.access(table, where, catalog.activeIndexes(table.id()));
+    }
+
+    /** 需要写入维护的索引:ACTIVE 与 BUILDING(FR-491 / K89);DROPPED 不维护。 */
+    private List<IndexMeta> writableIndexes(TableMeta table) {
+        List<IndexMeta> out = new ArrayList<>();
+        for (IndexMeta index : catalog.indexes(table.id())) {
+            if (index.maintainedOnWrite()) {
+                out.add(index);
+            }
+        }
+        return out;
     }
 
     // ------------------------------------------------------------ 行访问
@@ -545,6 +1068,8 @@ public final class Executor {
      */
     private int forEachMatch(Plan plan, TableMeta table, ReadView view, RowVisitor visitor) {
         int count = 0;
+        lastIndexEntriesScanned = 0;
+        lastTableLookups = 0;
         switch (plan.kind()) {
             case POINT, POINTS -> {
                 for (byte[] key : plan.pointKeys()) {
@@ -565,6 +1090,9 @@ public final class Executor {
             case RANGE -> {
                 List<KeyValue> kvs = view.scan(plan.start(), plan.end(), 0);
                 for (KeyValue row : kvs) {
+                    if (KeyCodec.indexId(row.key()) != KeyCodec.INDEX_ID_PRIMARY) {
+                        continue; // P4:同一表前缀下还有索引项,全表/主键范围扫描必须跳过它们
+                    }
                     RowCodec.Decoded decoded = RowCodec.decode(table, row.value());
                     if (decoded.tombstone() || !matches(plan, decoded.values())) {
                         continue;
@@ -575,8 +1103,54 @@ public final class Executor {
                     }
                 }
             }
+            case INDEX_POINT, INDEX_RANGE -> count = forEachIndexMatch(plan, table, view, visitor);
             default -> throw new CatalogException("未知的访问计划: " + plan.kind());
         }
+        return count;
+    }
+
+    /**
+     * 索引扫描 + 回表(SPEC-P4 §5.5 / FR-498 ~ FR-502 / FR-511):
+     * 扫同一读视图上的索引项 → 按同一快照点查主键 → 墓碑跳过 → 二次校验(行值必须等于索引项值)。
+     */
+    private int forEachIndexMatch(Plan plan, TableMeta table, ReadView view, RowVisitor visitor) {
+        IndexMeta index = plan.index();
+        Column indexColumn = IndexCodec.indexColumn(table, index);
+        Column pk = table.primaryKey();
+        List<KeyValue> entries = view.scan(plan.start(), plan.end(), 0);
+        lastIndexEntriesScanned = entries.size();
+        int count = 0;
+        for (KeyValue entry : entries) {
+            IndexCodec.DecodedEntry decodedEntry = IndexCodec.decodeEntry(table, index,
+                    entry.key(), entry.value());
+            if (decodedEntry.tombstone()) {
+                continue; // 索引项墓碑(行已删或索引列已改)
+            }
+            byte[] rowKey = KeyCodec.rowKeyEncoded(table.id(), decodedEntry.encodedPrimaryKey());
+            byte[] data = view.get(rowKey);
+            lastTableLookups++;
+            if (data == null) {
+                continue; // 主键行在该快照不可见(FR-511)
+            }
+            RowCodec.Decoded decoded = RowCodec.decode(table, data);
+            if (decoded.tombstone()) {
+                continue; // FR-502:行已删
+            }
+            Object actual = decoded.values()[indexColumn.ordinal()];
+            if (actual == null || !Objects.equals(actual, decodedEntry.columnValue())) {
+                continue; // FR-501:过期索引项,二次校验跳过
+            }
+            if (!matches(plan, decoded.values())) {
+                continue; // 残余过滤(FR-503)
+            }
+            count++;
+            if (!visitor.visit(rowKey, decoded.values())) {
+                break;
+            }
+        }
+        LOG.info("索引扫描 表=" + table.name() + " 索引=" + index.name()
+                + " 索引项=" + lastIndexEntriesScanned + " 回表=" + lastTableLookups
+                + " 命中=" + count);
         return count;
     }
 

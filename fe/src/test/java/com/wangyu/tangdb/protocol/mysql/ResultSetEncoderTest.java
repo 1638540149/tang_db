@@ -72,4 +72,33 @@ class ResultSetEncoderTest {
         assertTrue(secondRow.length >= 3);
         assertEquals(0xFB, secondRow[2] & 0xFF, "NULL 用 0xFB 表示");
     }
+
+    @Test
+    void moreResultsFlagIsOnlyOnTerminalPacket() {
+        Result.Table table = new Result.Table(List.of("id"),
+                List.<Object[]>of(new Object[]{1L}));
+        List<byte[]> packets = ResultSetEncoder.forResult(
+                table, Protocol.SERVER_STATUS_AUTOCOMMIT, false, true);
+        // 列数 + 1 列定义 + EOF + 1 行 + 终止 EOF
+        assertEquals(5, packets.size());
+        assertFalse(hasMoreResults(packets.get(2)), "列定义后的 EOF 不带 MORE 位");
+        assertTrue(hasMoreResults(packets.get(4)), "终止 EOF 带 MORE 位");
+
+        byte[] ok = ResultSetEncoder.forResult(new Result.Message("OK", -1),
+                Protocol.SERVER_STATUS_AUTOCOMMIT, false, true).get(0);
+        assertTrue(hasMoreResults(ok));
+
+        // 单条语句的旧口径不变:不带 MORE 位。
+        List<byte[]> single = ResultSetEncoder.forResult(
+                table, Protocol.SERVER_STATUS_AUTOCOMMIT, false);
+        assertFalse(hasMoreResults(single.get(4)));
+    }
+
+    private static boolean hasMoreResults(byte[] packet) {
+        // OK 包: 0x00 + affectedRows(0,1B) + lastInsertId(0,1B) + status(2B)
+        // EOF 包: 0xFE + warnings(2B) + status(2B)
+        // 本用例的 affectedRows / lastInsertId 都是 0,两类包的 status 都在偏移 3。
+        int status = (packet[3] & 0xFF) | ((packet[4] & 0xFF) << 8);
+        return (status & Protocol.SERVER_MORE_RESULTS_EXISTS) != 0;
+    }
 }

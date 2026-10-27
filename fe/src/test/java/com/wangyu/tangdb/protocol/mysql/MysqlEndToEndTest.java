@@ -155,6 +155,75 @@ class MysqlEndToEndTest {
         }
     }
 
+    // ------------------------------------------------------------ P4 H 组:单包多语句(FR-556 ~ FR-558)
+
+    private MysqlClientConnection connectMulti() throws Exception {
+        return MysqlClientConnection.connect("127.0.0.1", port, "root", "tangdb", null, true);
+    }
+
+    private static final String NAVICAT_BATCH =
+            "SHOW VARIABLES LIKE 'lower_case_%'; SHOW VARIABLES LIKE 'sql_mode'; "
+                    + "SELECT COUNT(*) AS support_ndb FROM information_schema.ENGINES "
+                    + "WHERE Engine = 'ndbcluster'";
+
+    @Test
+    void multiStatementsReturnEveryResultWhenDeclared() throws Exception {
+        try (MysqlClientConnection conn = connectMulti()) {
+            List<MysqlClientConnection.Response> responses = conn.queryAll(NAVICAT_BATCH);
+            assertEquals(3, responses.size(), "3 条语句 → 3 个结果");
+            assertTrue(responses.get(0).moreResults(), "第 1 条结束包带 SERVER_MORE_RESULTS_EXISTS");
+            assertTrue(responses.get(1).moreResults(), "第 2 条结束包带 SERVER_MORE_RESULTS_EXISTS");
+            assertFalse(responses.get(2).moreResults(), "最后一条不带 MORE 位");
+            assertEquals(List.of("support_ndb"), responses.get(2).columns());
+            assertEquals(1, responses.get(2).rows().size());
+            assertEquals("0", responses.get(2).rows().get(0)[0]);
+        }
+    }
+
+    @Test
+    void undeclaredClientGetsOnlyLastResultAndStaysAligned() throws Exception {
+        try (MysqlClientConnection conn = connect()) {
+            MysqlClientConnection.Response response = conn.query(NAVICAT_BATCH);
+            assertTrue(response.isResultSet());
+            assertEquals(List.of("support_ndb"), response.columns(), "只回最后一条(COUNT(*) 别名)");
+            assertFalse(response.moreResults());
+            // 若服务端多回了结果集,这里会协议错位 —— 下一条 COM_QUERY 必须照常。
+            MysqlClientConnection.Response next = conn.query("SHOW DATABASES");
+            assertEquals("Database", next.columns().get(0));
+            assertEquals("default", next.rows().get(0)[0]);
+        }
+    }
+
+    @Test
+    void errorInBatchStopsAndKeepsConnectionUsable() throws Exception {
+        try (MysqlClientConnection conn = connectMulti()) {
+            conn.queryAll("CREATE TABLE batch_t (id INT PRIMARY KEY)");
+            MysqlClientConnection.MysqlClientException e = assertThrows(
+                    MysqlClientConnection.MysqlClientException.class,
+                    () -> conn.queryAll("INSERT INTO batch_t (id) VALUES (1); "
+                            + "SELEC * FROM batch_t; INSERT INTO batch_t (id) VALUES (2)"));
+            assertEquals(SqlError.ER_SYNTAX_ERROR, e.code(), "只回第 2 条的错误,码与单条一致");
+
+            MysqlClientConnection.Response rows = conn.query("SELECT id FROM batch_t");
+            assertEquals(1, rows.rows().size(), "第 3 条没有执行");
+            assertEquals("1", rows.rows().get(0)[0]);
+            conn.ping(); // FR-558:连接保持
+        }
+    }
+
+    @Test
+    void semicolonInsideStringIsNotSplit() throws Exception {
+        try (MysqlClientConnection conn = connectMulti()) {
+            List<MysqlClientConnection.Response> responses = conn.queryAll(
+                    "CREATE TABLE semi (id INT PRIMARY KEY, note VARCHAR(16)); "
+                            + "INSERT INTO semi VALUES (1, 'a;b'); "
+                            + "SELECT note FROM semi WHERE id = 1");
+            assertEquals(3, responses.size());
+            MysqlClientConnection.Response last = responses.get(2);
+            assertEquals("a;b", last.rows().get(0)[0], "字符串里的分号不被切开");
+        }
+    }
+
     @Test
     void sessionLimitRejectsExtraConnections() throws Exception {
         // 会话上限 1:第二个连接握手后应被拒。

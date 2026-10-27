@@ -37,12 +37,35 @@ public final class KeyCodec {
     private KeyCodec() {
     }
 
-    /** 表前缀:表 ID + 索引 ID,共 8 字节。 */
+    /** 表前缀:表 ID + 索引 ID,共 8 字节(主键索引 ID = 0)。 */
     public static byte[] prefix(long tableId) {
+        return prefix(tableId, INDEX_ID_PRIMARY);
+    }
+
+    /** 表前缀 + 任意索引 ID(SPEC-P4 §5.1):索引记录与主键记录共用同一套 key 空间。 */
+    public static byte[] prefix(long tableId, int indexId) {
         ByteArrayOutputStream out = new ByteArrayOutputStream(8);
         writeBe4(out, tableId);
-        writeBe4(out, INDEX_ID_PRIMARY);
+        writeBe4(out, indexId);
         return out.toByteArray();
+    }
+
+    /** 用户键里的索引 ID(0 = 主键)。 */
+    public static int indexId(byte[] userKey) {
+        if (userKey == null || userKey.length < 8) {
+            throw new StoreException("用户键长度非法: " + (userKey == null ? "null" : userKey.length));
+        }
+        return (int) readBe4(userKey, 4);
+    }
+
+    /** 9 个 0xFF:比任何版本段都大的后缀,用于表达"包含/晚于某用户键的全部版本"。 */
+    public static byte[] afterAllVersions() {
+        return AFTER_ALL_VERSIONS.clone();
+    }
+
+    /** 由已编码的主键值直接拼用户键(索引回表用,避免再编一次)。 */
+    public static byte[] rowKeyEncoded(long tableId, byte[] encodedPrimaryKey) {
+        return systemRowKey(tableId, encodedPrimaryKey);
     }
 
     /** 用户表的完整用户键(不含版本段):表前缀 + 主键保序编码。 */
@@ -171,6 +194,45 @@ public final class KeyCodec {
         }
     }
 
+    /**
+     * 从"已编码的主键值"(不带 8 字节表前缀)解出主键值。
+     *
+     * <p>唯一索引的 value 里存的就是主键编码(§5.2),冲突报错与回表都要用它。</p>
+     */
+    public static Object decodePrimaryKeyValue(DataType type, byte[] encoded) {
+        if (encoded == null) {
+            throw new StoreException("主键编码为空");
+        }
+        switch (type) {
+            case INT: {
+                require(encoded, 0, 4);
+                int raw = (int) readBe4(encoded, 0);
+                return raw ^ 0x80000000;
+            }
+            case BIGINT: {
+                require(encoded, 0, 8);
+                long raw = 0;
+                for (int i = 0; i < 8; i++) {
+                    raw = (raw << 8) | (encoded[i] & 0xFFL);
+                }
+                return raw ^ Long.MIN_VALUE;
+            }
+            case DATE: {
+                require(encoded, 0, 4);
+                return LocalDate.ofEpochDay(readBe4(encoded, 0));
+            }
+            case VARCHAR: {
+                int end = 0;
+                while (end < encoded.length && encoded[end] != 0) {
+                    end++;
+                }
+                return new String(encoded, 0, end, StandardCharsets.UTF_8);
+            }
+            default:
+                throw new StoreException("主键类型不支持: " + type.sqlName());
+        }
+    }
+
     /** 主键列值的保序编码:字节序 = 数值/字典序(规约 §5.2)。 */
     public static byte[] encodePrimaryKey(DataType type, Object value) {
         if (value == null) {
@@ -222,6 +284,21 @@ public final class KeyCodec {
         return new byte[]{(byte) (v >>> 8), (byte) v};
     }
 
+    /** 拼接多段字节。 */
+    public static byte[] concat(byte[]... parts) {
+        int len = 0;
+        for (byte[] part : parts) {
+            len += part.length;
+        }
+        byte[] out = new byte[len];
+        int pos = 0;
+        for (byte[] part : parts) {
+            System.arraycopy(part, 0, out, pos, part.length);
+            pos += part.length;
+        }
+        return out;
+    }
+
     public static void writeBe4(ByteArrayOutputStream out, long v) {
         out.writeBytes(be4(v));
     }
@@ -231,6 +308,11 @@ public final class KeyCodec {
                 | ((buf[pos + 1] & 0xFFL) << 16)
                 | ((buf[pos + 2] & 0xFFL) << 8)
                 | (buf[pos + 3] & 0xFFL);
+    }
+
+    /** 读大端 4 字节(公开给系统表加载校验用)。 */
+    public static long decodeBe4(byte[] buf, int pos) {
+        return readBe4(buf, pos);
     }
 
     private static void require(byte[] data, int pos, int len) {

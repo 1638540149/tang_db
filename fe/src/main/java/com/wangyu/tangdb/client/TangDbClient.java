@@ -19,7 +19,6 @@ import com.wangyu.tangdb.proto.ScanRequest;
 import com.wangyu.tangdb.proto.StatusCode;
 import com.wangyu.tangdb.proto.TangDbGrpc;
 import com.wangyu.tangdb.storage.ConflictException;
-import com.wangyu.tangdb.storage.KeyCodec;
 import com.wangyu.tangdb.storage.KeyValue;
 import com.wangyu.tangdb.storage.KvStore;
 import com.wangyu.tangdb.storage.StoreException;
@@ -240,8 +239,14 @@ public class TangDbClient implements AutoCloseable, KvStore, TransactionStore {
                             + (detail == null || detail.isBlank() ? "" : ": " + detail), "SCAN_FAILED");
                 }
                 for (com.wangyu.tangdb.proto.Kv kv : batch.getRowsList()) {
-                    rows.add(new KeyValue(KeyCodec.userKey(kv.getKey().toByteArray()),
-                            kv.getValue().toByteArray()));
+                    // P3 起 BE 的 Scan 直接返回**用户键**(版本段已在 BE 侧按快照消解),
+                    // 所以这里不能再剥 8 字节 —— 否则主键会被截短(P4 发现的回归)。
+                    byte[] userKey = kv.getKey().toByteArray();
+                    if (userKey.length < 8) {
+                        throw new ClientException("BE 扫描返回的 key 长度非法: " + userKey.length,
+                                "SCAN_FAILED");
+                    }
+                    rows.add(new KeyValue(userKey, kv.getValue().toByteArray()));
                 }
             }
         } catch (StatusRuntimeException e) {

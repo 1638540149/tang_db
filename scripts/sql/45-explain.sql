@@ -1,0 +1,15 @@
+-- P4 演示 ⑤:EXPLAIN 五种访问路径(SPEC-P4 场景 7 / FR-504 / FR-513 ~ FR-517)
+-- 期望:依次输出 PRIMARY POINT / PRIMARY RANGE / INDEX POINT / INDEX RANGE / TABLE SCAN。
+
+CREATE TABLE t5 (id INT PRIMARY KEY, category VARCHAR(32), note VARCHAR(32));
+INSERT INTO t5 VALUES (1, 'A', 'n1'), (2, 'B', 'n2');
+CREATE INDEX idx_category ON t5 (category);
+
+EXPLAIN SELECT * FROM t5 WHERE id = 1;
+EXPLAIN SELECT * FROM t5 WHERE id > 1;
+EXPLAIN SELECT * FROM t5 WHERE category = 'A';
+EXPLAIN SELECT * FROM t5 WHERE category > 'A';
+EXPLAIN SELECT * FROM t5 WHERE note = 'n1';
+
+-- EXPLAIN 不执行写入;INSERT / DDL / 事务语句明确报"不支持解释该语句"(FR-518)。
+EXPLAIN INSERT INTO t5 VALUES (3, 'C', 'n3');

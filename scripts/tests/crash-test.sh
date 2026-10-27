@@ -8,8 +8,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 BE_DIR="${ROOT_DIR}/be"
 FE_DIR="${ROOT_DIR}/fe"
-DATA_DIR="${ROOT_DIR}/data/BE"
 TEST_DIR="${ROOT_DIR}/tmp/crash-test"
+# 默认用独立目录 + 独立端口:崩溃测试会 rm -rf 数据目录,绝不碰日常的 data/BE 与 9100。
+DATA_DIR="${CRASH_TEST_DATA_DIR:-${TEST_DIR}/data}"
 KV_FILE="$(cygpath -w "${TEST_DIR}/kv.txt")"
 REPORT_FILE="${TEST_DIR}/report.txt"
 BE_EXE="${ROOT_DIR}/tmp/be.exe"
@@ -19,27 +20,35 @@ BE_EXE_WIN="$(cygpath -w "${BE_EXE}")"
 # 测试参数
 COUNT=${COUNT:-1000}
 SEED=${SEED:-42}
-BE_PORT=${BE_PORT:-9100}
+BE_PORT=${BE_PORT:-9110}
 
-# 配置文件(与手工启动时用的是同一套);下面的命令行参数会覆盖其中的取值
-BE_CONFIG="$(cygpath -w "${ROOT_DIR}/config/be.conf")"
+# BE 用本测试自己的配置(心跳指向 9199,不打扰日常 3406 的 fed);
+# FE_CONFIG 仅作客户端默认值,实际 be_port 由下面的 --be-port 覆盖。
+BE_CONFIG="$(cygpath -w "${TEST_DIR}/be.conf")"
 FE_CONFIG="$(cygpath -w "${ROOT_DIR}/config/fe.conf")"
 
 export PATH="/c/Program Files/Go/bin:$PATH"
 
 mkdir -p "${TEST_DIR}" "${ROOT_DIR}/tmp"
 rm -rf "${DATA_DIR}" "${TEST_DIR}"/*
+cat >"${TEST_DIR}/be.conf" <<EOF
+data_dir = $(cygpath -w "${DATA_DIR}")
+port = ${BE_PORT}
+memtable_size = 32KB
+fe_host = 127.0.0.1
+fe_port = 9199
+heartbeat_interval_seconds = 3
+max_txn_write_bytes = 64MB
+test_crash_point =
+EOF
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "${REPORT_FILE}"
 }
 
+# 只杀本脚本自己的 BE(tmp/be.exe),不碰其它会话 / 所有者日常的 be/be.exe。
 kill_be() {
-    local pids
-    pids=$(tasklist 2>/dev/null | grep -i "be.exe" | awk '{print $2}' || true)
-    for pid in ${pids}; do
-        taskkill /F /PID "${pid}" >/dev/null 2>&1 || true
-    done
+    powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='be.exe'\" | Where-Object { \$_.ExecutablePath -eq '${BE_EXE_WIN}' } | ForEach-Object { Stop-Process -Id \$_.ProcessId -Force -ErrorAction SilentlyContinue }" >/dev/null 2>&1 || true
     sleep 1
 }
 

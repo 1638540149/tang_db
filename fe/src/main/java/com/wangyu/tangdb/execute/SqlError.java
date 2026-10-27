@@ -32,6 +32,10 @@ public final class SqlError extends RuntimeException {
     // 未列进 §5.3 但语义明确的补充码。
     public static final int ER_TABLE_EXISTS_ERROR = 1050;  // 表已存在
     public static final int ER_DB_DROP_EXISTS = 1008;      // 库不存在(删除时)
+    public static final int ER_DUP_KEYNAME = 1061;         // 索引名重复(SPEC-P4 FR-458)
+    public static final int ER_CANT_DROP_FIELD_OR_KEY = 1091; // 索引不存在(SPEC-P4 FR-461)
+    public static final int ER_NO_SUCH_THREAD = 1094;      // KILL 的会话 id 不存在(SPEC-P4 FR-541)
+    public static final int ER_QUERY_INTERRUPTED = 1317;   // 会话已被 KILL
 
     private final int code;
     private final String sqlState;
@@ -89,6 +93,10 @@ public final class SqlError extends RuntimeException {
             case ER_ROW_IS_REFERENCED_2 -> "23000";
             case ER_TABLE_EXISTS_ERROR -> "42S01";
             case ER_DB_DROP_EXISTS -> "HY000";
+            case ER_DUP_KEYNAME -> "42000";
+            case ER_CANT_DROP_FIELD_OR_KEY -> "42000";
+            case ER_NO_SUCH_THREAD -> "HY000";
+            case ER_QUERY_INTERRUPTED -> "70100";
             default -> "HY000";
         };
     }

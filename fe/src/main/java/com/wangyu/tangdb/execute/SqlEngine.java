@@ -1,15 +1,14 @@
 package com.wangyu.tangdb.execute;
 
 import com.wangyu.tangdb.catalog.Catalog;
+import com.wangyu.tangdb.parser.Ast;
+import com.wangyu.tangdb.parser.ParseException;
 import com.wangyu.tangdb.parser.Parser;
 import com.wangyu.tangdb.proto.HeartbeatRequest;
 import com.wangyu.tangdb.server.BackendRegistry;
 import com.wangyu.tangdb.session.Session;
 import com.wangyu.tangdb.session.SessionManager;
-import com.wangyu.tangdb.storage.Column;
 import com.wangyu.tangdb.storage.KvStore;
-import com.wangyu.tangdb.storage.TableMeta;
-import com.wangyu.tangdb.storage.Values;
 
 import java.time.Instant;
 import java.time.ZoneId;
@@ -44,27 +43,67 @@ public final class SqlEngine {
     private final BackendRegistry backends;
     private final boolean heartbeatEnabled;
     private final String user;
+    private final int indexBackfillBatch;
 
     public SqlEngine(KvStore kv, Catalog catalog, SessionManager sessions,
                      BackendRegistry backends, boolean heartbeatEnabled, String user) {
+        this(kv, catalog, sessions, backends, heartbeatEnabled, user, 1000);
+    }
+
+    public SqlEngine(KvStore kv, Catalog catalog, SessionManager sessions,
+                     BackendRegistry backends, boolean heartbeatEnabled, String user,
+                     int indexBackfillBatch) {
         this.kv = kv;
         this.catalog = catalog;
         this.sessions = sessions;
         this.backends = backends;
         this.heartbeatEnabled = heartbeatEnabled;
         this.user = user == null ? "" : user;
+        this.indexBackfillBatch = indexBackfillBatch > 0 ? indexBackfillBatch : 1000;
     }
 
-    /** 执行一条 SQL(FR-447)。失败时抛异常,由调用方(协议层 / 测试)映射成错误。 */
+    /**
+     * 执行一条 SQL(FR-447)。失败时抛异常,由调用方(协议层 / 测试)映射成错误。
+     *
+     * <p>文本里若有多条语句(顶层分号分隔),按书写顺序全部执行,返回**最后一条**的结果
+     * ——需要逐条结果请用 {@link #executeBatch}。</p>
+     */
     public Result execute(Session session, String sql) {
+        List<Result> results = executeBatch(session, sql);
+        return results.get(results.size() - 1);
+    }
+
+    /**
+     * 执行一条 {@code COM_QUERY} 文本(FR-556 / FR-558 / K101):按顶层分号切成 N 条,
+     * 逐条走原有单条路径,返回结果列表(空语句忽略)。
+     *
+     * <p>某条失败立即抛出 —— 已执行语句的结果一并丢弃,调用方只回该条的错误包,
+     * 其后语句不再执行(FR-558)。切分属 SQL 词汇层,协议层不参与(K101)。</p>
+     */
+    public List<Result> executeBatch(Session session, String sql) {
         if (session != null) {
+            if (session.killed()) {
+                throw new SqlError(SqlError.ER_QUERY_INTERRUPTED, "70100",
+                        "会话已被 KILL,请重新连接");
+            }
             session.touch();
         }
-        String statement = stripSemicolon(sql == null ? "" : sql.trim());
-        statement = stripLeadingComments(statement);
-        if (statement.isEmpty()) {
-            return new Result.Message("OK");
+        List<Result> results = new ArrayList<>();
+        for (String segment : splitStatements(sql == null ? "" : sql)) {
+            String statement = stripLeadingComments(stripSemicolon(segment.trim()));
+            if (statement.isEmpty()) {
+                continue; // 空语句(连续 / 尾随分号、只有注释)忽略,不报 1064(FR-556)
+            }
+            results.add(executeOne(session, statement));
         }
+        if (results.isEmpty()) {
+            return List.of(new Result.Message("OK"));
+        }
+        return results;
+    }
+
+    /** 执行一条已经切好、去过头注释的语句(原单条路径,兼容层 + Parser + Executor 不改)。 */
+    private Result executeOne(Session session, String statement) {
         String upper = statement.toUpperCase(Locale.ROOT);
 
         Result compat = handleCompat(session, statement, upper);
@@ -73,7 +112,111 @@ public final class SqlEngine {
         }
 
         Executor executor = executor(session);
-        return executor.execute(Parser.parse(statement));
+        try {
+            return executor.execute(Parser.parse(statement));
+        } catch (ParseException e) {
+            if (upper.startsWith("SHOW ")) {
+                throw new SqlError(SqlError.ER_NOT_SUPPORTED_YET, "42000",
+                        "不支持的 SHOW 语句:" + e.getMessage());
+            }
+            if (upper.startsWith("EXPLAIN ")) {
+                throw new SqlError(SqlError.ER_NOT_SUPPORTED_YET, "42000",
+                        "不支持解释该语句(EXPLAIN 只支持 SELECT / UPDATE / DELETE)");
+            }
+            throw e;
+        }
+    }
+
+    /**
+     * 按**顶层分号**切分多条语句(FR-556)。只做词法级扫描,不判断 SQL 语义:
+     * 单引号 / 双引号 / 反引号内的分号不切,{@code --} 与 {@code #} 行注释、块注释里的分号
+     * 也不切;成对引号(如 {@code ''})与反斜杠转义按词法跳过。
+     *
+     * <p>返回的片段保留原文(含注释),由调用方逐条走原执行路径;连续分号与尾随分号
+     * 产生的空片段由调用方忽略。</p>
+     */
+    static List<String> splitStatements(String sql) {
+        List<String> statements = new ArrayList<>();
+        StringBuilder buf = new StringBuilder();
+        int n = sql.length();
+        int i = 0;
+        while (i < n) {
+            char c = sql.charAt(i);
+            if (c == '\'' || c == '"') {
+                i = copyQuoted(sql, i, c, buf);
+                continue;
+            }
+            if (c == '`') {
+                i = copyQuoted(sql, i, c, buf);
+                continue;
+            }
+            if (c == '-' && i + 1 < n && sql.charAt(i + 1) == '-') {
+                int eol = sql.indexOf('\n', i);
+                if (eol < 0) {
+                    eol = n;
+                }
+                buf.append(sql, i, eol);
+                i = eol;
+                continue;
+            }
+            if (c == '#') {
+                int eol = sql.indexOf('\n', i);
+                if (eol < 0) {
+                    eol = n;
+                }
+                buf.append(sql, i, eol);
+                i = eol;
+                continue;
+            }
+            if (c == '/' && i + 1 < n && sql.charAt(i + 1) == '*') {
+                int end = sql.indexOf("*/", i + 2);
+                int stop = end < 0 ? n : end + 2;
+                buf.append(sql, i, stop);
+                i = stop;
+                continue;
+            }
+            if (c == ';') {
+                statements.add(buf.toString());
+                buf.setLength(0);
+                i++;
+                continue;
+            }
+            buf.append(c);
+            i++;
+        }
+        statements.add(buf.toString());
+        return statements;
+    }
+
+    /**
+     * 复制一段引号 / 反引号包裹的内容,返回下一个未处理位置。
+     * 成对引号(如 {@code ''})与反斜杠转义不结束当前片段。
+     */
+    private static int copyQuoted(String sql, int start, char quote, StringBuilder buf) {
+        int n = sql.length();
+        int i = start;
+        buf.append(quote);
+        i++;
+        while (i < n) {
+            char c = sql.charAt(i);
+            buf.append(c);
+            if (c == '\\' && i + 1 < n) {
+                buf.append(sql.charAt(i + 1));
+                i += 2;
+                continue;
+            }
+            if (c == quote) {
+                if (i + 1 < n && sql.charAt(i + 1) == quote) {
+                    buf.append(quote);
+                    i += 2;
+                    continue;
+                }
+                i++;
+                break;
+            }
+            i++;
+        }
+        return i;
     }
 
     /** 设置会话当前库(COM_INIT_DB / 握手 database),库不存在抛 1049(FR-436 / FR-446)。 */
@@ -82,7 +225,10 @@ public final class SqlEngine {
     }
 
     private Executor executor(Session session) {
-        return session == null ? new Executor(kv, catalog) : session.executor();
+        if (session == null) {
+            return new Executor(kv, catalog).attachServer(sessions, user, 0, indexBackfillBatch);
+        }
+        return session.executor().attachServer(sessions, user, session.id(), indexBackfillBatch);
     }
 
     // ------------------------------------------------------------ 连接期兼容语句(§5.5)
@@ -100,34 +246,16 @@ public final class SqlEngine {
             return atVars;
         }
 
-        // SHOW VARIABLES / SHOW STATUS / SHOW WARNINGS / SHOW COLLATION / SHOW CHARACTER SET
-        if (upper.startsWith("SHOW VARIABLES")) {
-            return emptyTwoColumn("Variable_name", "Value");
-        }
-        if (upper.startsWith("SHOW STATUS")) {
-            return emptyTwoColumn("Variable_name", "Value");
-        }
-        if (upper.startsWith("SHOW WARNINGS")) {
-            return emptyResult(List.of("Level", "Code", "Message"));
-        }
-        if (upper.startsWith("SHOW COLLATION")) {
-            return emptyResult(List.of("Collation", "Charset", "Id", "Default", "Compiled", "Sortlen"));
-        }
-        if (upper.startsWith("SHOW CHARACTER SET")) {
-            return emptyResult(List.of("Charset", "Description", "Default collation", "Maxlen"));
-        }
+        // SHOW SESSIONS / SHOW BACKENDS 是 tang_db 自有诊断语句,不进公共 SQL 语法。
         if (upper.startsWith("SHOW SESSIONS")) {
             return showSessions();
-        }
-        if (upper.startsWith("SHOW PROCESSLIST")) {
-            return showProcesslist();
         }
         if (upper.startsWith("SHOW BACKENDS")) {
             return showBackends();
         }
 
-        // information_schema 三张最小只读视图(§12 I9);其余表名报"不支持"。
-        if (upper.contains("INFORMATION_SCHEMA.")) {
+        // information_schema 虚拟表:走 Parser + MetaCommands(K92 / K94 / K98)。
+        if (upper.contains("INFORMATION_SCHEMA")) {
             return informationSchema(session, statement, upper);
         }
         return null;
@@ -293,101 +421,34 @@ public final class SqlEngine {
 
     // ------------------------------------------------------------ information_schema
 
+    /** information_schema 虚拟表查询(FR-537 ~ FR-540 / K98)。 */
     private Result informationSchema(Session session, String statement, String upper) {
-        int idx = upper.indexOf("INFORMATION_SCHEMA.");
-        String after = upper.substring(idx + "INFORMATION_SCHEMA.".length()).trim();
-        // 取表名(可能是 `tables` 或 tables)
-        String tableName = extractIdentifier(after);
-        if (tableName == null) {
-            throw new SqlError(SqlError.ER_NOT_SUPPORTED_YET, "42000",
-                    "不支持的 information_schema 查询");
+        String compact = upper.replaceAll("\s+", " ");
+        if (compact.contains(" JOIN ") || compact.contains(" UNION ")
+                || compact.contains(" GROUP BY ") || compact.contains(" DISTINCT ")
+                || compact.contains(" HAVING ")) {
+            throw MetaCommands.notSupported(
+                    "information_schema 上不支持 JOIN / 子查询 / 多列聚合(归 P5)");
         }
-        switch (tableName) {
-            case "SCHEMATA" -> {
-                return schemataView();
+        Ast.Statement ast;
+        try {
+            ast = Parser.parse(statement);
+        } catch (ParseException e) {
+            // LIMIT 取值 / 语法错统一报 1064(FR-549 / 边界 31),不能被误映射成 1235。
+            if (e.getMessage() != null && e.getMessage().contains("LIMIT")) {
+                throw e;
             }
-            case "TABLES" -> {
-                return tablesView();
-            }
-            case "COLUMNS" -> {
-                return columnsView();
-            }
-            default -> throw new SqlError(SqlError.ER_NOT_SUPPORTED_YET, "42000",
-                    "不支持 information_schema." + tableName.toLowerCase(Locale.ROOT));
+            throw MetaCommands.notSupported(
+                    "information_schema 上不支持该查询形态(只支持单表投影 / WHERE / LIMIT"
+                            + " / 多列 ORDER BY / COUNT(*) )");
         }
-    }
-
-    private String extractIdentifier(String text) {
-        String t = text.trim();
-        if (t.isEmpty()) {
-            return null;
+        if (ast instanceof Ast.Select select && select.database() != null
+                && select.database().equalsIgnoreCase("information_schema")) {
+            return new MetaCommands(catalog, executor(session), sessions, user)
+                    .informationSchema(select);
         }
-        if (t.startsWith("`")) {
-            int end = t.indexOf('`', 1);
-            return end < 0 ? null : t.substring(1, end).toUpperCase(Locale.ROOT);
-        }
-        int end = 0;
-        while (end < t.length() && Character.isLetterOrDigit(t.charAt(end))) {
-            end++;
-        }
-        if (end == 0) {
-            return null;
-        }
-        return t.substring(0, end).toUpperCase(Locale.ROOT);
-    }
-
-    private Result schemataView() {
-        List<Object[]> rows = new ArrayList<>();
-        for (String db : catalog.databases()) {
-            rows.add(new Object[]{"def", db, "utf8mb4", "utf8mb4_general_ci", null});
-        }
-        return new Result.Table(List.of("CATALOG_NAME", "SCHEMA_NAME", "DEFAULT_CHARACTER_SET_NAME",
-                "DEFAULT_COLLATION_NAME", "SQL_PATH"), rows);
-    }
-
-    private Result tablesView() {
-        List<Object[]> rows = new ArrayList<>();
-        for (String db : catalog.databases()) {
-            for (TableMeta table : catalog.tables(db)) {
-                rows.add(new Object[]{"def", db, table.name(), "BASE TABLE", "InnoDB", 0L});
-            }
-        }
-        return new Result.Table(List.of("TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME",
-                "TABLE_TYPE", "ENGINE", "TABLE_ROWS"), rows);
-    }
-
-    private Result columnsView() {
-        List<Object[]> rows = new ArrayList<>();
-        for (String db : catalog.databases()) {
-            for (TableMeta table : catalog.tables(db)) {
-                for (Column column : table.columns()) {
-                    rows.add(new Object[]{
-                            "def", db, table.name(), column.name(), column.ordinal() + 1,
-                            null, column.nullable() ? "YES" : "NO",
-                            mysqlTypeName(column), column.typeName(), maxLen(column)
-                    });
-                }
-            }
-        }
-        return new Result.Table(List.of("TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME",
-                "COLUMN_NAME", "ORDINAL_POSITION", "COLUMN_DEFAULT", "IS_NULLABLE",
-                "DATA_TYPE", "COLUMN_TYPE", "CHARACTER_MAXIMUM_LENGTH"), rows);
-    }
-
-    private static String mysqlTypeName(Column column) {
-        return switch (column.type()) {
-            case INT -> "int";
-            case BIGINT -> "bigint";
-            case DOUBLE -> "double";
-            case VARCHAR -> "varchar";
-            case DATE -> "date";
-            case BOOLEAN -> "tinyint";
-        };
-    }
-
-    private static Object maxLen(Column column) {
-        return column.type() == com.wangyu.tangdb.storage.DataType.VARCHAR
-                ? column.length() : null;
+        throw MetaCommands.notSupported(
+                "information_schema 上只支持单表投影 / WHERE / LIMIT / 多列 ORDER BY / COUNT(*)");
     }
 
     // ------------------------------------------------------------ 工具

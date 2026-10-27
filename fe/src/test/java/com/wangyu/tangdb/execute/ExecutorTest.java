@@ -12,6 +12,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.time.LocalDate;
+import java.util.ArrayList;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -38,6 +39,14 @@ class ExecutorTest {
 
     private Result.Message dml(String sql) {
         return (Result.Message) executor.execute(Parser.parse(sql));
+    }
+
+    private static List<Long> ids(Result.Table table) {
+        List<Long> out = new ArrayList<>(table.rows().size());
+        for (Object[] row : table.rows()) {
+            out.add(((Number) row[0]).longValue());
+        }
+        return out;
     }
 
     @Test
@@ -127,6 +136,52 @@ class ExecutorTest {
         assertEquals(0, select("SELECT * FROM users WHERE age > 5 AND id = 4").rows().size());
         Result.Table nulls = select("SELECT age FROM users WHERE id = 4");
         assertNull(nulls.rows().get(0)[0]);
+    }
+
+    @Test
+    void limitOffsetPaginationSemantics() {
+        dml("INSERT INTO users (id) VALUES (1), (2), (3), (4), (5), (6)");
+
+        // 三种写法在同一查询上结果一致(FR-549 / FR-550)
+        Result.Table plain = select("SELECT id FROM users LIMIT 3");
+        assertEquals(ids(plain), ids(select("SELECT id FROM users LIMIT 0, 3")));
+        assertEquals(ids(plain), ids(select("SELECT id FROM users LIMIT 3 OFFSET 0")));
+
+        // 先过滤 → 再跳过 offset → 再截断 count(FR-551)
+        assertEquals(List.of(3L, 4L, 5L), ids(select("SELECT id FROM users LIMIT 2, 3")));
+        assertEquals(List.of(4L, 5L), ids(select("SELECT id FROM users LIMIT 2 OFFSET 3")));
+        assertEquals(List.of(4L, 5L), ids(select("SELECT id FROM users WHERE id > 2 LIMIT 1, 2")));
+
+        // offset 越界 / LIMIT 0,0 → 空集,不报错(边界 32/33)
+        assertEquals(0, select("SELECT id FROM users LIMIT 100000, 1000").rows().size());
+        assertEquals(0, select("SELECT id FROM users LIMIT 0, 0").rows().size());
+        assertEquals(6, select("SELECT id FROM users").rows().size());
+    }
+
+    @Test
+    void limitOffsetIsIdenticalOnIndexPathAndTableScan() {
+        executor.execute(Parser.parse("CREATE TABLE pg (id INT PRIMARY KEY, cat VARCHAR(8))"));
+        executor.execute(Parser.parse("CREATE INDEX idx_pg_cat ON pg (cat)"));
+        dml("INSERT INTO pg VALUES (1, 'a'), (2, 'b'), (3, 'a'), (4, 'a'), (5, 'b'), (6, 'a'), (7, 'a')");
+
+        Result.Table viaIndex = select("SELECT id FROM pg WHERE cat = 'a' LIMIT 1, 2");
+        Result.Table viaScan = select(
+                "SELECT id FROM pg WHERE cat = 'a' AND id >= -2147483648 LIMIT 1, 2");
+        assertEquals(List.of(3L, 4L), ids(viaIndex));
+        assertEquals(ids(viaScan), ids(viaIndex), "索引路径与全表扫路径的分页结果必须一致(FR-552)");
+    }
+
+    @Test
+    void updateAndDeleteWithLimitAreExplicitlyRejected1235() {
+        dml("INSERT INTO users (id, name) VALUES (1, 'a'), (2, 'b')");
+        for (String sql : List.of(
+                "UPDATE users SET name = 'x' LIMIT 1",
+                "DELETE FROM users LIMIT 1")) {
+            SqlError e = assertThrows(SqlError.class, () -> executor.execute(Parser.parse(sql)), sql);
+            assertEquals(SqlError.ER_NOT_SUPPORTED_YET, e.code(), sql);
+            assertTrue(e.getMessage().contains("LIMIT"), e.getMessage());
+        }
+        assertEquals(2, select("SELECT * FROM users").rows().size(), "拒绝后不得产生任何写入");
     }
 
     @Test

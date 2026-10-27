@@ -34,6 +34,11 @@ pid_alive() {
     ps -W 2>/dev/null | awk -v p="$1" '$4==p {found=1} END{exit !found}'
 }
 
+# 兜底:pid 文件里的 WINPID 可能失效(进程被重启/映射错),按 exe 路径反查真正的 be.exe
+find_be_winpid() {
+    ps -W 2>/dev/null | awk -v exe="$(basename "${BE_EXE}")" '$NF ~ exe {print $4}' | head -1
+}
+
 msys_to_winpid() {
     ps -W 2>/dev/null | awk -v p="$1" '$1==p {print $4; exit}'
 }
@@ -46,9 +51,17 @@ stop_be() {
     local pid
     pid="$(cat "${PID_FILE}" 2>/dev/null || true)"
     if [ -z "${pid}" ] || ! pid_alive "${pid}"; then
-        echo "BE 未在运行(PID ${pid:-?} 已不存在),清理 PID 文件"
-        rm -f "${PID_FILE}"
-        return 0
+        # PID 文件失效时按 exe 名兜底(实测踩过:pid 记录与实际进程不一致)
+        local fallback
+        fallback="$(find_be_winpid)"
+        if [ -n "${fallback}" ]; then
+            echo "PID 文件记录为 ${pid:-空},但发现仍在运行的 be.exe(WINPID ${fallback}),按它停止"
+            pid="${fallback}"
+        else
+            echo "BE 未在运行(PID ${pid:-?} 已不存在),清理 PID 文件"
+            rm -f "${PID_FILE}"
+            return 0
+        fi
     fi
     echo "=== 停止 BE (PID ${pid}) ==="
     taskkill /PID "${pid}" >/dev/null 2>&1 || true

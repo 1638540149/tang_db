@@ -567,9 +567,183 @@ cd tools/jdbc-smoke && mvn.cmd compile
 一键验收:`bash scripts/tests/p35-test.sh`(SC-301 ~ SC-318,报告在 `tmp/p35-test/report.txt`),
 它会顺带跑 `p2-test.sh` 与 `p3-test.sh` 做回归。
 
+### P4 索引:二级索引 / 唯一索引 / 索引选择 / EXPLAIN + 图形客户端自省(P4)
+
+P4 把“索引”做成**同一套有序 key 空间里的另一段前缀**,BE 一行代码没改(`proto/` 与 `be/` 零改动)。
+
+**① 建索引与查询(实际运行输出节选)**
+
+```sql
+tangdb> CREATE TABLE orders (id INT PRIMARY KEY, category VARCHAR(32), amount INT);
+OK, 表 orders 已创建(表 ID 64)
+tangdb> INSERT INTO orders VALUES (1,'数码',100),(2,'数码',200),(3,'图书',300),(4,'图书',400);
+OK, 4 rows affected
+tangdb> CREATE INDEX idx_category ON orders (category);
+OK, 索引 idx_category 已创建(索引 ID 1,状态 ACTIVE)
+
+tangdb> EXPLAIN SELECT * FROM orders WHERE category = '数码';
++----------------------------------------------------------------------------+
+| plan                                                                       |
++----------------------------------------------------------------------------+
+| 访问路径: INDEX POINT                                                      |
+| 表: orders                                                                 |
+| 索引: idx_category(列 category,索引 ID 1)                                  |
+| key 范围: [0000004000000001E695B0E7A0810000, …(25B))                       |
+| 残余过滤: category = '数码'(由 FE 按谓词执行)                              |
+| 扫描方式: 索引区间扫描 + 逐行回表(二次校验)                               |
++----------------------------------------------------------------------------+
+
+tangdb> SELECT * FROM orders WHERE category = '数码';
++----+----------+--------+
+| id | category | amount |
++----+----------+--------+
+| 1  | 数码     | 100    |
+| 2  | 数码     | 200    |
++----+----------+--------+
+```
+
+- 语法:`CREATE INDEX <idx> ON <tbl>(<col>)`、`CREATE UNIQUE INDEX <idx> ON <tbl>(<col>)`、
+  `DROP INDEX <idx> ON <tbl>`、建表内联 `UNIQUE(<col>)` / `INDEX(<col>)`(等价于建表 + 建索引,同一批记录)
+- 索引 ID **每表独立、从 1 起、只增不复用**;索引名表内唯一;单列索引(复合索引归 P6)
+- 非空表建索引会**分批回填**(`index_backfill_batch`,默认 1000 行/批),进度存 `sys_indexes.build_cursor`;
+  中途强杀后索引保持 `BUILDING`,重跑同一条 `CREATE INDEX` 从游标续做;`SHOW INDEXES` 能看到状态与游标
+- `BUILDING` / `DROPPED` 索引**不参与查询**,查询自动退化全表扫且结果正确
+
+**② 唯一索引(错误码 1062)**
+
+```sql
+tangdb> CREATE TABLE codes (id INT PRIMARY KEY, code VARCHAR(16));
+tangdb> CREATE UNIQUE INDEX uk_code ON codes (code);
+tangdb> INSERT INTO codes VALUES (1, 'A001');
+OK, 1 row affected
+tangdb> INSERT INTO codes VALUES (2, 'A001');
+错误：唯一索引 uk_code 冲突(表 codes,列 code = 'A001',已有主键 1)
+```
+
+并发插入同一唯一值:恰好一个成功,另一个报 `1062`(由 P3 写写冲突翻译而来,不是可重试的 `1213`);
+唯一索引的 key **不含主键**(`K76`),唯一性完全复用 P3 已验证的机制。
+索引列 `NULL` 的行**不入索引**(`K79`),因此允许多行 `NULL`。
+
+**③ 索引选择(RBO)与 EXPLAIN**
+
+固定优先级(`K82`):**主键等值 > 主键范围 > 索引等值 > 索引范围 > 全表扫**;同类多个索引取索引 ID 最小者。
+`OR` 不做索引合并(退化全表扫,结果仍正确)。
+
+`EXPLAIN <SELECT|UPDATE|DELETE>` 输出**单列** `plan`,与执行**共用同一个计划构造入口**(不存在“说一套走一套”):
+
+```sql
+tangdb> EXPLAIN SELECT * FROM t5 WHERE id = 1;        -- PRIMARY POINT
+tangdb> EXPLAIN SELECT * FROM t5 WHERE id > 1;        -- PRIMARY RANGE
+tangdb> EXPLAIN SELECT * FROM t5 WHERE category = 'A'; -- INDEX POINT
+tangdb> EXPLAIN SELECT * FROM t5 WHERE category > 'A'; -- INDEX RANGE
+tangdb> EXPLAIN SELECT * FROM t5 WHERE note = 'n1';    -- TABLE SCAN
+```
+
+索引扫描会回表并做**二次校验**(行的索引列值必须等于索引项里的值,否则跳过),因此 `UPDATE` 改索引列后
+旧值不会查出“幽灵行”;每次索引扫描在 `fed` 日志里留下
+`索引扫描 表=… 索引=… 索引项=N 回表=M 命中=K`(FR-512)。
+
+**④ 图形客户端(Navicat / DataGrip)元数据自省**
+
+`fed` 仍监听同一个 MySQL 协议端口,连接方式与 P3.5 完全一致:
+
+```
+jdbc:mysql://127.0.0.1:3406/default?useSSL=false&allowPublicKeyRetrieval=true&useServerPrepStmts=false&characterEncoding=utf8&serverTimezone=Asia/Shanghai
+```
+
+已支持的元数据语句(每条都有合理响应,不会是 1064):
+
+- `SHOW [FULL] TABLES [FROM db] [LIKE …] [WHERE …]`(FULL 版带 `Table_type` = `BASE TABLE`)
+- `SHOW TABLE STATUS [FROM db] [LIKE …]`、`SHOW CREATE TABLE <t>`、`SHOW CREATE DATABASE <db>`
+- `SHOW [FULL] COLUMNS FROM <t> [FROM db] [LIKE …]`、`SHOW INDEX|KEYS FROM <t>`、`SHOW INDEXES [FROM <t>]`
+- `SHOW ENGINES`、`SHOW COLLATION`、`SHOW CHARACTER SET`、`SHOW GRANTS`、`SHOW WARNINGS` / `SHOW ERRORS`
+- `SHOW TRIGGERS` / `SHOW EVENTS` / `SHOW ROUTINES`(列定义正确的空集)
+- `SHOW VARIABLES [LIKE]` / `SHOW STATUS [LIKE]`(常用变量真值)、`SHOW [FULL] PROCESSLIST`
+- `information_schema` **17 张可查询虚拟表**:`SCHEMATA` / `TABLES` / `COLUMNS` / `STATISTICS` /
+  `KEY_COLUMN_USAGE` / `TABLE_CONSTRAINTS` / `REFERENTIAL_CONSTRAINTS` / `VIEWS` / `ROUTINES` /
+  `TRIGGERS` / `EVENTS` / `PROCESSLIST` / `CHARACTER_SETS` / `COLLATIONS` / `ENGINES` / `PARTITIONS` /
+  `USER_PRIVILEGES`。支持**投影裁剪 + WHERE + LIMIT(含 offset)+ 多列 ORDER BY + COUNT(*)**
+  (仅虚拟表,`K98` / `K99`);有数据的给真实数据(索引元数据),没数据的给**列定义正确的空集**
+- `SHOW CREATE TABLE` 的输出是 **round-trip 可执行**的:原样喂回本项目 parser 能建出等价表(单测 + 脚本各一处)
+- `SELECT ... LIMIT <offset>, <row_count>` / `LIMIT <row_count> OFFSET <offset>`:先过滤 → 跳 offset →
+  截断 count,索引路径与全表扫结果一致(`K100`);`UPDATE` / `DELETE` 带 `LIMIT` 明确报 `1235`
+- `KILL [CONNECTION] <id>`:回滚目标会话未提交事务、注销会话并落日志;被 KILL 的会话在下一条语句上
+  返回 `1317`。**限制**:`protocol/mysql` 本期只读不改,所以不会主动关闭对端 TCP socket ——
+  对端下一条语句即失败,但 socket 由对端/协议层最终回收
+
+`SHOW ENGINES` / `information_schema.ENGINES` 的 `Engine` 固定报 **`InnoDB`**(`Support = DEFAULT`)。
+这是**客户端兼容**:图形客户端按引擎名分支(InnoDB 走事务/DDL 面板),真实引擎仍是自研 LSM(`K93`),
+本 README 已明说,不是欺骗。`Cardinality` 本期恒 `NULL`(没有统计信息,不编数字,P6 才有)。
+
+明确不支持(会返回明确错误,不会返回半对结果):
+
+- `ALTER TABLE` 任何形态(Navicat“设计表”改结构)—— **P4 之后**;建表 / 删表 / 改数据 / 加索引可用
+- 用户表上的 `ORDER BY` / `COUNT(*)` / 聚合 / `GROUP BY` / `JOIN` / 子查询 / `DISTINCT` —— **P5**
+  (分页 `LIMIT <off>,<n>` / `LIMIT <n> OFFSET <off>` 已支持,见上文)
+- `information_schema` 上的 `JOIN` / 子查询 / 多列聚合 —— **P5**(多列 `ORDER BY` 与 `COUNT(*)` 例外)
+- `performance_schema`、视图/存储过程/触发器/事件的真实能力、TLS、权限体系(P13)、服务端预编译(`1295`)
+
+**⑤ 升级说明:P4 不需要清空数据目录。** `MANIFEST.format_version` 不变、key 布局不变;老目录
+(P3.5 产生、没有 `sys_indexes`)启动时**幂等创建** `sys_indexes`,老表一律“无索引”、数据一条不丢,
+之后可正常建索引。
+
+**⑥ 新增配置(`config/fe.conf`)**
+
+| 项 | 默认 | 说明 |
+|---|---|---|
+| `index_backfill_batch` | `1000` | `CREATE INDEX` 回填时每批行数(K84);批越大越快,但单批写入量受 `max_txn_write_bytes` 限制 |
+
+**⑦ 一键验收与演示脚本**
+
+```bash
+bash scripts/tests/p4-test.sh       # SC-319 ~ SC-343,报告 tmp/p4-test/report.txt
+```
+
+脚本覆盖:索引读写闭环与逐行对拍、改索引列、唯一冲突(单会话 + 并发)、两种崩溃注入点、
+回填中途强杀续做、EXPLAIN 五种路径与实际扫描交叉验证、DROP INDEX、老目录升级、事务可见性、
+5000 次随机写改删后的 **INV-10 对账(差异计数 = 0)**、SHOW 家族 / 17 张虚拟表 / round-trip、
+未支持语句降级、分页三种写法一致 / 越界空集 / DML `LIMIT` 拒绝、虚拟表多列排序,
+以及 `p2` / `p3` / `p35` 回归。演示 SQL 在 `scripts/sql/41~46-*.sql`。
+
+**⑧ 性能口径(本机实测,同报条件)**
+
+条件:Windows 11 开发机,BE 9900 / fed 9906,gRPC 本地回环,数据目录在本地盘,
+单条 INSERT 自动提交(每次一次 WAL fsync);查询为只读,CLI/JVM 启动计入耗时。
+
+| 查询(2 万行,int 主键,索引列 k 唯一取值) | 3 次耗时 | 扫描行数 |
+|---|---|---|
+| 索引路径 `WHERE k = 12345` | 420 / 438 / 445 ms(最小 420) | 索引项 1 + 回表 1 |
+| 对照 `WHERE k = 12345 AND id >= -2147483648`(主键范围扫描) | 581 / 474 / 512 ms(最小 474) | 20000 |
+
+| 单行 INSERT(n=300) | avg | p50 | p99 |
+|---|---|---|---|
+| 无索引 | 10.29 ms | 9.94 ms | 18.55 ms |
+| 1 个索引 | 14.60 ms | 13.25 ms | 20.96 ms |
+| 3 个索引 | 19.91 ms | 18.50 ms | 36.28 ms |
+
+> 这些数字同机同数据、只用于本期基线(P4 的 RBO 没有代价模型,`K82` 明确承认可能选出比全表扫更慢的路);
+> P6 拿到统计信息后用 CBO 替换。INSERT 的增量主要来自索引项与行记录同批写入的额外字节与 fsync 时间。
+
 ## 状态
 
-**P1(基座)、P2(表与 SQL)、P2.1(SQL 兼容性补齐)、P3(事务与 MVCC)、P3.5(常驻 FE + 多库 + MySQL 协议)均已实现。**
+**P1(基座)、P2(表与 SQL)、P2.1(SQL 兼容性补齐)、P3(事务与 MVCC)、P3.5(常驻 FE + 多库 + MySQL 协议)、P4(索引)均已实现。**
+
+P4 带来什么:
+
+- **二级索引**:非主键列上的等值 / 范围查询走索引 + 回表(同一快照 + 二次校验),索引路径与全表扫结果逐行一致
+- **唯一索引**:同一列值只能一行,冲突在提交时挡住,错误码 `1062`;并发同一唯一值由 P3 写写冲突翻译,
+  不引入任何新事务协议(唯一 key 不含主键)
+- **索引选择(RBO)与 EXPLAIN**:主键等值 > 主键范围 > 索引等值 > 索引范围 > 全表扫;
+  `EXPLAIN` 与执行共用同一计划入口,输出访问路径 / 索引名 / key 范围十六进制 / 残余过滤
+- **分批回填 + 断点续做**:非空表建索引按 `index_backfill_batch` 分批提交,游标持久化在 `sys_indexes`;
+  回填中断后保持 `BUILDING`,重跑同一条 `CREATE INDEX` 续做,期间查询退化全表扫
+- **索引与数据同批同版本**:行记录 + 所有索引记录一条批记录、同一 `commit_ts`;
+  崩溃后主键路径与索引路径同生同灭(INV-10 对账差异 0)
+- **图形客户端元数据自省**:`SHOW` 家族补齐 + `information_schema` 17 张可查询虚拟表
+  (投影 / WHERE / LIMIT / 多列 ORDER BY / COUNT(*)),`SHOW CREATE TABLE` round-trip 可执行
+- **图形客户端分页/排序补齐**:`LIMIT <offset>,<row_count>` / `LIMIT <row_count> OFFSET <offset>`,
+  虚拟表多列 `ORDER BY`(每列可 `ASC`/`DESC`;用户表仍归 P5) —— `K99` / `K100`
+- **BE / `proto/` 零改动**:索引就是 FE 编码的另一段有序 key,共享 BE 的 WAL / MVCC / 恢复机制
 
 P3.5 带来什么:
 
@@ -581,6 +755,9 @@ P3.5 带来什么:
 
 核验口径(真实执行,不看实现方自述):
 
+- `bash scripts/tests/p4-test.sh` —— SC-319 ~ SC-343(索引 DDL/维护/读路径/EXPLAIN/回填续做/崩溃/
+  5000 次随机对账/SHOW 家族/17 张虚拟表/round-trip/分页与多列排序/依赖红线 + P2/P3/P3.5 回归),
+  当前 **PASS=118 FAIL=0**
 - `bash scripts/tests/p35-test.sh` —— SC-301 ~ SC-318(常驻/多会话、跨会话 DDL、多库、同名表、库级 DDL、老目录升级、表 ID、协议正确性、依赖红线 + P2/P3 回归)
 - `bash scripts/tests/p3-test.sh` —— SC-201 ~ SC-211(事务语义、并发写写冲突、4 个崩溃场景、序号不回退、快照稳定、DDL 原子性、P2/P1 回归、依赖红线)
 - `bash scripts/tests/p2-test.sh` —— 11 个场景 + P2.1 断言组
@@ -625,9 +802,28 @@ P3 带来什么:
 - **崩溃恢复**:载入 segment + 重放 WAL,尾部坏记录物理截断;数据目录格式版本守卫
 - **FE**:gRPC 客户端封装 + SQL 控制台 + catalog(元数据存在 BE 系统表)
 - **事务与 MVCC**:commit_ts、快照读与版本分组、原子批写、写写冲突、序号持久化
-- **一键验收**:`p3-test.sh` / `p2-test.sh` / `crash-test.sh`
+- **索引(SPEC-P4)**:`sys_indexes` 元数据、索引 key 编码(K76/K77)、写路径维护、唯一约束(1062)、
+  RBO 索引选择、`EXPLAIN`、分批回填与游标续做、`SHOW` 家族与 `information_schema` 17 张虚拟表
+- **一键验收**:`p4-test.sh` / `p35-test.sh` / `p3-test.sh` / `p2-test.sh` / `crash-test.sh`
 
-下一步:**P4 · 索引** —— 主键/二级/唯一索引与索引选择;版本回收与 compaction 归 P5。
+P4 施工时发现并修复的 P3.5 遗留 bug(诚实记录):
+
+- **范围扫描主键被截短**:BE 的 `Scan` 自 P3 起就返回**用户键**(版本段已在 BE 按快照消解),但 FE 的
+  `TangDbClient.scanRaw` 又剥了 8 字节,导致真实 BE 上 `SELECT` 范围扫描拿到的主键只剩前 4 字节
+  (单元测试用内存 store 所以没暴露)。P4 开工基线跑 `p2-test.sh` 即失败(7 条);已改为直接使用 BE 返回的用户键,
+  `p2`(52)/`p3`(62)/`p35`(46)恢复全绿。
+
+P4 已知限制(不影响本期验收,已记录):
+
+- `KILL` 会回滚并注销目标会话、落日志,被 KILL 的会话下一条语句返回 `1317`;但 `protocol/mysql` 本期只读不改,
+  不会主动关闭对端 TCP socket(对端/协议层最终回收)。
+- `DROP INDEX` 只标 `DROPPED`,索引项数据留给 P5 的 compaction 回收(P4 不物理删)。
+- 索引统计信息 / 基数 / 直方图归 P6;`Cardinality` 恒 `NULL`。
+- 用户表上的 `ORDER BY` / `COUNT(*)` / 聚合 / JOIN / 子查询归 P5;`information_schema` 上也只支持
+  单表 + 单列 `ORDER BY` + `COUNT(*)`。
+- `SHOW ENGINES` 报 `InnoDB` 仅为客户端兼容,真实引擎是自研 LSM(`K93`)。
+
+下一步:**P5 · 分析引擎** —— 列式 segment、向量化执行、聚合、JOIN、子查询;版本回收与 compaction 也在 P5。
 
 ---
 

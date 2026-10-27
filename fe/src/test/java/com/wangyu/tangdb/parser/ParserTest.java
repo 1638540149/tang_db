@@ -105,10 +105,101 @@ class ParserTest {
         assertEquals(2, select.items().size());
         assertEquals("编号", select.items().get(0).alias());
         assertEquals(10, select.limit());
+        assertNull(select.offset());
         Ast.Compare cmp = (Ast.Compare) select.where();
         assertEquals("age", cmp.column());
         assertEquals(Ast.Op.GT, cmp.op());
         assertEquals(25, cmp.value());
+    }
+
+    @Test
+    void limitFormsNormalizeToCountAndOffset() {
+        Ast.Select plain = (Ast.Select) Parser.parse("SELECT * FROM t LIMIT 10");
+        assertEquals(10, plain.limit());
+        assertNull(plain.offset());
+
+        // LIMIT <offset>, <row_count>
+        Ast.Select comma = (Ast.Select) Parser.parse("SELECT * FROM t LIMIT 20, 10");
+        assertEquals(10, comma.limit());
+        assertEquals(20, comma.offset());
+
+        // LIMIT <row_count> OFFSET <offset>
+        Ast.Select offset = (Ast.Select) Parser.parse("SELECT * FROM t LIMIT 10 OFFSET 20");
+        assertEquals(10, offset.limit());
+        assertEquals(20, offset.offset());
+
+        Ast.Select zero = (Ast.Select) Parser.parse("SELECT * FROM t LIMIT 0, 0");
+        assertEquals(0, zero.limit());
+        assertEquals(0, zero.offset());
+    }
+
+    @Test
+    void limitRejectsNegativeDecimalAndMissingArguments() {
+        for (String sql : List.of(
+                "SELECT * FROM t LIMIT -1, 10",
+                "SELECT * FROM t LIMIT 10, -1",
+                "SELECT * FROM t LIMIT 1.5",
+                "SELECT * FROM t LIMIT",
+                "SELECT * FROM t LIMIT 10,",
+                "SELECT * FROM t LIMIT 10 OFFSET",
+                "SELECT * FROM t LIMIT 10 OFFSET -1")) {
+            ParseException e = assertThrows(ParseException.class, () -> Parser.parse(sql), sql);
+            assertTrue(e.getMessage().contains("第 1 行第"), sql + " → " + e.getMessage());
+            assertTrue(e.getMessage().contains("LIMIT") || e.getMessage().contains("OFFSET"),
+                    sql + " → " + e.getMessage());
+        }
+    }
+
+    @Test
+    void updateAndDeleteParseLimitForExecutorRejection() {
+        assertEquals(3, ((Ast.Update) Parser.parse("UPDATE t SET a = 1 LIMIT 3")).limit());
+        assertEquals(5, ((Ast.Update) Parser.parse("UPDATE t SET a = 1 LIMIT 0, 5")).limit());
+        assertEquals(4, ((Ast.Delete) Parser.parse("DELETE FROM t LIMIT 4")).limit());
+        assertNull(((Ast.Update) Parser.parse("UPDATE t SET a = 1")).limit());
+        assertNull(((Ast.Delete) Parser.parse("DELETE FROM t")).limit());
+    }
+
+    // ------------------------------------------------------------ P4 H 组:COUNT(*) 别名
+
+    @Test
+    void countStarAcceptsAliasWithAndWithoutAs() {
+        Ast.Select withAs = (Ast.Select) Parser.parse(
+                "SELECT COUNT(*) AS support_ndb FROM information_schema.ENGINES "
+                        + "WHERE Engine = 'ndbcluster'");
+        assertTrue(withAs.countStar());
+        assertEquals("support_ndb", withAs.alias());
+        assertNull(withAs.limit());
+
+        Ast.Select withoutAs = (Ast.Select) Parser.parse(
+                "SELECT COUNT(*) support_ndb FROM information_schema.ENGINES");
+        assertTrue(withoutAs.countStar());
+        assertEquals("support_ndb", withoutAs.alias());
+
+        Ast.Select backticked = (Ast.Select) Parser.parse(
+                "SELECT COUNT(*) AS `Total` FROM information_schema.TABLES");
+        assertEquals("total", backticked.alias(), "反引号别名与普通列同样统一小写");
+
+        Ast.Select plain = (Ast.Select) Parser.parse(
+                "SELECT COUNT(*) FROM information_schema.ENGINES");
+        assertTrue(plain.countStar());
+        assertNull(plain.alias(), "没有别名时 alias 为 null(结果列名仍由执行层给 COUNT(*))");
+    }
+
+    @Test
+    void countStarDoesNotSwallowFollowingClause() {
+        // 不带 AS 的别名只吃标识符;FROM 是子句起点,不能被当成别名。
+        Ast.Select select = (Ast.Select) Parser.parse(
+                "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = 'default'");
+        assertNull(select.alias());
+        assertNotNull(select.where());
+    }
+
+    @Test
+    void normalProjectionAliasAlsoAcceptsNoAs() {
+        Ast.Select select = (Ast.Select) Parser.parse("SELECT id 编号, name FROM users");
+        assertEquals("编号", select.items().get(0).alias());
+        assertNull(select.items().get(1).alias());
+        assertEquals("users", select.table());
     }
 
     @Test
@@ -331,12 +422,89 @@ class ParserTest {
     }
 
     @Test
-    void showRejectsUnsupportedTarget() {
-        for (String sql : List.of("SHOW SCHEMAS", "SHOW DATABASE", "SHOW COLUMNS")) {
-            ParseException e = assertThrows(ParseException.class, () -> Parser.parse(sql), sql);
-            assertTrue(e.getMessage().contains("SHOW 只支持 SHOW TABLES / SHOW DATABASES"),
-                    e.getMessage());
-        }
+    void showSupportsP4TargetsAndRejectsUnknownOnes() {
+        // P4 起 SCHEMAS / COLUMNS 属于 SHOW 家族(FR-527 ~ FR-536)。
+        assertInstanceOf(Ast.ShowDatabases.class, Parser.parse("SHOW SCHEMAS"));
+        assertThrows(ParseException.class, () -> Parser.parse("SHOW COLUMNS"));
+        ParseException e = assertThrows(ParseException.class,
+                () -> Parser.parse("SHOW SLAVE STATUS"));
+        assertTrue(e.getMessage().contains("不支持的 SHOW"), e.getMessage());
+    }
+
+    // ------------------------------------------------------------ P4 H-7(FR-560 ~ FR-562)
+
+    @Test
+    void selectLiteralProjectionWithoutFrom() {
+        // FR-560:字面量原样返回,列名为字面量文本。
+        Ast.SelectLiterals one = assertInstanceOf(Ast.SelectLiterals.class, Parser.parse("SELECT 1"));
+        assertEquals(1, one.items().size());
+        assertEquals(1, one.items().get(0).value());
+        assertEquals("1", one.items().get(0).name());
+
+        Ast.SelectLiterals two = assertInstanceOf(Ast.SelectLiterals.class,
+                Parser.parse("SELECT 1, 'x'"));
+        assertEquals(2, two.items().size());
+        assertEquals("x", two.items().get(1).value());
+        assertEquals("x", two.items().get(1).name());
+
+        Ast.SelectLiterals mixed = assertInstanceOf(Ast.SelectLiterals.class,
+                Parser.parse("SELECT -2, 1.5, NULL"));
+        assertEquals(-2, mixed.items().get(0).value());
+        assertEquals("-2", mixed.items().get(0).name());
+        assertEquals(1.5, mixed.items().get(1).value());
+        assertEquals("1.5", mixed.items().get(1).name());
+        assertNull(mixed.items().get(2).value());
+        assertEquals("NULL", mixed.items().get(2).name());
+    }
+
+    @Test
+    void selectExpressionWithoutFromStillRejected() {
+        // 边界 39:表达式 / 函数归 P5,仍报 1064,不得返回错值。
+        assertThrows(ParseException.class, () -> Parser.parse("SELECT 1+1"));
+        assertThrows(ParseException.class, () -> Parser.parse("SELECT now()"));
+        assertThrows(ParseException.class, () -> Parser.parse("SELECT 1 FROM users"));
+    }
+
+    @Test
+    void showCountStarWarningsAndErrors() {
+        // FR-561
+        Ast.ShowSimple warnings = assertInstanceOf(Ast.ShowSimple.class,
+                Parser.parse("SHOW COUNT(*) WARNINGS"));
+        assertEquals(Ast.ShowKind.WARNING_COUNT, warnings.kind());
+        Ast.ShowSimple errors = assertInstanceOf(Ast.ShowSimple.class,
+                Parser.parse("SHOW COUNT(*) ERRORS"));
+        assertEquals(Ast.ShowKind.ERROR_COUNT, errors.kind());
+        assertThrows(ParseException.class, () -> Parser.parse("SHOW COUNT(*) STATUS"));
+    }
+
+    @Test
+    void showVariablesStatusAndIndexAcceptWhere() {
+        // FR-562:列名与输出列名一致,走 SHOW 输出的通用过滤路径。
+        Ast.ShowSimple variables = assertInstanceOf(Ast.ShowSimple.class,
+                Parser.parse("SHOW VARIABLES WHERE Variable_name = 'version'"));
+        assertEquals(Ast.ShowKind.VARIABLES, variables.kind());
+        assertNotNull(variables.where());
+
+        Ast.ShowSimple status = assertInstanceOf(Ast.ShowSimple.class,
+                Parser.parse("SHOW STATUS WHERE Variable_name = 'Uptime'"));
+        assertEquals(Ast.ShowKind.STATUS, status.kind());
+        assertNotNull(status.where());
+
+        Ast.ShowSimple sessionVariables = assertInstanceOf(Ast.ShowSimple.class,
+                Parser.parse("SHOW SESSION VARIABLES LIKE 'version%' WHERE Variable_name = 'version'"));
+        assertEquals(Ast.ShowKind.VARIABLES, sessionVariables.kind());
+        assertEquals("version%", sessionVariables.like());
+        assertNotNull(sessionVariables.where());
+
+        Ast.ShowIndexDetails index = assertInstanceOf(Ast.ShowIndexDetails.class,
+                Parser.parse("SHOW INDEX FROM t WHERE Key_name = 'PRIMARY'"));
+        assertNotNull(index.where());
+        Ast.ShowIndexDetails keys = assertInstanceOf(Ast.ShowIndexDetails.class,
+                Parser.parse("SHOW KEYS FROM t WHERE Non_unique = 0"));
+        assertNotNull(keys.where());
+        Ast.ShowIndexes indexes = assertInstanceOf(Ast.ShowIndexes.class,
+                Parser.parse("SHOW INDEXES FROM t WHERE index_name = 'idx'"));
+        assertNotNull(indexes.where());
     }
 
     @Test

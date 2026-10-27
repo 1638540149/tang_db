@@ -68,18 +68,23 @@ note() { log "  [NOTE] $*"; }
 
 # ---------------------------------------------------------------- 服务启停
 
+# 只杀本脚本自己的 BE(tmp/<本脚本>/be.exe):不碰其它会话 / 所有者日常的 be/be.exe 与 3406 上的 fed。
+BE_EXE_WIN="$(cygpath -w "${BE_EXE}")"
+TEST_DIR_WIN="$(cygpath -w "${TEST_DIR}")"
+
 kill_be() {
-    local pids
-    pids=$(tasklist 2>/dev/null | grep -i "be.exe" | awk '{print $2}' || true)
-    for pid in ${pids}; do
-        taskkill /F /PID "${pid}" >/dev/null 2>&1 || true
-    done
+    powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='be.exe'\" | Where-Object { \$_.ExecutablePath -eq '${BE_EXE_WIN}' } | ForEach-Object { Stop-Process -Id \$_.ProcessId -Force -ErrorAction SilentlyContinue }" >/dev/null 2>&1 || true
     sleep 1
+}
+
+be_running() {
+    powershell -NoProfile -Command "if (Get-CimInstance Win32_Process -Filter \"Name='be.exe'\" | Where-Object { \$_.ExecutablePath -eq '${BE_EXE_WIN}' }) { exit 0 } else { exit 1 }" >/dev/null 2>&1
 }
 
 kill_fed() {
     # git-bash 的 $! 是 MSYS PID;按命令行精确匹配 fed 的 java 进程再 taskkill。
-    powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='java.exe'\" | Where-Object { \$_.CommandLine -like '*tangdb.fed.Fed*' } | ForEach-Object { Stop-Process -Id \$_.ProcessId -Force -ErrorAction SilentlyContinue }" >/dev/null 2>&1 || true
+    # 只杀本脚本起的 fed(命令行带 tmp/<本脚本> 配置路径);3406 上的常驻 fed 不动。
+    powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='java.exe'\" | Where-Object { \$_.CommandLine -like '*tangdb.fed.Fed*' -and \$_.CommandLine -like '*${TEST_DIR_WIN}*' } | ForEach-Object { Stop-Process -Id \$_.ProcessId -Force -ErrorAction SilentlyContinue }" >/dev/null 2>&1 || true
     FED_PID=""
     NOHB_PID=""
     sleep 1

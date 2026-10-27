@@ -24,9 +24,12 @@ import java.util.Set;
  *                    列: db_name VARCHAR, create_ts VARCHAR, remark VARCHAR
  * 4 sys_counters   : key = name(VARCHAR 保序编码)
  *                    列: name VARCHAR, value BIGINT
+ * 5 sys_indexes    : key = table_id(4B BE) + index_id(4B BE)
+ *                    列: table_id BIGINT, index_id INT, name VARCHAR, column_name VARCHAR,
+ *                        is_unique BOOLEAN, state INT, build_cursor VARCHAR, created_at VARCHAR
  * </pre>
  *
- * <p>系统表 ID 登记表(SPEC-P3.5 K70 / FR-426):</p>
+ * <p>系统表 ID 登记表(SPEC-P3.5 K70 / FR-426;SPEC-P4 FR-473 新增 5):</p>
  *
  * <pre>
  * | ID | 状态   | 用途        |
@@ -34,7 +37,8 @@ import java.util.Set;
  * |  2 | 已分配 | sys_columns |
  * |  3 | 已分配 | sys_databases |
  * |  4 | 已分配 | sys_counters|
- * | 5~63 | 预留 | 后续元数据族 |
+ * |  5 | 已分配 | sys_indexes |
+ * | 6~63 | 预留 | 后续元数据族 |
  * | ≥64 | 用户表 | 新库 next_table_id 初值 |
  * </pre>
  */
@@ -44,20 +48,25 @@ public final class SystemTables {
     public static final long SYS_COLUMNS = 2;
     public static final long SYS_DATABASES = 3;
     public static final long SYS_COUNTERS = 4;
+    public static final long SYS_INDEXES = 5;
 
-    /** 系统表 ID 登记表(FR-426 / K70):不在其中的 ID 即用户表。 */
-    public static final Set<Long> REGISTERED_IDS = Set.of(SYS_TABLES, SYS_COLUMNS, SYS_DATABASES, SYS_COUNTERS);
+    /** 系统表 ID 登记表(FR-426 / K70 / FR-473):不在其中的 ID 即用户表。 */
+    public static final Set<Long> REGISTERED_IDS =
+            Set.of(SYS_TABLES, SYS_COLUMNS, SYS_DATABASES, SYS_COUNTERS, SYS_INDEXES);
 
-    /** 预留区上界(5~63 预留给后续元数据族,当前未登记)。 */
+    /** 预留区上界(6~63 预留给后续元数据族,当前未登记)。 */
     public static final long RESERVED_MAX_TABLE_ID = 63;
 
     public static final String COUNTER_NEXT_TABLE_ID = "next_table_id";
 
+    /** 索引 ID 计数器的键前缀:`next_index_id:<table_id>`(FR-464 / K75)。 */
+    public static final String COUNTER_NEXT_INDEX_ID_PREFIX = "next_index_id:";
+
     /** 新库 next_table_id 初值(FR-425)。 */
     public static final long INITIAL_NEXT_TABLE_ID = 64;
 
-    /** 任何数据目录里 next_table_id 的下限:1~4 是系统表,不得分配(FR-426)。 */
-    public static final long MIN_TABLE_ID = 5;
+    /** 任何数据目录里 next_table_id 的下限:1~5 是系统表,不得分配(FR-426 / FR-473)。 */
+    public static final long MIN_TABLE_ID = 6;
 
     public static final String DEFAULT_DATABASE = "default";
 
@@ -111,6 +120,20 @@ public final class SystemTables {
                     new Column("value", DataType.BIGINT, 0, false, false, 1)),
             true);
 
+    /** SPEC-P4 §5.4:索引元数据表。复合主键 (table_id, index_id) 由 key 编码表达。 */
+    public static final TableMeta INDEXES = new TableMeta(
+            SYS_INDEXES, "sys_indexes", TableMeta.STATE_ACTIVE, "",
+            List.of(
+                    new Column("table_id", DataType.BIGINT, 0, false, true, 0),
+                    new Column("index_id", DataType.INT, 0, false, false, 1),
+                    new Column("name", DataType.VARCHAR, 64, false, false, 2),
+                    new Column("column_name", DataType.VARCHAR, 64, false, false, 3),
+                    new Column("is_unique", DataType.BOOLEAN, 0, false, false, 4),
+                    new Column("state", DataType.INT, 0, false, false, 5),
+                    new Column("build_cursor", DataType.VARCHAR, 256, false, false, 6),
+                    new Column("created_at", DataType.VARCHAR, 64, false, false, 7)),
+            true);
+
     private SystemTables() {
     }
 
@@ -142,6 +165,20 @@ public final class SystemTables {
         return KeyCodec.systemRowKey(SYS_DATABASES, KeyCodec.encodePrimaryKey(DataType.VARCHAR, dbName));
     }
 
+    /** sys_indexes 的主键编码:table_id 4B 大端 + index_id 4B 大端(FR-479)。 */
+    public static byte[] indexKey(long tableId, int indexId) {
+        return KeyCodec.systemRowKey(SYS_INDEXES, KeyCodec.concat(KeyCodec.be4(tableId), KeyCodec.be4(indexId)));
+    }
+
+    /** sys_counters 里"某表下一个索引 ID"的计数器键(FR-464)。 */
+    public static byte[] indexCounterKey(long tableId) {
+        return counterKey(COUNTER_NEXT_INDEX_ID_PREFIX + tableId);
+    }
+
+    public static String indexCounterName(long tableId) {
+        return COUNTER_NEXT_INDEX_ID_PREFIX + tableId;
+    }
+
     public static byte[] encodeTableRow(long tableId, String name, int state, String createdAt, String dbName) {
         return RowCodec.encode(TABLES, new Object[]{tableId, name, state, createdAt, dbName});
     }
@@ -164,6 +201,20 @@ public final class SystemTables {
 
     public static byte[] encodeDatabaseRow(String dbName, String createTs, String remark) {
         return RowCodec.encode(DATABASES, new Object[]{dbName, createTs, remark});
+    }
+
+    /** sys_indexes 行(§5.4 的列顺序)。 */
+    public static byte[] encodeIndexRow(com.wangyu.tangdb.storage.IndexMeta index) {
+        return RowCodec.encode(INDEXES, new Object[]{
+                index.tableId(),
+                index.indexId(),
+                index.name(),
+                index.columnName(),
+                index.unique(),
+                index.state(),
+                index.buildCursor(),
+                index.createdAt()
+        });
     }
 
     public static long decodeTableId(byte[] row) {

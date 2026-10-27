@@ -37,6 +37,8 @@ public final class FeConfig {
     public static final int DEFAULT_SHUTDOWN_GRACE_SECONDS = 5;
     public static final String DEFAULT_USER = "root";
     public static final String DEFAULT_PASSWORD = "tangdb";
+    /** 建索引回填批量(SPEC-P4 K84)。 */
+    public static final int DEFAULT_INDEX_BACKFILL_BATCH = 1000;
 
     private final String beHost;
     private final int bePort;
@@ -50,10 +52,12 @@ public final class FeConfig {
     private final int shutdownGraceSeconds;
     private final String user;
     private final String password;
+    private final int indexBackfillBatch;
 
     private FeConfig(String beHost, int bePort, int heartbeatListenPort, int beOfflineCycles,
                      boolean heartbeatEnabled, String mode, int mysqlPort, int sessionMax,
-                     int sessionIdleTimeout, int shutdownGraceSeconds, String user, String password) {
+                     int sessionIdleTimeout, int shutdownGraceSeconds, String user, String password,
+                     int indexBackfillBatch) {
         this.beHost = beHost;
         this.bePort = bePort;
         this.heartbeatListenPort = heartbeatListenPort;
@@ -66,6 +70,7 @@ public final class FeConfig {
         this.shutdownGraceSeconds = shutdownGraceSeconds;
         this.user = user;
         this.password = password;
+        this.indexBackfillBatch = indexBackfillBatch;
     }
 
     /** 内置默认配置。 */
@@ -73,7 +78,8 @@ public final class FeConfig {
         return new FeConfig(TangDbClient.DEFAULT_HOST, TangDbClient.DEFAULT_PORT,
                 DEFAULT_HEARTBEAT_LISTEN_PORT, DEFAULT_BE_OFFLINE_CYCLES, true,
                 "fed", DEFAULT_MYSQL_PORT, DEFAULT_SESSION_MAX, DEFAULT_SESSION_IDLE_TIMEOUT,
-                DEFAULT_SHUTDOWN_GRACE_SECONDS, DEFAULT_USER, DEFAULT_PASSWORD);
+                DEFAULT_SHUTDOWN_GRACE_SECONDS, DEFAULT_USER, DEFAULT_PASSWORD,
+                DEFAULT_INDEX_BACKFILL_BATCH);
     }
 
     /** 直接用给定取值构造配置(供程序化使用与测试)。 */
@@ -94,7 +100,7 @@ public final class FeConfig {
                 validatePort(heartbeatListenPort, "heartbeat_listen_port"),
                 Math.max(1, beOfflineCycles), heartbeatEnabled,
                 d.mode, d.mysqlPort, d.sessionMax, d.sessionIdleTimeout, d.shutdownGraceSeconds,
-                d.user, d.password);
+                d.user, d.password, d.indexBackfillBatch);
     }
 
     public String beHost() {
@@ -155,6 +161,11 @@ public final class FeConfig {
         return password;
     }
 
+    /** 建索引回填批量(SPEC-P4 K84 / FR-467)。 */
+    public int indexBackfillBatch() {
+        return indexBackfillBatch;
+    }
+
     /**
      * 加载配置文件。
      *
@@ -196,6 +207,7 @@ public final class FeConfig {
         int shutdownGraceSeconds = d.shutdownGraceSeconds;
         String user = d.user;
         String password = d.password;
+        int indexBackfillBatch = d.indexBackfillBatch;
 
         for (int i = 0; i < lines.size(); i++) {
             String line = lines.get(i);
@@ -235,13 +247,16 @@ public final class FeConfig {
                 case "shutdown_grace_seconds" -> shutdownGraceSeconds = parseInt(key, value, path, i + 1, 0, 3600);
                 case "user" -> user = requireNonBlank(value, path, i + 1);
                 case "password" -> password = value;
+                case "index_backfill_batch" ->
+                        indexBackfillBatch = parseInt(key, value, path, i + 1, 1, 1_000_000);
                 default -> throw new IllegalArgumentException(
                         path + " 第 " + (i + 1) + " 行未知配置项: " + key);
             }
         }
 
         return new FeConfig(host, port, heartbeatPort, offlineCycles, heartbeatEnabled,
-                mode, mysqlPort, sessionMax, sessionIdleTimeout, shutdownGraceSeconds, user, password);
+                mode, mysqlPort, sessionMax, sessionIdleTimeout, shutdownGraceSeconds, user, password,
+                indexBackfillBatch);
     }
 
     private static String parseMode(String raw, String path, int lineNo) {

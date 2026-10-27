@@ -16,6 +16,7 @@ import java.io.OutputStream;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
+import java.util.List;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -45,6 +46,8 @@ public final class ConnectionHandler implements Runnable {
     private boolean authenticated;
     /** 客户端是否置了 CLIENT_SESSION_TRACK(是则 OK 包附带 info 字符串)。 */
     private boolean clientSessionTrack;
+    /** 客户端握手是否声明了 CLIENT_MULTI_STATEMENTS(FR-557:只按声明回多结果集)。 */
+    private boolean clientMultiStatements;
 
     public ConnectionHandler(Socket socket, long connectionId, SqlEngine engine,
                              SessionManager sessions, KvStore kv, Catalog catalog,
@@ -150,6 +153,7 @@ public final class ConnectionHandler implements Runnable {
             return false;
         }
         clientSessionTrack = (auth.capabilities & Protocol.CLIENT_SESSION_TRACK) != 0;
+        clientMultiStatements = (auth.capabilities & Protocol.CLIENT_MULTI_STATEMENTS) != 0;
 
         Executor executor = new Executor(kv, catalog);
         try {
@@ -225,12 +229,27 @@ public final class ConnectionHandler implements Runnable {
     private void handleQuery(byte[] args) throws IOException {
         String sql = new String(args, StandardCharsets.UTF_8);
         try {
-            Result result = engine.execute(session, sql);
+            List<Result> results = engine.executeBatch(session, sql);
             int status = statusFlags();
-            for (byte[] packet : ResultSetEncoder.forResult(result, status, clientSessionTrack)) {
-                io.writePacket(packet);
+            if (!clientMultiStatements) {
+                // FR-557:客户端未声明 CLIENT_MULTI_STATEMENTS → 只回最后一条的结果
+                // (前面的照常执行、结果丢弃),不追加多余结果集,避免协议错位。
+                Result last = results.get(results.size() - 1);
+                for (byte[] packet : ResultSetEncoder.forResult(last, status, clientSessionTrack)) {
+                    io.writePacket(packet);
+                }
+                return;
+            }
+            // 声明了 → 逐条回;非最后一条的结束包带 SERVER_MORE_RESULTS_EXISTS(FR-557)。
+            for (int i = 0; i < results.size(); i++) {
+                boolean more = i < results.size() - 1;
+                for (byte[] packet : ResultSetEncoder.forResult(
+                        results.get(i), status, clientSessionTrack, more)) {
+                    io.writePacket(packet);
+                }
             }
         } catch (SqlError e) {
+            // FR-558:某条失败只回该条的错误包、不带 MORE 位,后续语句未执行,连接保持。
             io.writePacket(ResultSetEncoder.errPacket(e.code(), e.sqlState(), e.getMessage()));
             logError(e.code(), sql);
         } catch (RuntimeException e) {

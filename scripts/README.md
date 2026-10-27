@@ -28,12 +28,14 @@
 
 | 脚本 | 覆盖 |
 |---|---|
+| `tests/p4-test.sh` | **P4 一键验收**:SC-319 ~ SC-343(二级/唯一索引、索引列 UPDATE、并发唯一冲突、崩溃同批、回填续做、EXPLAIN 五路径、DROP、老目录升级、事务可见性、5000 次随机对账、SHOW 家族、17 张虚拟表、round-trip、分页三写法一致 / 越界空集 / DML LIMIT 拒绝、虚拟表多列排序、依赖红线 + P2/P3/P3.5 回归) |
 | `tests/p35-test.sh` | **P3.5 一键验收**:SC-301 ~ SC-318(常驻/多会话、跨会话 DDL、多库、同名表、库级 DDL、老目录升级、表 ID、协议正确性、依赖红线 + P2/P3 回归) |
 | `tests/p3-test.sh` | P3:SC-201 ~ SC-211(事务、并发写写冲突、4 个崩溃注入点、序号不回退、快照稳定、DDL 原子性)+ P2/P1 回归 |
 | `tests/p2-test.sh` | P2 + P2.1:11 个场景 + SQL 兼容性断言 |
 | `tests/crash-test.sh` | P1 崩溃基线:1000 条随机 KV,强杀重启后丢失 0 条 |
 
 ```bash
+bash scripts/tests/p4-test.sh                 # 报告 → tmp/p4-test/report.txt(端口 9900/9906/9991)
 bash scripts/tests/p35-test.sh                # 报告 → tmp/p35-test/report.txt
 bash scripts/tests/p3-test.sh                 # 报告 → tmp/p3-test/report.txt
 bash scripts/tests/p2-test.sh                 # 报告 → tmp/p2-test/report.txt

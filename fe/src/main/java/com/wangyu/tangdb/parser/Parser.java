@@ -18,12 +18,19 @@ import java.util.List;
  *            | INSERT INTO ident ['(' ident (',' ident)* ')'] VALUES 行 (',' 行)*   -- 省略列表 = 全部列
  *            | UPDATE ident SET ident '=' literal (',' ident '=' literal)* [WHERE cond]
  *            | DELETE FROM ident [WHERE cond]
- *            | SELECT ('*' | ident [AS ident] (',' ...)*) FROM ident [WHERE cond] [LIMIT int]
+ *            | SELECT ('*' | 'COUNT' '(' '*' ')' [[AS] ident] | ident [[AS] ident] (',' ...)*) FROM ident [WHERE cond] [LIMIT int]
  * ident      := 普通标识符 | '`' 任意字符 '`'(反引号不解释关键字,不改变大小写语义)
  * cond       := cond AND cond | cond OR cond | '(' cond ')' | ident op literal | ident IN '(' literal,... ')'
  * </pre>
  */
 public final class Parser {
+
+    /**
+     * 投影项后面出现这些关键字时,它是子句起点,不是不带 {@code AS} 的别名(K102)。
+     */
+    private static final java.util.Set<String> ITEM_FOLLOW_KEYWORDS = java.util.Set.of(
+            "FROM", "WHERE", "ORDER", "GROUP", "HAVING", "LIMIT", "OFFSET",
+            "AND", "OR", "IN", "ASC", "DESC", "UNION", "JOIN", "ON");
 
     private final List<Token> tokens;
     private int index;
@@ -58,12 +65,15 @@ public final class Parser {
             case "UPDATE" -> parseUpdate();
             case "DELETE" -> parseDelete();
             case "SELECT" -> parseSelect();
+            case "EXPLAIN" -> parseExplain();
+            case "KILL" -> parseKill();
             case "BEGIN" -> parseBegin();
             case "COMMIT" -> parseCommit();
             case "ROLLBACK" -> parseRollback();
             case "USE" -> parseUse();
             default -> throw error("不支持的语句: " + t.text()
-                    + "(支持 CREATE/DROP/TRUNCATE/SHOW/DESC/INSERT/UPDATE/DELETE/SELECT/BEGIN/COMMIT/ROLLBACK/USE)");
+                    + "(支持 CREATE/DROP/TRUNCATE/SHOW/DESC/INSERT/UPDATE/DELETE/SELECT/EXPLAIN/KILL"
+                    + "/BEGIN/COMMIT/ROLLBACK/USE)");
         };
     }
 
@@ -72,15 +82,160 @@ public final class Parser {
         if (matchKeyword("DATABASE")) {
             return new Ast.CreateDatabase(expectIdentifier("库名"));
         }
+        if (matchKeyword("UNIQUE")) {
+            expectKeyword("INDEX");
+            return parseCreateIndex(true);
+        }
+        if (matchKeyword("INDEX")) {
+            return parseCreateIndex(false);
+        }
         expectKeyword("TABLE");
         Ref ref = parseTableRef("表名");
         expect(TokenType.LPAREN, "列定义列表的 '('");
         List<Ast.ColumnDef> columns = new ArrayList<>();
+        List<Ast.InlineIndex> inlineIndexes = new ArrayList<>();
+        String tablePrimaryKey = null;
         do {
-            columns.add(parseColumnDef());
+            if (isPrimaryKeyConstraint()) {
+                advance(); // PRIMARY
+                expectKeyword("KEY");
+                expect(TokenType.LPAREN, "主键约束的 '('");
+                tablePrimaryKey = expectIdentifier("主键列名");
+                if (match(TokenType.COMMA)) {
+                    throw error("本期只支持单列主键");
+                }
+                expect(TokenType.RPAREN, "主键约束的 ')'");
+            } else if (isInlineIndexStart()) {
+                inlineIndexes.add(parseInlineIndex());
+            } else {
+                columns.add(parseColumnDef());
+            }
         } while (match(TokenType.COMMA));
         expect(TokenType.RPAREN, "列定义列表的 ')'");
-        return new Ast.CreateTable(ref.database(), ref.table(), columns);
+        parseTableOptions();
+        if (columns.isEmpty()) {
+            throw error("建表至少要有一个列");
+        }
+        if (tablePrimaryKey != null) {
+            columns = applyTablePrimaryKey(columns, tablePrimaryKey);
+        }
+        return new Ast.CreateTable(ref.database(), ref.table(), columns, inlineIndexes);
+    }
+
+    /** 表级 PRIMARY KEY (`col`) 约束:把对应列标记为主键(只支持单列)。 */
+    private List<Ast.ColumnDef> applyTablePrimaryKey(List<Ast.ColumnDef> columns, String pkColumn) {
+        List<Ast.ColumnDef> out = new ArrayList<>(columns.size());
+        boolean found = false;
+        for (Ast.ColumnDef column : columns) {
+            boolean isPk = column.name().equalsIgnoreCase(pkColumn);
+            if (isPk) {
+                if (found) {
+                    throw error("主键列 " + pkColumn + " 重复定义");
+                }
+                if (column.primaryKey()) {
+                    throw error("列 " + column.name() + " 同时声明了列级与表级主键");
+                }
+                found = true;
+            }
+            if (column.primaryKey() && !isPk) {
+                throw error("只能有一个主键(列 " + column.name() + " 与表级主键 " + pkColumn + ")");
+            }
+            out.add(new Ast.ColumnDef(column.name(), column.type(), column.length(), isPk));
+        }
+        if (!found) {
+            throw error("表级主键指向不存在的列 " + pkColumn);
+        }
+        return out;
+    }
+
+    private boolean isPrimaryKeyConstraint() {
+        Token t = current();
+        if (t.type() != TokenType.IDENT || !t.text().equalsIgnoreCase("PRIMARY")) {
+            return false;
+        }
+        return index + 1 < tokens.size()
+                && tokens.get(index + 1).type() == TokenType.IDENT
+                && tokens.get(index + 1).text().equalsIgnoreCase("KEY");
+    }
+
+    /** CREATE [UNIQUE] INDEX <idx> ON <tbl>(<col>)。 */
+    private Ast.Statement parseCreateIndex(boolean unique) {
+        String name = expectIdentifier("索引名");
+        expectKeyword("ON");
+        Ref ref = parseTableRef("表名");
+        expect(TokenType.LPAREN, "索引列的 '('");
+        String column = expectIdentifier("索引列名");
+        if (match(TokenType.COMMA)) {
+            throw error("本期只支持单列索引(复合索引归 P6)");
+        }
+        expect(TokenType.RPAREN, "索引列的 ')'");
+        return new Ast.CreateIndex(ref.database(), ref.table(), name, column, unique);
+    }
+
+    /**
+     * 建表内联约束:`UNIQUE[(KEY)] [name](<col>)` / `INDEX|KEY [name](<col>)`。
+     * 名字可省略(FR-463 自动命名);带名字的形式用于 SHOW CREATE TABLE round-trip(K96)。
+     */
+    private boolean isInlineIndexStart() {
+        Token t = current();
+        if (t.type() != TokenType.IDENT) {
+            return false;
+        }
+        String upper = t.text().toUpperCase();
+        return upper.equals("UNIQUE") || upper.equals("INDEX") || upper.equals("KEY");
+    }
+
+    private Ast.InlineIndex parseInlineIndex() {
+        boolean unique = matchKeyword("UNIQUE");
+        if (unique) {
+            matchKeyword("KEY");
+            matchKeyword("INDEX");
+        } else if (!matchKeyword("INDEX")) {
+            expectKeyword("KEY");
+        }
+        String name = null;
+        if (current().type() != TokenType.LPAREN) {
+            name = expectIdentifier("索引名");
+        }
+        expect(TokenType.LPAREN, "内联索引的 '('");
+        String column = expectIdentifier("索引列名");
+        if (match(TokenType.COMMA)) {
+            throw error("本期只支持单列索引(复合索引归 P6)");
+        }
+        expect(TokenType.RPAREN, "内联索引的 ')'");
+        return new Ast.InlineIndex(name, column, unique);
+    }
+
+    /**
+     * 表选项(`) DEFAULT CHARSET=utf8mb4 COLLATE=...` 等):SHOW CREATE TABLE 的输出
+     * 必须能被原样吃回去(K96),这里把它安全跳过。
+     */
+    private void parseTableOptions() {
+        while (current().type() != TokenType.EOF && current().type() != TokenType.SEMICOLON) {
+            Token t = current();
+            if (t.type() != TokenType.IDENT) {
+                return;
+            }
+            String upper = t.text().toUpperCase();
+            if (upper.equals("DEFAULT")) {
+                advance();
+                continue;
+            }
+            if (!upper.equals("CHARSET") && !upper.equals("COLLATE") && !upper.equals("ENGINE")
+                    && !upper.equals("AUTO_INCREMENT") && !upper.equals("COMMENT")
+                    && !upper.equals("ROW_FORMAT")) {
+                return;
+            }
+            advance();
+            if (current().type() == TokenType.EQ) {
+                advance();
+            }
+            if (current().type() == TokenType.IDENT || current().type() == TokenType.STRING
+                    || current().type() == TokenType.INTEGER
+                    || current().type() == TokenType.QUOTED_IDENT) {
+                advance();
+            }
+        }
     }
 
     /** 解析一个可限定的表引用:ident 或 ident . ident(db.tbl)。 */
@@ -118,9 +273,37 @@ public final class Parser {
             length = (int) len;
         }
         boolean primaryKey = false;
-        if (matchKeyword("PRIMARY")) {
-            expectKeyword("KEY");
-            primaryKey = true;
+        // 列级修饰:PRIMARY KEY / NOT NULL / NULL / DEFAULT ... / AUTO_INCREMENT / COMMENT ...
+        // (NULL 性由主键标记推导;这些修饰只为让 SHOW CREATE TABLE 的输出能原样吃回去,K96)
+        while (true) {
+            if (matchKeyword("PRIMARY")) {
+                expectKeyword("KEY");
+                primaryKey = true;
+                continue;
+            }
+            if (matchKeyword("NOT")) {
+                expectKeyword("NULL");
+                continue;
+            }
+            if (matchKeyword("NULL")) {
+                continue;
+            }
+            if (matchKeyword("AUTO_INCREMENT")) {
+                continue;
+            }
+            if (matchKeyword("DEFAULT")) {
+                parseLiteral();
+                continue;
+            }
+            if (matchKeyword("COMMENT")) {
+                expect(TokenType.STRING, "COMMENT 的字符串");
+                continue;
+            }
+            if (matchKeyword("COLLATE")) {
+                expectIdentifier("排序规则");
+                continue;
+            }
+            break;
         }
         return new Ast.ColumnDef(name, type, length, primaryKey);
     }
@@ -163,6 +346,12 @@ public final class Parser {
         if (matchKeyword("DATABASE")) {
             return new Ast.DropDatabase(expectIdentifier("库名"));
         }
+        if (matchKeyword("INDEX")) {
+            String name = expectIdentifier("索引名");
+            expectKeyword("ON");
+            Ref ref = parseTableRef("表名");
+            return new Ast.DropIndex(ref.database(), ref.table(), name);
+        }
         expectKeyword("TABLE");
         Ref ref = parseTableRef("表名");
         return new Ast.DropTable(ref.database(), ref.table());
@@ -182,13 +371,220 @@ public final class Parser {
 
     private Ast.Statement parseShow() {
         expectKeyword("SHOW");
-        if (matchKeyword("TABLES")) {
-            return new Ast.ShowTables();
+        boolean full = matchKeyword("FULL");
+
+        // SHOW COUNT(*) WARNINGS / ERRORS(FR-561):单值 @@session.warning_count / error_count。
+        if (isCountStar()) {
+            advance(); // COUNT
+            expect(TokenType.LPAREN, "COUNT 的 '('");
+            expect(TokenType.STAR, "COUNT(*) 的 '*'");
+            expect(TokenType.RPAREN, "COUNT(*) 的 ')'");
+            if (matchKeyword("WARNINGS")) {
+                return new Ast.ShowSimple(Ast.ShowKind.WARNING_COUNT, null);
+            }
+            if (matchKeyword("ERRORS")) {
+                return new Ast.ShowSimple(Ast.ShowKind.ERROR_COUNT, null);
+            }
+            throw error("SHOW COUNT(*) 只支持 WARNINGS / ERRORS");
         }
-        if (matchKeyword("DATABASES")) {
+
+        // [GLOBAL|SESSION] VARIABLES / STATUS
+        if (matchKeyword("GLOBAL") || matchKeyword("SESSION") || matchKeyword("LOCAL")) {
+            if (matchKeyword("VARIABLES")) {
+                return parseVariablesLikeWhere(Ast.ShowKind.VARIABLES);
+            }
+            if (matchKeyword("STATUS")) {
+                return parseVariablesLikeWhere(Ast.ShowKind.STATUS);
+            }
+            throw error("只支持 SHOW [GLOBAL|SESSION] VARIABLES / STATUS");
+        }
+
+        if (matchKeyword("TABLES")) {
+            String db = parseOptionalFrom();
+            String like = parseOptionalLike();
+            Ast.Condition where = matchKeyword("WHERE") ? parseCondition() : null;
+            return new Ast.ShowTables(full, db, like, where);
+        }
+        if (matchKeyword("DATABASES") || matchKeyword("SCHEMAS")) {
+            String like = parseOptionalLike();
             return new Ast.ShowDatabases();
         }
-        throw error("SHOW 只支持 SHOW TABLES / SHOW DATABASES");
+        if (matchKeyword("INDEXES")) {
+            String db = null;
+            String table = null;
+            if (matchKeyword("FROM") || matchKeyword("IN")) {
+                Ref ref = parseTableRef("表名");
+                db = ref.database();
+                table = ref.table();
+            }
+            Ast.Condition where = matchKeyword("WHERE") ? parseCondition() : null;
+            return new Ast.ShowIndexes(db, table, where);
+        }
+        if (matchKeyword("INDEX") || matchKeyword("KEYS")) {
+            if (!matchKeyword("FROM") && !matchKeyword("IN")) {
+                throw error("SHOW INDEX / SHOW KEYS 需要 FROM <表>");
+            }
+            Ref ref = parseTableRef("表名");
+            Ast.Condition where = matchKeyword("WHERE") ? parseCondition() : null;
+            return new Ast.ShowIndexDetails(ref.database(), ref.table(), where);
+        }
+        if (matchKeyword("TABLE")) {
+            expectKeyword("STATUS");
+            String db = parseOptionalFrom();
+            return new Ast.ShowTableStatus(db, parseOptionalLike());
+        }
+        if (matchKeyword("CREATE")) {
+            if (matchKeyword("TABLE")) {
+                Ref ref = parseTableRef("表名");
+                return new Ast.ShowCreateTable(ref.database(), ref.table());
+            }
+            if (matchKeyword("DATABASE") || matchKeyword("SCHEMA")) {
+                return new Ast.ShowCreateDatabase(expectIdentifier("库名"));
+            }
+            throw error("SHOW CREATE 只支持 TABLE / DATABASE");
+        }
+        if (matchKeyword("COLUMNS") || matchKeyword("FIELDS")) {
+            String db = null;
+            String table;
+            if (matchKeyword("FROM") || matchKeyword("IN")) {
+                Ref ref = parseTableRef("表名");
+                db = ref.database();
+                table = ref.table();
+            } else {
+                throw error("SHOW COLUMNS 需要 FROM <表>");
+            }
+            // MySQL 允许 SHOW COLUMNS FROM tbl FROM db;这里把第二个 FROM 当作库名。
+            if (matchKeyword("FROM") || matchKeyword("IN")) {
+                db = expectIdentifier("库名");
+            }
+            return new Ast.ShowColumns(full, db, table, parseOptionalLike());
+        }
+        if (matchKeyword("ENGINES")) {
+            return new Ast.ShowSimple(Ast.ShowKind.ENGINES, null);
+        }
+        if (matchKeyword("COLLATION")) {
+            return new Ast.ShowSimple(Ast.ShowKind.COLLATION, parseOptionalLike());
+        }
+        if (matchKeyword("CHARACTER")) {
+            expectKeyword("SET");
+            return new Ast.ShowSimple(Ast.ShowKind.CHARACTER_SET, parseOptionalLike());
+        }
+        if (matchKeyword("CHARSET")) {
+            return new Ast.ShowSimple(Ast.ShowKind.CHARACTER_SET, parseOptionalLike());
+        }
+        if (matchKeyword("GRANTS")) {
+            // SHOW GRANTS [FOR user] —— 本期无权限体系,FOR 部分直接跳过。
+            skipRestOfStatement();
+            return new Ast.ShowSimple(Ast.ShowKind.GRANTS, null);
+        }
+        if (matchKeyword("WARNINGS")) {
+            skipOptionalLimit();
+            return new Ast.ShowSimple(Ast.ShowKind.WARNINGS, null);
+        }
+        if (matchKeyword("ERRORS")) {
+            skipOptionalLimit();
+            return new Ast.ShowSimple(Ast.ShowKind.ERRORS, null);
+        }
+        if (matchKeyword("TRIGGERS")) {
+            parseOptionalFrom();
+            parseOptionalLike();
+            return new Ast.ShowSimple(Ast.ShowKind.TRIGGERS, null);
+        }
+        if (matchKeyword("EVENTS")) {
+            parseOptionalFrom();
+            parseOptionalLike();
+            return new Ast.ShowSimple(Ast.ShowKind.EVENTS, null);
+        }
+        if (matchKeyword("ROUTINES")) {
+            parseOptionalFrom();
+            parseOptionalLike();
+            return new Ast.ShowSimple(Ast.ShowKind.ROUTINES, null);
+        }
+        // SHOW PROCEDURE|FUNCTION|FUNC STATUS [LIKE '<pat>'] [WHERE <cond>](FR-559 / H-6):
+        // 本期没有存储过程/函数,恒为空集,但列定义与 SHOW ROUTINES 一致。
+        if (peekKeyword("PROCEDURE") || peekKeyword("FUNCTION") || peekKeyword("FUNC")) {
+            Ast.ShowKind kind = matchKeyword("PROCEDURE")
+                    ? Ast.ShowKind.PROCEDURE_STATUS : Ast.ShowKind.FUNCTION_STATUS;
+            if (kind == Ast.ShowKind.FUNCTION_STATUS) {
+                advance(); // FUNCTION / FUNC
+            }
+            expectKeyword("STATUS");
+            String routineLike = parseOptionalLike();
+            Ast.Condition routineWhere = matchKeyword("WHERE") ? parseCondition() : null;
+            return new Ast.ShowSimple(kind, routineLike, routineWhere);
+        }
+        if (matchKeyword("VARIABLES")) {
+            return parseVariablesLikeWhere(Ast.ShowKind.VARIABLES);
+        }
+        if (matchKeyword("STATUS")) {
+            return parseVariablesLikeWhere(Ast.ShowKind.STATUS);
+        }
+        if (matchKeyword("PROCESSLIST")) {
+            return new Ast.ShowSimple(
+                    full ? Ast.ShowKind.FULL_PROCESSLIST : Ast.ShowKind.PROCESSLIST, null);
+        }
+        throw error("不支持的 SHOW 语句");
+    }
+
+    /** SHOW VARIABLES / STATUS 的可选 LIKE + WHERE(FR-562;WHERE 走 SHOW 输出的通用过滤路径)。 */
+    private Ast.ShowSimple parseVariablesLikeWhere(Ast.ShowKind kind) {
+        String like = parseOptionalLike();
+        Ast.Condition where = matchKeyword("WHERE") ? parseCondition() : null;
+        return new Ast.ShowSimple(kind, like, where);
+    }
+
+    /** 可选的 FROM / IN <db>(只取库名,不吃表名)。 */
+    private String parseOptionalFrom() {
+        if (matchKeyword("FROM") || matchKeyword("IN")) {
+            return expectIdentifier("库名");
+        }
+        return null;
+    }
+
+    /** 跳过语句剩余 token(用于 SHOW GRANTS FOR ... 这类本期不解释的尾缀)。 */
+    private void skipRestOfStatement() {
+        while (current().type() != TokenType.EOF && current().type() != TokenType.SEMICOLON) {
+            advance();
+        }
+    }
+
+    private void skipOptionalLimit() {
+        if (matchKeyword("LIMIT")) {
+            while (current().type() != TokenType.EOF && current().type() != TokenType.SEMICOLON) {
+                advance();
+            }
+        }
+    }
+
+    private String parseOptionalLike() {
+        if (matchKeyword("LIKE")) {
+            Token t = expect(TokenType.STRING, "LIKE 的模式字符串");
+            return t.text();
+        }
+        return null;
+    }
+
+    // ------------------------------------------------------------ P4:EXPLAIN / KILL
+
+    private Ast.Statement parseExplain() {
+        expectKeyword("EXPLAIN");
+        // 语法层接受任意语句;执行层对 INSERT / DDL / 事务语句明确报"不支持解释"(FR-518)。
+        Ast.Statement inner = parseStatement();
+        return new Ast.Explain(inner);
+    }
+
+    private Ast.Statement parseKill() {
+        expectKeyword("KILL");
+        matchKeyword("CONNECTION");
+        matchKeyword("QUERY");
+        Token t = expect(TokenType.INTEGER, "会话 id");
+        long id;
+        try {
+            id = Long.parseLong(t.text());
+        } catch (NumberFormatException e) {
+            throw error(t, "会话 id 非法: " + t.text());
+        }
+        return new Ast.Kill(id);
     }
 
     private Ast.Statement parseDescribe() {
@@ -244,7 +640,11 @@ public final class Parser {
         if (matchKeyword("WHERE")) {
             where = parseCondition();
         }
-        return new Ast.Update(ref.database(), ref.table(), assignments, where);
+        Integer limit = null;
+        if (peekKeyword("LIMIT")) {
+            limit = parseLimitClause().count();
+        }
+        return new Ast.Update(ref.database(), ref.table(), assignments, where, limit);
     }
 
     private Ast.Statement parseDelete() {
@@ -255,22 +655,36 @@ public final class Parser {
         if (matchKeyword("WHERE")) {
             where = parseCondition();
         }
-        return new Ast.Delete(ref.database(), ref.table(), where);
+        Integer limit = null;
+        if (peekKeyword("LIMIT")) {
+            limit = parseLimitClause().count();
+        }
+        return new Ast.Delete(ref.database(), ref.table(), where, limit);
     }
 
     private Ast.Statement parseSelect() {
         expectKeyword("SELECT");
+        if (isLiteralProjectionStart()) {
+            return parseLiteralProjection();
+        }
         boolean star = false;
+        boolean countStar = false;
+        String countAlias = null;
         List<Ast.Item> items = new ArrayList<>();
         if (match(TokenType.STAR)) {
             star = true;
+        } else if (isCountStar()) {
+            advance(); // COUNT
+            expect(TokenType.LPAREN, "COUNT 的 '('");
+            expect(TokenType.STAR, "COUNT(*) 的 '*'");
+            expect(TokenType.RPAREN, "COUNT(*) 的 ')'");
+            countStar = true;
+            // FR-555 / K102:与普通列的别名同一套解析(AS 可省),不另开一条路径。
+            countAlias = parseOptionalAlias("列别名");
         } else {
             do {
                 String column = expectIdentifier("列名或 *");
-                String alias = null;
-                if (matchKeyword("AS")) {
-                    alias = expectIdentifier("列别名");
-                }
+                String alias = parseOptionalAlias("列别名");
                 items.add(new Ast.Item(column, alias));
             } while (match(TokenType.COMMA));
         }
@@ -280,21 +694,182 @@ public final class Parser {
         if (matchKeyword("WHERE")) {
             where = parseCondition();
         }
-        Integer limit = null;
-        if (matchKeyword("LIMIT")) {
-            Token t = expect(TokenType.INTEGER, "LIMIT 的非负整数");
-            long v;
-            try {
-                v = Long.parseLong(t.text());
-            } catch (NumberFormatException e) {
-                throw error(t, "LIMIT 取值非法: " + t.text());
-            }
-            if (v < 0 || v > Integer.MAX_VALUE) {
-                throw error(t, "LIMIT 取值非法: " + v);
-            }
-            limit = (int) v;
+        List<Ast.Order> orderBy = new ArrayList<>();
+        if (matchKeyword("ORDER")) {
+            expectKeyword("BY");
+            do {
+                String column = expectIdentifier("排序列名");
+                boolean descending = false;
+                if (matchKeyword("DESC")) {
+                    descending = true;
+                } else {
+                    matchKeyword("ASC");
+                }
+                orderBy.add(new Ast.Order(column, descending));
+            } while (match(TokenType.COMMA));
         }
-        return new Ast.Select(ref.database(), ref.table(), star, items, where, limit);
+        Integer limit = null;
+        Integer offset = null;
+        if (peekKeyword("LIMIT")) {
+            Limit parsed = parseLimitClause();
+            limit = parsed.count();
+            offset = parsed.offset();
+        }
+        return new Ast.Select(ref.database(), ref.table(), star, items, where, orderBy,
+                limit, offset, countStar, countAlias);
+    }
+
+    /**
+     * 投影项的可选别名(K29 / K102):{@code [AS] <ident>},{@code AS} 可省。
+     *
+     * <p>不带 {@code AS} 时只有三种情况算别名:反引号标识符、普通标识符、且该标识符
+     * 不是投影项后面的子句起点({@code FROM} / {@code WHERE} / {@code ORDER} 等)。
+     * 普通列与 {@code COUNT(*)} 共用这一条路径,不各写一套。</p>
+     *
+     * @return 别名;没有别名返回 {@code null}
+     */
+    private String parseOptionalAlias(String what) {
+        if (matchKeyword("AS")) {
+            return expectIdentifier(what);
+        }
+        Token t = current();
+        if (t.type() == TokenType.QUOTED_IDENT) {
+            return expectIdentifier(what);
+        }
+        if (t.type() == TokenType.IDENT
+                && !ITEM_FOLLOW_KEYWORDS.contains(t.text().toUpperCase(java.util.Locale.ROOT))) {
+            return expectIdentifier(what);
+        }
+        return null;
+    }
+
+    /**
+     * LIMIT 子句(FR-549 ~ FR-552):三种写法等价地归一到 count / offset。
+     *
+     * <pre>
+     *   LIMIT n                 → count = n, offset = null
+     *   LIMIT off, n            → count = n, offset = off
+     *   LIMIT n OFFSET off      → count = n, offset = off
+     * </pre>
+     *
+     * 数值必须是非负整数(INTEGER token);负数(前导 {@code -})、小数、缺参数
+     * 都在对应 token 的位置报 1064(边界 31)。
+     */
+    private Limit parseLimitClause() {
+        expectKeyword("LIMIT");
+        int first = parseLimitNumber("LIMIT 的非负整数");
+        if (match(TokenType.COMMA)) {
+            int count = parseLimitNumber("LIMIT 的行数");
+            return new Limit(count, first);
+        }
+        if (matchKeyword("OFFSET")) {
+            int offset = parseLimitNumber("OFFSET 的非负整数");
+            return new Limit(first, offset);
+        }
+        return new Limit(first, null);
+    }
+
+    private int parseLimitNumber(String what) {
+        Token t = expect(TokenType.INTEGER, what);
+        long v;
+        try {
+            v = Long.parseLong(t.text());
+        } catch (NumberFormatException e) {
+            throw error(t, what + " 取值非法: " + t.text());
+        }
+        if (v < 0 || v > Integer.MAX_VALUE) {
+            throw error(t, what + " 取值非法: " + v);
+        }
+        return (int) v;
+    }
+
+    /** LIMIT 子句解析结果:count = 取多少行,offset = 先跳过多少行(null 表示 0)。 */
+    private record Limit(Integer count, Integer offset) {
+    }
+
+    private boolean isCountStar() {
+        if (current().type() != TokenType.IDENT
+                || !current().text().equalsIgnoreCase("COUNT")) {
+            return false;
+        }
+        if (index + 3 >= tokens.size()) {
+            return false;
+        }
+        return tokens.get(index + 1).type() == TokenType.LPAREN
+                && tokens.get(index + 2).type() == TokenType.STAR
+                && tokens.get(index + 3).type() == TokenType.RPAREN;
+    }
+
+    // ------------------------------------------------------------ 无 FROM 的字面量投影(FR-560)
+
+    /** {@code SELECT} 之后紧跟字面量 → 无 {@code FROM} 的字面量投影(FR-560)。 */
+    private boolean isLiteralProjectionStart() {
+        Token t = current();
+        return switch (t.type()) {
+            case INTEGER, DECIMAL, STRING, MINUS -> true;
+            case IDENT -> t.text().equalsIgnoreCase("NULL");
+            default -> false;
+        };
+    }
+
+    /**
+     * {@code SELECT <literal>[, <literal>...]}(FR-560):返回一行,列名为字面量文本。
+     * 字面量只收整数 / 小数 / 单引号字符串 / {@code NULL};表达式与函数仍报 1064(边界 39)。
+     */
+    private Ast.Statement parseLiteralProjection() {
+        List<Ast.LiteralItem> items = new ArrayList<>();
+        do {
+            items.add(parseLiteralItem());
+        } while (match(TokenType.COMMA));
+        return new Ast.SelectLiterals(items);
+    }
+
+    private Ast.LiteralItem parseLiteralItem() {
+        boolean negative = match(TokenType.MINUS);
+        Token t = current();
+        switch (t.type()) {
+            case INTEGER -> {
+                advance();
+                long v;
+                try {
+                    v = Long.parseLong(t.text());
+                } catch (NumberFormatException e) {
+                    throw error(t, "整数超出范围: " + t.text());
+                }
+                if (negative) {
+                    v = -v;
+                }
+                Object value = (v >= Integer.MIN_VALUE && v <= Integer.MAX_VALUE)
+                        ? (Object) (int) v : (Object) v;
+                return new Ast.LiteralItem(value, (negative ? "-" : "") + t.text());
+            }
+            case DECIMAL -> {
+                advance();
+                double d;
+                try {
+                    d = Double.parseDouble(t.text());
+                } catch (NumberFormatException e) {
+                    throw error(t, "小数格式非法: " + t.text());
+                }
+                return new Ast.LiteralItem(negative ? -d : d, (negative ? "-" : "") + t.text());
+            }
+            case STRING -> {
+                if (negative) {
+                    throw error(t, "字符串前不能加负号");
+                }
+                advance();
+                return new Ast.LiteralItem(t.text(), t.text());
+            }
+            case IDENT -> {
+                if (!negative && t.text().equalsIgnoreCase("NULL")) {
+                    advance();
+                    return new Ast.LiteralItem(null, "NULL");
+                }
+                throw error("无 FROM 的 SELECT 只支持字面量(整数 / 小数 / 单引号字符串 / NULL)");
+            }
+            default -> throw error(
+                    "无 FROM 的 SELECT 只支持字面量(整数 / 小数 / 单引号字符串 / NULL)");
+        }
     }
 
     // ------------------------------------------------------------ 条件
@@ -470,6 +1045,12 @@ public final class Parser {
             return true;
         }
         return false;
+    }
+
+    /** 只看不消费:当前 token 是否是给定关键字。 */
+    private boolean peekKeyword(String keyword) {
+        Token t = current();
+        return t.type() == TokenType.IDENT && t.text().equalsIgnoreCase(keyword);
     }
 
     private void expectKeyword(String keyword) {

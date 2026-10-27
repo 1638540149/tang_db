@@ -23,6 +23,8 @@ public final class Protocol {
     // 状态位(SERVER_STATUS_*)
     public static final int SERVER_STATUS_IN_TRANS = 0x0001;
     public static final int SERVER_STATUS_AUTOCOMMIT = 0x0002;
+    /** 非最后一条语句的结束包带此位(FR-557);单条语句绝不带。 */
+    public static final int SERVER_MORE_RESULTS_EXISTS = 0x0008;
 
     // 字符集(K64:utf8mb4_general_ci = 45)
     public static final int CHARSET_UTF8MB4_GENERAL_CI = 45;

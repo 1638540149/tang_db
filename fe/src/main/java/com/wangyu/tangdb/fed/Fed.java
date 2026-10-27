@@ -96,7 +96,7 @@ public final class Fed implements AutoCloseable {
         // ④ 会话层 + 执行入口 + 协议监听
         SessionManager sessions = new SessionManager(config.sessionMax(), config.sessionIdleTimeout());
         SqlEngine engine = new SqlEngine(client, catalog, sessions, registry,
-                config.heartbeatEnabled(), config.user());
+                config.heartbeatEnabled(), config.user(), config.indexBackfillBatch());
         byte[] storedHash = NativePassword.deriveStoredHash(config.password());
 
         MysqlServer mysqlServer;

@@ -15,6 +15,8 @@ public final class Session {
     private final Executor executor;
     private final long startTimeMillis;
     private volatile long lastActiveMillis;
+    /** KILL 标记:被 KILL 的会话下一条语句明确失败(SPEC-P4 FR-541)。 */
+    private volatile boolean killed;
 
     public Session(long id, String source, Executor executor) {
         this.id = id;
@@ -56,5 +58,14 @@ public final class Session {
     /** 刷新最近活跃时间(收到语句时调用)。 */
     public void touch() {
         lastActiveMillis = System.currentTimeMillis();
+    }
+
+    /** KILL:标记会话已终止;执行入口在收到下一条语句时拒绝(FR-541 / K97)。 */
+    public void kill() {
+        killed = true;
+    }
+
+    public boolean killed() {
+        return killed;
     }
 }

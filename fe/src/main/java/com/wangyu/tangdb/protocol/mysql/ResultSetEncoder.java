@@ -31,10 +31,24 @@ public final class ResultSetEncoder {
 
     /** 把一条语句的执行结果编码成一组协议包(OK 包 或 文本结果集)。 */
     public static List<byte[]> forResult(Result result, int statusFlags, boolean includeInfo) {
+        return forResult(result, statusFlags, includeInfo, false);
+    }
+
+    /**
+     * 把一条语句的执行结果编码成一组协议包;{@code moreResults} 为 true 时,
+     * **终止包**(OK 包或结果集的最后一个 EOF)带 {@code SERVER_MORE_RESULTS_EXISTS}(FR-557)。
+     *
+     * <p>单条语句一律传 false,报文序列与 P4 之前逐字节一致。</p>
+     */
+    public static List<byte[]> forResult(Result result, int statusFlags, boolean includeInfo,
+                                         boolean moreResults) {
+        int terminalStatus = moreResults
+                ? statusFlags | Protocol.SERVER_MORE_RESULTS_EXISTS
+                : statusFlags;
         if (result instanceof Result.Message message) {
             long affected = message.affectedRows() >= 0 ? message.affectedRows() : 0;
             String info = includeInfo ? message.text() : null;
-            return List.of(okPacket(affected, 0, statusFlags, 0, info));
+            return List.of(okPacket(affected, 0, terminalStatus, 0, info));
         }
         Result.Table table = (Result.Table) result;
         List<ColumnInfo> columns = new ArrayList<>(table.columns().size());
@@ -52,7 +66,7 @@ public final class ResultSetEncoder {
         for (Object[] row : table.rows()) {
             packets.add(rowPacket(row));
         }
-        packets.add(eofPacket(0, statusFlags));
+        packets.add(eofPacket(0, terminalStatus));
         return packets;
     }
 

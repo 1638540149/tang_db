@@ -40,15 +40,18 @@ public final class MysqlClientConnection implements AutoCloseable {
         private final long affectedRows;
         private final String info;
         private final boolean inTransaction;
+        private final boolean moreResults;
 
         private Response(boolean resultSet, List<String> columns, List<Object[]> rows,
-                         long affectedRows, String info, boolean inTransaction) {
+                         long affectedRows, String info, boolean inTransaction,
+                         boolean moreResults) {
             this.resultSet = resultSet;
             this.columns = columns;
             this.rows = rows;
             this.affectedRows = affectedRows;
             this.info = info;
             this.inTransaction = inTransaction;
+            this.moreResults = moreResults;
         }
 
         public boolean isResultSet() {
@@ -75,6 +78,11 @@ public final class MysqlClientConnection implements AutoCloseable {
         public boolean inTransaction() {
             return inTransaction;
         }
+
+        /** 服务端是否还有后续结果集(SERVER_MORE_RESULTS_EXISTS,FR-557)。 */
+        public boolean moreResults() {
+            return moreResults;
+        }
     }
 
     private final String host;
@@ -82,6 +90,8 @@ public final class MysqlClientConnection implements AutoCloseable {
     private final Socket socket;
     private final PacketIO io;
     private boolean inTransaction;
+    /** 最近一次结束包是否带 SERVER_MORE_RESULTS_EXISTS(仅 queryAll 使用)。 */
+    private boolean moreResults;
 
     private MysqlClientConnection(String host, int port, Socket socket, PacketIO io) {
         this.host = host;
@@ -94,6 +104,16 @@ public final class MysqlClientConnection implements AutoCloseable {
     public static MysqlClientConnection connect(String host, int port, String user,
                                                 String password, String database)
             throws IOException {
+        return connect(host, port, user, password, database, false);
+    }
+
+    /**
+     * 连接并握手。{@code multiStatements} = true 时在握手响应里声明
+     * {@code CLIENT_MULTI_STATEMENTS}(FR-557 的多结果集路径),配合 {@link #queryAll} 使用。
+     */
+    public static MysqlClientConnection connect(String host, int port, String user,
+                                                String password, String database,
+                                                boolean multiStatements) throws IOException {
         Socket socket = new Socket(host, port);
         InputStream in = socket.getInputStream();
         OutputStream out = socket.getOutputStream();
@@ -105,6 +125,9 @@ public final class MysqlClientConnection implements AutoCloseable {
         long caps = Protocol.CLIENT_LONG_PASSWORD | Protocol.CLIENT_PROTOCOL_41
                 | Protocol.CLIENT_SECURE_CONNECTION | Protocol.CLIENT_PLUGIN_AUTH
                 | Protocol.CLIENT_TRANSACTIONS | Protocol.CLIENT_SESSION_TRACK;
+        if (multiStatements) {
+            caps |= Protocol.CLIENT_MULTI_STATEMENTS;
+        }
         if (database != null && !database.isBlank()) {
             caps |= Protocol.CLIENT_CONNECT_WITH_DB;
         }
@@ -146,6 +169,27 @@ public final class MysqlClientConnection implements AutoCloseable {
         io.setWriteSeq(0);
         io.writePacket(out.toByteArray());
         return readResponse();
+    }
+
+    /**
+     * 执行一条可能含多条语句的 SQL,读到服务端不再带
+     * {@code SERVER_MORE_RESULTS_EXISTS} 为止,返回全部响应(FR-557 / FR-558)。
+     * 中途某条失败时抛 {@link MysqlClientException}(此前已收到的响应由调用方决定怎么用)。
+     */
+    public List<Response> queryAll(String sql) throws IOException {
+        ByteArrayOutputStream out = new ByteArrayOutputStream(8);
+        out.write(Protocol.COM_QUERY);
+        out.writeBytes(sql.getBytes(StandardCharsets.UTF_8));
+        io.setWriteSeq(0);
+        io.writePacket(out.toByteArray());
+        List<Response> responses = new ArrayList<>();
+        while (true) {
+            Response response = readResponse();
+            responses.add(response);
+            if (!response.moreResults()) {
+                return responses;
+            }
+        }
     }
 
     /** COM_INIT_DB:切库。 */
@@ -204,7 +248,7 @@ public final class MysqlClientConnection implements AutoCloseable {
     private Response readResponse() throws IOException {
         byte[] first = io.readPacket();
         if (first.length == 0) {
-            return new Response(false, List.of(), List.of(), 0, null, inTransaction);
+            return new Response(false, List.of(), List.of(), 0, null, inTransaction, false);
         }
         int header = first[0] & 0xFF;
         if (header == 0x00) {
@@ -236,7 +280,7 @@ public final class MysqlClientConnection implements AutoCloseable {
             }
             rows.add(parseRow(rowPacket, columnCount));
         }
-        return new Response(true, columns, rows, 0, null, inTransaction);
+        return new Response(true, columns, rows, 0, null, inTransaction, moreResults);
     }
 
     private Response parseOk(byte[] packet) {
@@ -249,6 +293,7 @@ public final class MysqlClientConnection implements AutoCloseable {
         pos += 2;
         pos += 2; // warnings
         inTransaction = (status & Protocol.SERVER_STATUS_IN_TRANS) != 0;
+        moreResults = (status & Protocol.SERVER_MORE_RESULTS_EXISTS) != 0;
         String info = null;
         if (pos < packet.length) {
             // CLIENT_SESSION_TRACK:info 字符串
@@ -258,7 +303,8 @@ public final class MysqlClientConnection implements AutoCloseable {
                 info = new String(packet, pos, infoLen[0], StandardCharsets.UTF_8);
             }
         }
-        return new Response(false, List.of(), List.of(), affected[0], info, inTransaction);
+        return new Response(false, List.of(), List.of(), affected[0], info, inTransaction,
+                moreResults);
     }
 
     private Object[] parseRow(byte[] packet, int columnCount) {
@@ -296,6 +342,7 @@ public final class MysqlClientConnection implements AutoCloseable {
         if (eof.length >= 5) {
             int status = readLe2(eof, 3);
             inTransaction = (status & Protocol.SERVER_STATUS_IN_TRANS) != 0;
+            moreResults = (status & Protocol.SERVER_MORE_RESULTS_EXISTS) != 0;
         }
     }
 
