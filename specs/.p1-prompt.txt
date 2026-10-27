@@ -1,0 +1,68 @@
+实现 tang_db 的 P1(基座)。工作目录:D:/projects/tang_db
+
+## 必读文档(按顺序读完再动手)
+
+1. `AGENTS.md` —— 项目硬约束和构建方式
+2. `specs/README.md` —— 规约索引
+3. `specs/P1-baseline.md` —— **本期规约,状态 Approved,这是你唯一的施工依据**
+4. `.specify/memory/constitution.md` —— 项目宪法(护栏)
+
+设计文档 `docs/tang_db-设计方案.md` 是背景资料,施工以 P1 规约为准。
+
+## 实现顺序(每完成一步,立刻跑构建/测试确认没坏)
+
+**步骤 1 · 生成桩代码**
+- 用 protoc 从 `proto/tangdb.proto` 生成 Go 代码到 `be/internal/server/pb/`(用 protoc-gen-go 和 protoc-gen-go-grpc)
+- 生成 Java 代码到 FE 侧(用 Maven 的 protobuf 插件,或先手工生成到 `fe/src/main/java/`)
+- 把生成命令固化成 `scripts/gen-proto.sh`
+- protoc 插件位置:`D:/dev/gopath/bin`
+
+**步骤 2 · `be/internal/wal`**
+追加写、CRC32C 校验、每条记录 fsync、逐条重放、尾部截断时的停止逻辑。格式按规约 §5.2。
+
+**步骤 3 · `be/internal/memtable`**
+跳表(SkipList)实现:有序、支持多 goroutine 并发插入、支持有序遍历、支持按 key 查找。
+
+**步骤 4 · `be/internal/segment`**
+列式文件写入与读取:Footer(置于文件末尾)+ 列块(chunk 4096 行)+ ZoneMap + Index Block。本期用原始编码(不做压缩),但结构必须按列组织。文件落盘后只读。
+
+**步骤 5 · `be/internal/manifest`**
+版本记录:当前有效的 segment 列表 + 当前 WAL 编号。更新必须原子(写临时文件 + rename)。`CURRENT` 指针文件的维护。
+
+**步骤 6 · `be/internal/server`**
+gRPC 服务实现 `Ping` / `Put` / `Get`。`Put` 的处理顺序严格按:① 追加 WAL → ② fsync → ③ 写 memtable → ④ 返回 OK。
+
+**步骤 7 · `be/cmd/be/main.go`**
+参数解析(`--data-dir` 默认 `./data/BE`、`--port` 默认 `9100`、`--memtable-size` 默认 64MB)、启动恢复流程、启动信息日志、后台 Flush Worker 的启动。
+
+**步骤 8 · FE(Java)**
+gRPC 客户端封装(连接、错误转换)+ 命令行 CLI,支持 `put <key> <value>` / `get <key>` / `ping` / `exit`。连不上 BE 时给中文提示,不要打印堆栈。
+
+**步骤 9 · 单元测试**
+WAL 编解码与截断、跳表基本操作与并发、segment 读写、启动恢复逻辑。测试必须真跑通。
+
+**步骤 10 · 脚本**
+`scripts/start-be.sh`、`scripts/start-fe.sh`、`scripts/crash-test.sh`(写入 N 条随机 KV → 强杀两进程 → 重启 → 逐条校验 → 输出报告)。注意本机是 Windows,杀进程用 `taskkill /F`。
+
+## 硬约束(违反即返工)
+
+- BE 侧**只允许**两个第三方依赖:`google.golang.org/grpc`、`google.golang.org/protobuf`。**严禁**引入任何现成存储引擎或嵌入式数据库(RocksDB、LevelDB、Badger、Pebble、SQLite、bbolt 等)及其绑定 —— 存储引擎必须自己写。
+- 写路径顺序不可调换:**追加 WAL → fsync → 写 memtable → 返回 OK**。不允许先返回 OK。
+- FE **不得**读写 BE 数据目录下的任何文件。
+- segment 文件一旦落盘不可修改。
+- 本机 `mvn`(sh 脚本版)不可用,一律用 `mvn.cmd`。
+- Go 代理已配好(goproxy.cn),不需要再设。
+- **不要执行 `git commit` / `git push`**,改动留在工作区。
+
+## 验证要求
+
+- 每一步跑 `cd be && go build ./... && go vet ./...`
+- 单元测试真跑,输出真实结果
+- 最后跑一次 `scripts/crash-test.sh`;若本机环境跑不通,说明具体原因,不要跳过不提
+- 交付时列出:改了哪些文件、**实际执行过的命令与真实输出**、哪些项尚未验证
+
+## 不要做的事
+
+- 不要伪造或推测任何测试结果。没跑就写"未验证"。
+- 不要超出 P1 规约范围(不实现 compaction、事务、SQL、表、索引)。
+- 遇到无法解决的阻塞,停下来在最终输出里说明,不要硬编一个看起来能跑的实现。

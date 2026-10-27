@@ -1,0 +1,41 @@
+补充实现 tang_db P4 的两条客户端刚需(SPEC-P4 v0.1f 的 G 组)。工作目录:D:/projects/tang_db
+
+## 背景(读完再动手)
+
+P4 主体已实现并通过验收(`scripts/tests/p4-test.sh` → PASS=97 FAIL=0,FE 253 用例全绿,BE 零改动)。
+实机用 Navicat/DataGrip 连上来后暴露两条缺口,所有者拍板并入本期。**只做这两条,不要顺手做别的。**
+
+必读:`specs/P4-indexes.md` 的 §2.1 **G 组**、**§4.8 FR-549~FR-554**、**K99 / K100**、§8 的 **SC-342 / SC-343**、§9 的**边界 31~33**。
+
+## 要做的事
+
+**1. `LIMIT <offset>, <row_count>` 与 `LIMIT <row_count> OFFSET <offset>`(FR-549 ~ FR-552 / K100)**
+
+- 现在 `SELECT * FROM t LIMIT 0,1000` 报 `1064`(语法错);图形客户端翻页全靠这个写法。
+- Parser:在 `SELECT` 的 `LIMIT` 子句里同时接受三种写法 `LIMIT n` / `LIMIT off,n` / `LIMIT n OFFSET off`;`off`/`n` 必须是非负整数,非法报 `1064` 并指出位置。
+- 执行语义(**先过滤 → 再跳过 offset → 再截断 count**),`Executor.select` 里实现;`offset >= 行数` 返回空集不报错;`LIMIT 0,0` 空集。
+- 索引路径与全表扫路径行为必须一致(两条路径共用同一处 limit 逻辑)。
+- `UPDATE` / `DELETE` 带 `LIMIT` → 明确报 `1235`(不做半实现)。
+
+**2. 虚拟表 `ORDER BY` 放开到多列(FR-553 / K99)**
+
+- 现在 `SELECT ... FROM information_schema.TABLES ORDER BY TABLE_SCHEMA, TABLE_TYPE` 报 `1235`(只支持单列)。
+- 支持多列、每列可 `ASC`/`DESC`,按列序依次比较(前一列相等才比下一列)。
+- **仍只对 `information_schema.*` 生效**;用户表上的 `ORDER BY` 继续明确报"不支持(归 P5)"(K98/K99 的边界不许破)。
+
+## 验证要求
+
+- `cd fe && mvn.cmd test` 全绿(现有 253 个用例不许坏),并为这两条各补单测。
+- 在 `scripts/tests/p4-test.sh` 里补 **SC-342**(三种分页写法结果一致 / offset 越界空集 / `UPDATE ... LIMIT` 报 1235)与 **SC-343**(虚拟表三列排序有序 / 用户表同样语句仍 1235)。
+- 用真实客户端验一遍(**用 3406 端口的常驻 fed**):
+  - `SELECT * FROM default.student LIMIT 0,1000;`(或任一张有你数据的表)必须正常返回
+  - `SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME FROM information_schema.COLUMNS ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION LIMIT 0,50;` 必须有序返回
+- 最后跑 `bash scripts/tests/p4-test.sh`(报告 `tmp/p4-test/report.txt`)与内嵌回归,把真实输出贴出来。
+
+## 硬约束
+
+- 不改 BE、不改 `proto/`;不引任何第三方库。
+- 不把"用户表的 ORDER BY / 聚合"提前做掉(那是 P5)。
+- 不执行 `git commit` / `git push`;不写 `docs/验收报告/*`(核验方写)。
+- 起常驻进程必须后台 + 重定向日志,**不许前台阻塞**;跑脚本前确认 9900/9906/9991 与 9600/9691、9800/9806 没被残留进程占着。
+- 全程自己顺序完成,不要派子代理;做完并真跑过验证再结束;不许伪造输出。

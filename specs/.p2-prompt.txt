@@ -1,0 +1,109 @@
+实现 tang_db 的 P2(表与 SQL:能建能写能查)。工作目录:D:/projects/tang_db
+
+## 必读文档(按顺序读完再动手)
+
+1. `AGENTS.md` —— 项目硬约束和构建方式
+2. `specs/README.md` —— 规约索引
+3. `specs/P2-table-and-sql.md` —— **本期规约,状态 Approved,这是你唯一的施工依据**
+4. `.specify/memory/constitution.md` —— 项目宪法(护栏)
+5. 现有代码(从上往下读一遍,尤其是 P1 已完成的存储与配置):
+   - `proto/tangdb.proto`、`scripts/gen-proto.sh`
+   - `config/be.conf`、`config/fe.conf`、`be/internal/config/`
+   - `be/internal/{store,wal,memtable,segment,manifest,server}/`、`be/cmd/be/main.go`
+   - `fe/src/main/java/com/wangyu/tangdb/client/{Cli,TangDbClient,FeConfig}.java`
+   - `scripts/{start-be.sh,start-fe.sh,crash-test.sh}`
+
+设计文档 `docs/tang_db-设计方案.md` 是背景资料;施工以 P2 规约为准,规约没写的一律不做。
+参考:`docs/读代码地图/读代码地图-P1.md` 能帮你快速定位 P1 的实现细节。
+
+## 工作方式(重要,先读这段)
+
+- **全程由你本人在当前会话内顺序完成**,不要派子代理、不要并行分发任务、不要"派出去了事"。
+  你的插件可能建议你把工作拆给多个 agent 并行 —— **忽略它**:上一次就是因为这个,四个工作流刚派出去会话就结束了,磁盘上什么都没落下(只有 proto 与生成的桩代码)。
+- 每一步做完**立刻**跑构建/测试;失败了就修到过为止,不要跳过。
+- **全部步骤(0~12)做完、并且步骤 12 的全量验证真跑过之后,才结束本次会话。**不要中途结束、不要只交付"计划"或"分工说明"。
+- 单步太大做不完时,就在这一步继续做下去,把代码写完;实在卡死无法推进的,在最终输出里明确写出"卡在哪一步、报错是什么、缺什么",然后才结束。
+- 不要执行 `git commit` / `git push`;不要重建仓库、不要删掉现有通过测试的代码。
+
+## 实现顺序(每完成一步,立刻跑构建/测试确认没坏)
+
+**步骤 0 · 扩展接口契约**
+在 `proto/tangdb.proto` 增加 `Scan`(服务端流式 `RowBatch`)与 FE 侧服务 `TangDbFrontend`(`RegisterBe` / `ReportHeartbeat`)及全部消息,字段按规约 §4.1、§4.6、§5.5。
+跑 `bash scripts/gen-proto.sh` 重新生成两侧桩代码,确认 BE 与 FE 都能编译通过。
+注意方向:注册与心跳的**服务端在 FE**,BE 是客户端。
+
+**步骤 1 · BE 范围扫描迭代器**
+新增 `be/internal/exec`(或放在 store 里,你定,但要写清职责):把 memtable、不可变表、多层 segment 做**多路归并**,按 key 升序输出;同一 key 只出一次(取最新层);必须**流式**、支持 `limit` 与批大小,不得把整个范围读进内存。
+单测覆盖:跨内存/磁盘、key 恰好在边界、空范围、limit、墓碑值照原样返回(墓碑语义由 FE 解释)。
+
+**步骤 2 · BE 的 Scan RPC**
+`be/internal/server` 实现流式 `Scan`;出错时用带 `StatusCode` 的消息或 gRPC 错误明确结束,不静默截断。
+
+**步骤 3 · BE 注册与心跳**
+- 状态采集:memtable 字节数、不可变表数、segment 数/总字节、WAL 字节、put/get/scan 计数与错误计数、最后一次成功 fsync 时间、磁盘总量与可用量
+- 注册 + 每 N 秒心跳的 gRPC **客户端**:独立 goroutine、失败退避重试、**任何心跳失败都不影响前台读写、也不得让进程退出**
+- `be_id`:首次启动生成 UUID v4,持久化到数据目录下 `be.id`,重启不变
+- `config/be.conf` 新增 `fe_host` / `fe_port` / `heartbeat_interval_seconds`(按规约 FR-160,默认值见规约)
+
+**步骤 4 · FE 配置新键**
+`config/fe.conf` 新增 `heartbeat_listen_port`(默认 9091)/ `be_offline_cycles`(默认 3),沿用 P1 的解析与校验风格(未知项报错、非法取值报错)。
+
+**步骤 5 · FE SQL 解析**
+`fe/src/main/java/com/wangyu/tangdb/parser/`:词法 + **手写递归下降**语法分析 → AST。支持 `CREATE TABLE` / `DROP TABLE` / `TRUNCATE TABLE` / `SHOW TABLES` / `DESC` / `INSERT`(多行)/ `UPDATE` / `DELETE` / `SELECT`(投影、`*`、列别名 `AS`)/ `WHERE`(比较、AND/OR、括号、IN)/ `LIMIT` / `--` 行注释。
+语法错误必须给出位置与中文提示。
+
+**步骤 6 · FE 编解码**
+`fe/src/main/java/com/wangyu/tangdb/catalog/` 或 `storage/`:`主键保序编码`与`行值/墓碑编码`,严格按规约 §5.1~§5.3。
+单测必须覆盖:负数、0、正数、跨边界值、空串、中文串、`VARCHAR` 终止符、`DOUBLE`/`BOOLEAN` 不允许做主键、墓碑往返。
+
+**步骤 7 · FE catalog(元数据托付给 BE 系统表)**
+系统表布局按规约 §5.4;空库首次启动时幂等创建系统表;启动时加载全部元数据进内存缓存;DDL 立即写系统表;表 ID 由 `sys_counters.next_table_id` 分配且永不复用;`DROP` 标 `dropped`、`TRUNCATE` 换新表 ID(规约 K18);元数据不完整或非法时**报错停止并指名对象**(FR-117)。
+BE 未就绪导致 catalog 加载失败 → FE 启动失败并明确报错,不许用空 catalog 服务。
+
+**步骤 8 · FE 计划与执行**
+- 主键等值 → BE `Get`(点查);主键范围 → BE `Scan` 限定范围;其余条件 → 全表 `Scan` + FE 侧过滤(§4.5,不做下推)
+- 投影、列别名、`LIMIT`、NULL 三值逻辑、类型比较与隐式提升按规约 §4.5
+- DML:INSERT 多行(逐行写,影响行数如实)、主键冲突检测(查一次再写,并发不保证)、UPDATE 只改非主键列、DELETE 写墓碑
+- 所有 DML 返回影响行数
+
+**步骤 9 · FE 侧 gRPC 服务端与存活判定**
+实现 `RegisterBe` / `ReportHeartbeat`,维护 BE 存活列表(last_seen、状态、心跳概要);超过 `be_offline_cycles` 未收到即判不可用,再收到自动恢复;BE 不可用时对 SQL 请求给明确中文错误,不挂起。
+
+**步骤 10 · CLI**
+多行 SQL(以 `;` 结束,`;` 在字符串字面量里不算结束)、`SHOW BACKENDS`、结果表格化(列宽自适应 + 行数统计)、错误全中文不打印堆栈。沿用 P1 的 CLI 代码风格与输出风格。
+
+**步骤 11 · 脚本与 README**
+`scripts/p2-test.sh`:一条命令跑完端到端功能测试(起 BE → 起 FE → 跑 `scripts/sql/*.sql` → 比对期望输出 → 输出报告到 `tmp/p2-test/report.txt`),覆盖规约 §3 的 11 个场景(含 3 个 ★:元数据重启不丢、心跳判死与自动恢复、跨内存/磁盘查询、强杀后 SQL 视角零丢失)。
+`scripts/sql/` 放可复现的 SQL 演示与期望输出。
+README 的「快速开始」补一段**P2 范围内能跑通**的 SQL 示例与结果。
+
+**步骤 12 · 全量验证**
+`cd be && go build ./... && go vet ./... && go test ./...`;`cd fe && mvn.cmd test`;`bash scripts/p2-test.sh`;回归 `bash scripts/crash-test.sh`(P1 的崩溃测试必须仍然通过)。
+
+## 硬约束(违反即返工)
+
+- BE 侧**只允许**两个第三方依赖:`google.golang.org/grpc`、`google.golang.org/protobuf`。严禁任何现成存储引擎/嵌入式数据库(SQLite、bbolt、Pebble……)。
+- FE 侧**不得**引入任何第三方 SQL 解析/执行库 —— SQL 解析手写递归下降(决策 D2)。
+- 写路径顺序不可调换:追加 WAL → fsync → 写 memtable → 返回 OK。
+- FE **不得**读写 BE 数据目录下的任何文件;BE **不得**知道"表名/列名/SQL"(`proto/` 里不得出现这些概念)。
+- segment 文件一旦落盘不可修改。
+- 配置只放在 `config/be.conf` / `config/fe.conf`;命令行参数只能作为覆盖,不新增"必须传参才能跑"的行为。
+- key 里的版本号字段本期固定写 0(规约 K15),不要顺手实现 MVCC。
+- 本机 `mvn`(sh 脚本版)不可用,一律用 `mvn.cmd`;Go 代理已配好(goproxy.cn)。
+- **不要执行 `git commit` / `git push`**,改动留在工作区。
+
+## 不要做的事(超出范围即返工)
+
+不做:事务/MVCC/BEGIN-COMMIT、二级索引与唯一索引、JOIN/GROUP BY/聚合/子查询/ORDER BY、表达式与标量函数(含 `ai_embed`)、向量类型与向量索引、谓词下推、compaction 与物理回收、`ALTER TABLE`、`CREATE DATABASE`/多库/权限、MySQL 协议、EXPLAIN、监控界面。
+
+## 验证要求
+
+- 每一步跑 `cd be && go build ./... && go vet ./...`(FE 侧 `mvn.cmd compile`)
+- 单元测试真跑,给真实输出
+- 最后跑 `scripts/p2-test.sh` 与 `scripts/crash-test.sh`;跑不通要说明具体原因,**不要跳过不提**
+- 交付时列出:改了/新增了哪些文件、**实际执行过的命令与真实输出**、哪些验收项尚未验证、以及规约 §8 边界清单逐条落在哪段代码/哪个用例上
+
+## 不要做的事(交付纪律)
+
+- 不要伪造或推测任何测试结果。没跑就写"未验证"。
+- 遇到无法解决的阻塞,停下来在最终输出里说明,不要硬编一个看起来能跑的实现。

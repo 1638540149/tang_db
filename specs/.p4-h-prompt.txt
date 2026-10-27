@@ -1,0 +1,71 @@
+补充实现 tang_db P4 的 H 组(客户端自检语句补齐)。工作目录:D:/projects/tang_db
+
+## 背景(读完再动手)
+
+P4 主体与 G 组已实现并通过核验(p4-test.sh PASS=97 / FAIL=0,FE 全绿,BE 零改动)。
+2026-10-27 所有者用 Navicat 连 3406 的常驻 fed,连接期自检语句报 1235。所有者拍板"补",**只做这两条,不要顺手做别的**。
+
+必读:`specs/P4-indexes.md` 的 §2.1 **H 组**、**§4.9 FR-555~FR-558**、**K101 / K102**、§8 的 **SC-344 / SC-345**、§9 的**边界 34~37**、§2.2 新补的一行「无 `FROM` 常量投影归 P5」。
+
+实测现状(复现命令,已确认):
+
+```
+SELECT COUNT(*) AS support_ndb FROM information_schema.ENGINES WHERE Engine = 'ndbcluster'
+  → 1235 「information_schema 上不支持该查询形态」
+SELECT COUNT(*) FROM information_schema.ENGINES WHERE Engine = 'ndbcluster'   → 正常
+SHOW VARIABLES LIKE 'lower_case_%'; SHOW VARIABLES LIKE 'sql_mode'; SELECT COUNT(*) ...
+  → 1235(Navicat 连接期把 3 条语句塞进一个 COM_QUERY)
+```
+
+## 要做的事
+
+**1. `COUNT(*)` 接受可选别名(FR-555 / K102)**
+
+- 现在 `fe/src/main/java/com/wangyu/tangdb/parser/Parser.java` 的 `parseSelect` 里,`countStar` 分支吃 `COUNT` `(` `*` `)` 后直接 `expectKeyword("FROM")`,`AS 别名` 会被判语法错。
+- 改:与普通列的别名处理走同一套(带不带 `AS` 都收,别名走 `expectIdentifier`),AST 里别为它单开一条路径(`Ast.Select` 若需加字段,就用与 `Ast.Item.alias` 同义的字段名)。
+- `fe/src/main/java/com/wangyu/tangdb/execute/MetaCommands.java` 的 `informationSchema(Ast.Select)`:`countStar` 时结果列名 = 别名,没有别名时仍为 `COUNT(*)`。
+- 边界不变:用户表上的 `COUNT(*)`(带不带别名)继续报 1235(FR-554 / H-5)。
+
+**2. 单包多语句(FR-556 ~ FR-558 / K101)**
+
+- SQL 入口(`fe/src/main/java/com/wangyu/tangdb/execute/SqlEngine.java`)把一条文本按**顶层分号**切成 N 条,逐条走**既有**单条路径(兼容层 + Parser + Executor 都不改),对外返回结果列表。
+- 切分必须感知:单引号 / 双引号 / 反引号、`--` 行注释、`#` 行注释、`/* */` 块注释;里面的分号不切。连续分号与尾随分号产生空语句 → 忽略、不报 1064。转义(如 `''`)要正确跳过。
+- 一条失败立即停(FR-558):只回该条的错误包,后面不执行,连接保持。错误码/文案与单条执行时完全一致。
+- 回包(`fe/src/main/java/com/wangyu/tangdb/protocol/mysql/ConnectionHandler.java`):
+  - 客户端握手声明了 `CLIENT_MULTI_STATEMENTS`(能力位常量已在 `Protocol` 里)→ 逐条回结果集/OK,非最后一条的结束包带 `SERVER_MORE_RESULTS_EXISTS`(0x0008),最后一条不带;
+  - **未声明** → 只回**最后一条**语句的结果(前面的照常执行、结果丢弃),绝不追加多余结果集(会协议错位);
+  - 服务端**不主动置** `CLIENT_MULTI_STATEMENTS` 能力位(FR-434 原文不变);
+  - 单条语句的报文序列必须与今天**逐字节一致**(不许因为走批路径而多带状态位)。
+- 协议层不许出现任何 SQL 语义判断(引号/分号识别是 SQL 词汇层,放 `SqlEngine` 侧;AGENTS.md 红线)。
+
+## 验证要求
+
+- `cd fe && mvn.cmd test` 全绿(现有用例一个不许坏);为这两条各补单测:
+  - 别名:带 `AS` / 不带 `AS` / 用户表上仍 1235;
+  - 切分器:`'a;b'`、反引号 `` `a;b` ``、`-- ;`、`/* ; */`、`;;`、尾随分号、空文本;
+  - 批量执行:第 2 条错 → 只回第 2 条错误、第 3 条未执行(可用计数型假 store 或日志断言);
+  - 多结果集:声明能力位时 3 条 → 前两条带 MORE 位、最后一条不带;未声明时只回最后一条。
+- `scripts/tests/p4-test.sh` 补 **SC-344 / SC-345**(脚本内用 `MysqlErrorCheck` 的等价方式断言 `CODE=0` 与列名;`p4-test.sh` 用独立高位端口,**不要碰 3406**),跑完把 `tmp/p4-test/report.txt` 的 PASS/FAIL 真数贴出来。
+- 真客户端实测:自己在高位端口起一次 fed(后台 + 日志重定向),用 `java -cp <fe>/target/classes;<fe>/target/test-classes;<cp> com.wangyu.tangdb.index.MysqlErrorCheck <port> root tangdb default "<sql>"` 跑:
+  1. `SELECT COUNT(*) AS support_ndb FROM information_schema.ENGINES WHERE Engine = 'ndbcluster'` → `CODE=0` + 列名 `support_ndb`
+  2. 那 3 条合成一包 → `CODE=0`
+  3. `SELECT COUNT(*) FROM default.<有数据的表>` → 仍 1235
+- 回归:`bash scripts/tests/p4-test.sh`(含 p2/p3/p35)与 `bash scripts/tests/crash-test.sh` 全绿。
+
+## 硬约束
+
+- 不改 BE、不改 `proto/`;不引任何第三方库。
+- 不做无 `FROM` 的常量投影(`SELECT 1` 仍报 1064,归 P5);不放开用户表上的 `ORDER BY` / 聚合。
+- 不执行 `git commit` / `git push`;不写 `docs/验收报告/*`(核验方写);README 若要补一句「已支持单包多语句」可改 `README.md` 的客户端兼容小段。
+- 起常驻进程必须后台 + 重定向日志,**不许前台阻塞**;跑脚本前确认 9900/9906/9991 与 9600/9691、9800/9806 没被残留进程占着;**不要动 3406 上所有者正在用的 fed**。
+- 全程自己顺序完成,不要派子代理;做完并真跑过验证再结束;不许伪造输出。
+
+
+## 追加任务 3(2026-10-27 实机第二轮反馈,所有者口径:属 P4 的缺口就在 P4 补完)
+
+**3. `SHOW PROCEDURE STATUS` / `SHOW FUNCTION STATUS` 返回列正确的空集(FR-559 / H-6 / SC-346 / 边界 38)**
+
+- 现状:`SHOW PROCEDURE STATUS WHERE Db = 'def'` 报 1235(Navicat 打开每个库都会发一条)。
+- 要求:接受 `SHOW PROCEDURE STATUS`、`SHOW FUNCTION STATUS`、`SHOW FUNC STATUS`,可带 `LIKE '<pat>'` 与 `WHERE <cond>`;返回 11 列空集:Db / Name / Type / Definer / Modified / Created / Security_type / Comment / character_set_client / collation_connection / Database Collation(与 `SHOW ROUTINES` 的列口径一致)。
+- `WHERE` 过滤走现有 SHOW 过滤路径(列名与输出列名一致);过滤到不存在库 / LIKE 无匹配 → 空集不报错。
+- 不实现真正的存储过程/函数(仍是空集),`SHOW CREATE PROCEDURE` 保持报不支持。

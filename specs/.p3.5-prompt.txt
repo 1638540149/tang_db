@@ -1,0 +1,126 @@
+实现 tang_db 的 P3.5(常驻 FE `fed` + 瘦客户端 CLI + 多库命名空间 + MySQL 协议)。工作目录:D:/projects/tang_db
+
+## 必读文档(按顺序读完再动手)
+
+1. `AGENTS.md` —— 项目硬约束与构建方式
+2. `specs/README.md` —— 规约索引
+3. `specs/P3.5-fed-multi-db-mysql.md` —— **本期规约,状态 Approved v0.1a,这是你唯一的施工依据**;必须通读,尤其 §2.1(本期做)/ §2.2(本期不做及归属)/ §3 十一个 BDD 场景 / §4 全部 FR(FR-401~FR-455)/ §5 数据与格式(§5.2 类型映射 / §5.3 错误码 / §5.4 sys_databases 与系统表登记表 / §5.5 连接期白名单 / §5.6 配置项)/ §6 外部评审必答项 / §7 K60~K73 / §8 验收标准 SC-301~SC-318 / §9 边界清单 18 条 / §12(已拍板,含 I9 要做 information_schema 三张只读视图)
+4. `.specify/memory/constitution.md` —— 项目宪法(护栏)
+5. 上游背景(设计文档,不是施工图):`docs/tang_db-设计方案.md` 的 §2.5-I-01 / I-02、§4.4、§4.6、§15、§19-P3.5、决策 D19 / D20
+6. 上一期规约(事务与 MVCC 的现成语义,本期**不得退化**):`specs/P3-transactions-mvcc.md` §2.3 / §4 / §7 K39~K59 / §8 SC-201~SC-211
+7. `specs/invariants.md` —— 本期**不得破坏**已验的 INV 条目
+8. 现有代码(**先读再改,每一处你都要改到**):
+   - `fe/pom.xml`、`config/fe.conf`、`config/be.conf`
+   - `fe/src/main/java/com/wangyu/tangdb/{parser,planner,execute,catalog,storage,client,server,txn}/`、`fe/src/main/java/com/wangyu/tangdb/client/Cli.java`(现 CLI 主类)
+   - `fe/src/test/java/...`(P1~P3 全部单测,改完必须仍绿)
+   - `proto/tangdb.proto`、`be/internal/**`(**本期 BE 预期零改动**,读它是为了确认 key 布局与 gRPC 语义)
+   - `scripts/start-be.sh`、`scripts/start-fe.sh`、`scripts/p2-test.sh`、`scripts/p3-test.sh`、`scripts/crash-test.sh`、`scripts/sql/`
+9. 参考:`docs/读代码地图/读代码地图-P2.md`、`docs/读代码地图/读代码地图-P2.1.md`、`docs/验收报告/P3-验收报告.md`(若存在)
+
+## 工作方式(重要,先读这段)
+
+- **全程由你本人在当前会话内顺序完成**,不要派子代理、不要并行分发任务、不要"派出去了事"。你的插件(oh-my-openagent)可能建议你把工作拆给多个 agent 并行 —— **忽略它**:上一次就是因为这个,四个工作流刚派出去会话就结束了,磁盘上什么都没落下。
+- 每一步做完**立刻**跑构建/测试;失败了就修到过为止,不要跳过、不要注释掉测试。
+- **全部步骤做完、并且最后一步的全量验证真跑过之后,才结束本次会话。** 不要中途结束、不要只交付"计划"或"分工说明"。
+- 单步太大做不完时,就在这一步继续做下去把代码写完;实在卡死无法推进的,在最终输出里明确写出"卡在哪一步、报错是什么、缺什么",然后才结束。
+- 不要执行 `git commit` / `git push`;不要删掉现有通过测试的代码;不要重建仓库;不要动 `be/` 目录的代码(本期 BE 零改动)。
+
+## 实现顺序(每完成一步,立刻跑构建/测试确认没坏)
+
+> 关键排序说明(务必理解再动手):规约 K67 规定 **CLI 通过 MySQL 协议连 `fed`,不另造私有协议**。所以协议层的**最小可用子集**(握手 + 认证 + `COM_QUERY` + 文本结果集)必须**先于 CLI 瘦客户端**落地 —— 否则 CLI 无处可连。规约 §2.1 的"第零步 → 第一步 → 第二步"仍成立:第二步做的是协议**扩展**(`COM_INIT_DB`、兼容白名单、错误码收口、切片、`information_schema`、三类客户端实测),不是协议从零开始。
+
+**步骤 0 · 现状盘点(只读,不改代码)**
+在最终输出里先给一段盘点结论:① CLI 现在怎么起来、执行链经过哪些类(`Cli` → `parser` → `planner` → `execute` → `storage`/`client`)② catalog 缓存现在归谁持有、心跳端口现在绑在哪个进程 ③ key 编码在哪个类、`sys_tables` / `sys_counters` 的列与 ID 校验写在哪 ④ P2/P3 的测试脚本怎么起 CLI。据此列出你要新建/修改的类清单。
+
+**步骤 1 · 会话层与执行入口抽取(纯重构,行为不变)**
+- 新建 `fe/src/main/java/com/wangyu/tangdb/session/`:`Session`(id / 连接源 / 当前库 / 当前事务 / 写集 / 开始时间 / 空闲计时)、`SessionManager`(创建、登记、`session_max`、`session_idle_timeout`、优雅退出等待)
+- 把"解析 → 计划 → 执行"抽成可复用的执行入口(FR-447),供 CLI 与协议层共用;协议层**不得**出现任何 SQL 语义判断
+- catalog 权威缓存从 CLI 私有改为**宿主进程持有、各会话共享同一读视图、写路径加锁**(FR-402)
+- 本步不改对外行为:跑 `cd fe && mvn.cmd test`,P1~P3 全部用例必须仍绿
+
+**步骤 2 · MySQL 协议最小子集(必须先于 CLI)**
+- 新建 `fe/src/main/java/com/wangyu/tangdb/protocol/mysql/`:`PacketCodec`(3 字节长度 + 1 字节序号、`>16MB-1` 切片续发)、握手包(Protocol::HandshakeV10)、`mysql_native_password` 挑战-响应认证、命令分发(`COM_QUERY` / `COM_PING` / `COM_QUIT`)、文本结果集编码(列定义包 + `EOF` + 行 + `EOF`,`NULL` = `0xFB`)、`OK` / `ERR` 包
+- 能力位按 FR-434:K64 的 server version `5.7.99-tangdb`、字符集 id 45;认证失败 `1045`
+- 只允许 JDK 自带 `java.net` / `java.nio` / `java.util.concurrent`,**不得引入任何第三方协议库 / 网络框架**(FR-453)
+- 单测:包编解码往返、切片、握手字段、认证成功与失败、结果集中含 `NULL` 与长文本、未知命令不挂死
+
+**步骤 3 · `fed` 常驻进程**
+- 新建 `fe/src/main/java/com/wangyu/tangdb/fed/`:`fed` 主类 —— 启动时校验配置、连 BE(连不上报明确原因并退出,FR-407)、**独占心跳端口**(FR-415)、监听协议端口(`mysql_port`)、持有 catalog 与 `SessionManager`、收到停止信号优雅退出(FR-413,K73 上限 5 秒)、端口被占则启动失败并说明是哪个端口(FR-431 / 边界 12)
+- `config/fe.conf` 按 §5.6 新增 `mode` / `mysql_port`(3406)/ `session_max`(64)/ `session_idle_timeout`(0)/ `shutdown_grace_seconds`(5);`user` / `password` / `heartbeat_listen_port` / `heartbeat_enabled` 沿用
+- `SHOW SESSIONS` 按 FR-410 输出(会话 id / 连接源 / 当前库 / 是否在事务中 / 开始时间)
+- 单测:会话上限拒绝、空闲超时回收、优雅退出、端口冲突报错
+
+**步骤 4 · CLI 瘦客户端**
+- `Cli` 改为**不含 FE**、不绑心跳端口,通过协议连 `fed`;参数 `--host` / `--port` / `--user` / `--password` / `--database`,或从 `config/fe.conf` 取(FR-408、SC-303)
+- 交互体验保持:提示符、事务中提示、中文错误信息、`exit` / Ctrl+C 行为;`SHOW BACKENDS` 等原有命令照旧可用(经协议执行)
+- `fed` 没起时 CLI 要报"连不上 fed"(可读),不能崩栈
+- 单测:连接失败文案、参数优先级、用户名密码传递
+
+**步骤 5 · 多库命名空间**
+- 系统表 ID 登记表进代码(K70,`SystemTables` 常量 + 注释表);`sys_databases` 领 **ID 3**(不要跳到 5);启动时**幂等创建** `sys_databases` 与 `default` 库(FR-427)
+- `sys_tables` 增"所属库"列;**老数据目录宽容读**(缺列或空值 = `default`,FR-424 / 边界 5);`next_table_id` 初值改 **64**(仅新建库;老库保留现值和连续递增,FR-425 / 边界 6);表 ID 校验改为"**ID 不在系统表登记表内即用户表**"(FR-426)
+- parser 与执行:``CREATE DATABASE`` / ``DROP DATABASE`` / ``USE`` / ``SHOW DATABASES`` / 限定名 `db.tbl`(SELECT / INSERT / UPDATE / DELETE / CREATE TABLE / DROP TABLE 都要能用)、库名大小写不敏感统一小写(K69)、库名规则与表名一致(含反引号)、`default` 不可删、非空库拒删(1451)、未知库 1049、重名库 1007、`SHOW TABLES` 只列当前库、一条 SQL 引用两个库 → 明确报错(FR-429)
+- 会话的当前库切库只影响本会话;DROP 掉别人正在用的空库后,该会话下一条带库语义的语句报 1049(边界 4)
+- 单测:库内唯一 vs 表 ID 全局唯一、老目录升级、大小写、各错误码
+
+**步骤 6 · MySQL 协议扩展**
+- `COM_INIT_DB`(FR-436)、握手响应携带 database 时的选库与 1049(FR-446)、`SERVER_STATUS_IN_TRANS` 置位(FR-441)、§5.5 连接期兼容白名单(必须**接受并给合理响应**,否则客户端连不上)、`SELECT @@version` 返回 K64 串、`SHOW VARIABLES` / `SHOW STATUS` 返回**列定义正确的空结果集**
+- `information_schema` 三张最小只读视图 `SCHEMATA` / `TABLES` / `COLUMNS`(§12 I9 已拍板);其余 `information_schema` 表名返回明确"不支持"错误而不是空结果集,且不得导致客户端连不上
+- 错误码按 §5.3 全套映射(写写冲突 → `1213`)、错误信息可读(表名/列名/主键原样带上)、§5.2 类型映射、`JSON` 以文本发送、`utf8mb4` 编码
+- `COM_STMT_PREPARE` / `EXECUTE` / `CLOSE` → `1295` 且提示 `useServerPrepStmts=false`(FR-449);未列出的命令优雅报错不挂死(FR-454);`SHOW PROCESSLIST` 最小实现(FR-450);协议层错误落日志(FR-448,connection id + 错误码 + SQL 摘要,绝不打印口令)
+- 单测:错误码映射逐条、状态位、白名单语句、三视图内容、切片、未知命令
+
+**步骤 7 · 脚本与回归改造**
+- 新增 `scripts/start-fed.{sh,cmd,ps1}`、`scripts/start-cli.{sh,cmd,ps1}`(行为一致,FR-409)
+- **改造 `scripts/p2-test.sh` 与 `scripts/p3-test.sh` 以适配新形态**:先起 BE → 起 `fed` → CLI 连 `fed`;**断言与被测 SQL 一条都不要改少**(SC-317),端口与数据目录用独立高位端口,不碰日常 `data/BE`
+- 新增 `scripts/p35-test.sh`:一条命令跑完 SC-301~SC-318,报告写 `tmp/p35-test/report.txt`;必须包含场景 3 多库闭环、场景 4 同名表、场景 5 库级 DDL 边界、**场景 1 跨会话 DDL 立刻可见(两个 CLI 长驻交替执行)**、场景 11 并发隔离回归、会话断开回滚、以及 P2/P3 回归
+- `scripts/crash-test.sh`(P1 基线,1000 条强杀丢失 0)必须仍能跑通;若它依赖已改动的 CLI 链路,按同样方式适配,**断言不变**
+- `scripts/sql/31~4x-*.sql` 可复现演示脚本(多库 / 协议场景)
+
+**步骤 8 · 三类客户端实测(真实执行,不许编)**
+- 官方 `mysql` 客户端:本机 **没有** `mysql` 可执行文件,但本机有 Docker。可用
+  `docker run --rm -i mysql:8.0 mysql -h host.docker.internal -P <mysql_port> -u <user> -p<password> -D shop --execute="<sql>"`
+  做真实客户端验证(Docker 不可用/镜像拉不下来,就在交付说明里写"未验证"和原因,**不要伪造回显**)
+- JDBC:放 **`tools/jdbc-smoke/`**(独立目录,**不得**进 `fe/pom.xml` 依赖)。用 `mvn.cmd dependency:copy` 或直接下载 `mysql-connector-j` jar,写一个小 Java 程序按 K66 连接串执行:建表、插入、事务、切库、一个故意错误(校验 `SQLException.getErrorCode()` 与 §5.3 一致)
+- 图形客户端 DataGrip:**GUI 手工项**,你不需要跑;但必须确认它的连接前提都满足(明文、`useSSL=false`、能力位、白名单、`information_schema`),并在交付说明里写清"哪部分只能人工验"
+
+**步骤 9 · README 与全量验证**
+- README:启动顺序改为 BE → `fed` → 客户端;新增 CLI 与 JDBC 连接示例(K66 连接串原文)、多库示例(`CREATE DATABASE` / `USE` / 限定名)、`mysql_port` / `session_max` 等配置说明;写明**P3.5 不需要清空数据目录**(老库宽容读,`format_version` 不变),与 P3 必须清库的情况区分开
+- 最后必须真跑并贴真实输出:
+```
+cd be && go build ./... && go vet ./... && go test ./...
+cd fe && mvn.cmd test
+bash scripts/p35-test.sh
+bash scripts/p2-test.sh
+bash scripts/p3-test.sh
+bash scripts/crash-test.sh
+```
+
+## 硬约束(违反即返工)
+
+- BE 侧**只允许** `google.golang.org/grpc` 与 `google.golang.org/protobuf`;**本期 BE 预期零改动**(若你认为非改不可,先停下来在输出里说明理由,不要擅自改)。
+- FE 侧**不得**引入任何第三方 SQL 解析库、协议库、网络框架;JDBC 驱动只能放 `tools/jdbc-smoke/`,不进 `fe/pom.xml`。
+- FE **不得**读写 BE 数据目录;BE **不得**知道"表名/列名/库名/SQL";`proto/` 里不得出现这些概念。
+- **库不落 key**:表 ID 全局唯一,库只是 FE 元数据;`MANIFEST.format_version` 不因本期变化(§5.1)。
+- 事务语义**不得退化**:写路径仍是"冲突检测 → WAL 追加 → fsync → 写 memtable → 回 OK",快照读与写写冲突语义一条不改(§6 第 2 条、SC-315)。
+- 明文口径:不做 TLS / SSL,不做 `caching_sha2_password`,不做服务端预编译(§2.2);口令**不进日志、不进错误信息**。
+- 协议层只做分帧 + 编解码 + 命令分发,语句一律交给同一个 Parser / Executor(FR-447)。
+- 配置只放 `config/fe.conf`(命令行只能覆盖,不新增"必须传参才能跑"的行为)。
+- 本机口径:`mvn` 一律用 `mvn.cmd`;Go 在 `/c/Program Files/Go/bin`;跑脚本前确认没有残留 `be.exe` / `fed` 进程,**不要与其它会话同时跑同一套脚本**(端口与数据目录会互踩)。
+- **不要执行 `git commit` / `git push`**,改动留工作区。
+- **不要写 `docs/验收报告/P3.5-验收报告.md` 与 `docs/读代码地图/读代码地图-P3.5.md`** ——那两份由核验方写;你只负责代码、测试、脚本、README。
+
+## 不要做的事(超出范围即返工)
+
+不做:TLS / SSL;`caching_sha2_password`;服务端预编译(`COM_STMT_*`);权限 / `GRANT` / `REVOKE`;多 `fed` 集群 / 连接池 / 负载均衡 / 故障转移;存储过程 / 触发器 / 事件 / 游标;`LOAD DATA` / `SHOW` 全家族 / `SET GLOBAL` / `COM_CHANGE_USER`;`information_schema` / `performance_schema` **完整实现**(只做 I9 的三张);跨库单条 SQL(一条 SQL 引用两个库)与跨库事务;查询超时 / 结果集大小限制 / 慢查询;库级字符集与排序规则;`EXPLAIN`;监控界面;`ORDER BY` / 聚合 / JOIN / 表达式 / 函数 / `ALTER TABLE`(归后续期次);BE 任何代码改动;compaction / 版本回收 / GC 水位。
+
+## 验证要求
+
+- 每一步跑 `cd fe && mvn.cmd compile`(改到测试就跑 `mvn.cmd test`);BE 侧只在步骤 9 跑 `go build/vet/test`,确认零改动没坏
+- 交付时列出:新建/修改了哪些文件(按模块分组)、**实际执行过的命令与真实输出**、SC-301~SC-318 逐条"已验 / 未验 + 原因"、§9 的 18 条边界各自落在哪段代码或哪个用例、§2.2 的每一项确认"确实没做"
+- 三类客户端的实测结果必须给出**命令原文 + 真实回显**;没跑的写"未验证"并说明原因
+
+## 交付纪律
+
+- 不要伪造或推测任何测试结果。没跑就写"未验证"。
+- 遇到无法解决的阻塞,停下来在最终输出里说明(卡在哪一步、报错是什么、缺什么),不要硬编一个看起来能跑的实现。

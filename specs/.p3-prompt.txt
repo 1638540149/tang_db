@@ -1,0 +1,135 @@
+实现 tang_db 的 P3(事务与 MVCC:提交序号 / 快照读 / 原子批写 / 写写冲突)。工作目录:D:/projects/tang_db
+
+## 必读文档(按顺序读完再动手)
+
+1. `AGENTS.md` —— 项目硬约束与构建方式
+2. `specs/README.md` —— 规约索引
+3. `specs/P3-transactions-mvcc.md` —— **本期规约,状态 Approved v0.1b,这是你唯一的施工依据**;必须通读,尤其 §2.3(保证/不保证)、§4 全部 FR、§5 数据与格式、§6 外部评审必答项、§7 K39~K59、§8 验收标准、§9 边界清单
+4. `.specify/memory/constitution.md` —— 项目宪法(护栏)
+5. `specs/invariants.md` —— 本期必须让 **INV-4 / INV-5 / INV-6 / INV-11** 从"未实现"变成"已验"
+6. 背景(设计文档,不是施工图):`docs/tang_db-设计方案.md` 的 §4.4 / §6.2 / §6.2.1 / §6.5 / §7 / §8 / §13.2 / §14 / §19-P3
+7. 现有代码(先读再改,你要改的每一处都在这里):
+   - `proto/tangdb.proto`、`scripts/gen-proto.sh`
+   - `be/internal/wal/wal.go`(记录格式与重放)、`be/internal/store/engine.go`(提交路径、刷盘、MANIFEST 维护、WAL 回收)、`be/internal/exec/exec.go`(多路归并扫描器)、`be/internal/memtable/`、`be/internal/segment/`、`be/internal/manifest/manifest.go`、`be/internal/server/server.go`、`be/cmd/be/main.go`、`be/internal/config/config.go`
+   - `fe/src/main/java/com/wangyu/tangdb/{parser,catalog,planner,execute,storage,client,server}/`
+   - `scripts/p2-test.sh`、`scripts/crash-test.sh`、`scripts/sql/`、`README.md`
+8. 参考:`docs/读代码地图/读代码地图-P2.md`、`docs/读代码地图/读代码地图-P2.1.md`、`docs/验收报告/P2.1-验收报告.md`
+
+## 工作方式(重要,先读这段)
+
+- **全程由你本人在当前会话内顺序完成**,不要派子代理、不要并行分发任务、不要"派出去了事"。你的插件(oh-my-openagent)可能建议你把工作拆给多个 agent 并行 —— **忽略它**:上一次就是因为这个,四个工作流刚派出去会话就结束了,磁盘上什么都没落下。
+- 每一步做完**立刻**跑构建/测试;失败了就修到过为止,不要跳过。
+- **全部步骤(0~11)做完、并且步骤 11 的全量验证真跑过之后,才结束本次会话。** 不要中途结束、不要只交付"计划"或"分工说明"。
+- 单步太大做不完时,就在这一步继续做下去把代码写完;实在卡死无法推进的,在最终输出里明确写出"卡在哪一步、报错是什么、缺什么",然后才结束。
+- 不要执行 `git commit` / `git push`;不要删掉现有通过测试的代码;不要重建仓库。
+
+## 实现顺序(每完成一步,立刻跑构建/测试确认没坏)
+
+**步骤 0 · 扩展接口契约(proto)**
+按 §4.1:新增 `BeginTxn` / `CommitTxn` / `AbortTxn` 三个 RPC 及消息;`GetRequest` / `ScanRequest` 增加 `uint64 snapshot`(0 = 最新已提交);`StatusCode` 增加 `CONFLICT = 5`;`CommitTxnResponse` 带 `commit_ts` 与 `conflict_key`。
+`ScanRequest.start_key/end_key` 的语义改为**用户键级**(不含版本段)——在 proto 注释里写清。
+P1 的 `Put` / `Get` / `Ping` **语义保持不变**(`Put` = 单 key 自动提交事务,`crash-test.sh` 依赖它)。
+跑 `bash scripts/gen-proto.sh`,确认 BE 与 FE 都能编译。
+
+**步骤 1 · MANIFEST 扩展与格式版本守卫**
+`manifest.Manifest` 增加 `format_version`(本期 2)与 `last_commit_ts`。
+启动时:`format_version` 缺失或 ≠ 2 → **启动失败**并报规约 FR-362 的文案(要求清空数据目录);空目录首次启动写入 `format_version = 2`。
+`last_commit_ts` 的维护义务(FR-336):每次 flush 产出新 segment、以及每次启动恢复完成时,保证它 ≥ 已落盘数据里的最大 `commit_ts`。
+单测:格式守卫(无字段 / = 1 → 拒绝启动)、`last_commit_ts` 刷新。
+
+**步骤 2 · WAL 批记录**
+按 §5.3 实现 `TypeBatch = 2`:载荷 = `commit_ts(8B 大端)` | `txn_id(8B 大端)` | `kvCount(4B 小端)` | `[klen(4B 小端)|k|vlen(4B 小端)|v] × n`;CRC32C 覆盖 Type + PayloadLen + Payload(与 P1 一致)。
+新增"一次追加一整批 + 一次 fsync"的接口;`TypePut(1)` 保留**只读解析**能力(读 P1 老 WAL)。
+重放:记录尾部读不满或 CRC 不符 → **在此截断、整条丢弃**,不报错、服务照常启动(FR-315)。
+单测:批记录往返编解码、多 KV、大 count、尾部截断(手工构造半条)、CRC 不符、TypePut 兼容。
+
+**步骤 3 · 引擎:序号 + 提交路径 + 版本戳**
+- 全局原子计数器;恢复完成时初始化 `next_commit_ts = max(MANIFEST.last_commit_ts, 重放所见最大 commit_ts) + 1`(FR-316/337;**注意 engine.go 已在 flush 后回收旧 WAL**,序号信息可能只剩 MANIFEST,必须有专门用例覆盖)
+- 提交路径固定顺序:**① 冲突检测 → ② 追加批记录 → ③ fsync → ④ 写 memtable → ⑤ 回 OK**(FR-312);OK 只在 fsync 之后返回
+- 写入时由 BE 在 key 尾部追加版本段 = `^commit_ts`(按位取反、大端 8B,新版本字节序更小;**倒序**)——FE 传来的 key 不含版本段
+- `Put` 内部转成"单 key 自动提交批"(同一条路径,`txn_id = 0`)
+- 每次写路径都更新"已落盘/已提交最大 ts"供心跳与 MANIFEST 使用
+单测:版本戳字节序(越新越小)、提交后即时可读、序号单调。
+
+**步骤 4 · 引擎:读路径与版本分组**
+- `Get(user_key, snapshot)`:返回该用户键满足 `commit_ts ≤ snapshot` 的**最大**版本(FR-322)
+- `Scan(start, end, snapshot, limit, batch_rows)`:按**用户键**范围过滤、按用户键分组、每组只输出一次(取该快照可见版本);仍必须**流式**(每源只保留当前一条,FR-324)
+- 分组依据:去掉 key 尾部 8 字节得到用户键;**BE 不解释用户键的内容**(不得出现表名/列名/SQL)
+- 墓碑照原样返回,由 FE 解释(FR-327)
+单测:同 key 三版本 × 多档快照(15/20/25/30)对拍、墓碑可见性、跨 memtable/segment 的多版本分组、范围边界(含/不含)、limit 在分组之后的语义。
+
+**步骤 5 · 冲突检测**
+按 FR-329~334:提交时对写集每个 key 检查"该用户键**最新已提交版本**是否晚于本事务快照";是 → 整批不写(不追加、不取号)、返回 `CONFLICT` + 第一个冲突 key(按写集顺序,可复现)。
+"检测 → 取号 → fsync"必须在**串行区间**内完成(否则并发事务可能互相覆盖),但**不同用户键的写要能并行推进**(不能把整个写路径变成单线程瓶颈)。
+单测:同 key 并发冲突、不同 key 并发不冲突、墓碑算作"被改过"、冲突时不产生任何写入。
+
+**步骤 6 · 崩溃注入点**
+`config/be.conf` 增加 `test_crash_point`(默认空;取值 `before_wal` / `after_fsync` / `after_memtable` / `before_ok`)与 `max_txn_write_bytes`(默认 `64MB`);`config/fe.conf` 增加 `heartbeat_enabled`(默认 `true`)。
+命中一次即让 BE 进程立即退出(模拟强杀),启动日志必须明显告警(FR-365)。**仅验收用**,不得影响默认路径。
+
+**步骤 7 · BE 单元测试补全**(步骤 1~6 的用例之外)
+批记录/恢复/序号/可见性/冲突/格式守卫/崩注入点开关,全部真跑。
+
+**步骤 8 · FE:key 编码调整 + 事务状态机**
+- `storage/KeyCodec`:不再拼版本段(只产出 表ID + 索引ID + 索引列值 + 主键值);范围条件改为**用户键级**表达(FR-349~351,注意:不要再依赖"8 字节零 + 1 字节"那套与版本段形态绑定的哨兵)
+- `storage/KvStore` 与 `client/TangDbClient`:Get/Scan 带 snapshot;新增 BeginTxn/CommitTxn/AbortTxn 封装;冲突错误转成 `ClientException`/`StoreException` 的中文文案
+- 事务:状态机(IDLE / ACTIVE)、写集(按 key 覆盖,**同事务多次改同一行只留最终版本**)、读己之写、自动提交(事务外单条 DML 自成事务、单条 SELECT 用最新快照)
+- 解析与 CLI:新增 `BEGIN` / `COMMIT` / `ROLLBACK` 语句;事务中提示符显示 `tangdb(txn)>`;事务中再 `BEGIN`、无事务 `COMMIT`/`ROLLBACK`、事务内 DDL 各有明确中文报错(FR-341、FR-357)
+- 主键语义:快照下可见版本存在且非墓碑 → "主键冲突";可见版本是墓碑 → 允许重新插入(FR-352);同事务先删后插按"最后一次操作胜出"(FR-353)
+- UPDATE 仍只允许改非主键列(FR-354)
+- DDL 的元数据(表记录 + 全部列记录 + sys_counters 更新)**必须在同一条批记录里原子生效**(FR-355);启动校验(K26)保留为防御
+
+**步骤 9 · FE:心跳开关与隐式注册**
+FR-366~370:`heartbeat_enabled = false` 时不绑心跳端口、不启动 FE 侧 gRPC 服务,SQL 照常;此时 `SHOW BACKENDS` 明确提示"本会话未启用心跳监听",不报"BE 不可用";FE 收到**未知 be_id** 的心跳时隐式注册(FR-368);默认值下 P2 的"端口被占用即启动失败"行为**保持不变**。
+
+**步骤 10 · 单测 + 端到端脚本 + README**
+- FE 单测:事务状态机、写集覆盖、读己之写、冲突翻译、自动提交、DDL 单批、心跳开关
+- 新增 `scripts/p3-test.sh`:一条命令跑完 §8 的 SC-201~SC-211,报告写到 `tmp/p3-test/report.txt`。**必须包含**:
+  - 事务语义(提交/回滚/读己之写)
+  - 并发写写冲突:两个 CLI 会话抢同一行(第二个会话用 `heartbeat_enabled = false` 启动),一个成功一个报冲突,**且原值未被覆盖**
+  - 四个崩溃注入点(before_wal / after_fsync / after_memtable / 尾部截断),分别断言"全不可见 / 全不可见 / 全可见 / 整体丢弃"
+  - 序号不回退(数据已刷进 segment、旧 WAL 已回收后重启)
+  - 快照对拍(同一主键三版本 + 多档快照)
+  - **P2 回归**:调用 `bash scripts/p2-test.sh`(52/52)与 `bash scripts/crash-test.sh`(丢失 0 条)
+  - 用独立端口与独立数据目录(如 BE 9600 / FE 心跳 9691),不碰日常 `data/BE`
+- 新增 `scripts/sql/2x-*.sql` 可复现演示
+- README:「快速开始」增事务示例(含两会话抢同一行的真实输出);写明**升级到 P3 需要清空数据目录**(格式版本守卫),以及 `test_crash_point` / `heartbeat_enabled` 的用途
+
+**步骤 11 · 全量验证(必须真跑,贴真实输出)**
+```
+cd be && go build ./... && go vet ./... && go test ./...
+cd fe && mvn.cmd test
+bash scripts/p3-test.sh      # SC-201~SC-211 全过
+bash scripts/p2-test.sh      # P2 + P2.1 回归:52/52
+bash scripts/crash-test.sh   # P1 回归:1000 条强杀重启丢失 0 条
+```
+另跑一次性能对比:单行 INSERT 的延迟(与 P2 基线 SPEC-P2 SC-112 的 `< 10ms` 比较,把实测数字写进交付说明)。
+
+## 硬约束(违反即返工)
+
+- BE 侧**只允许**两个第三方依赖:`google.golang.org/grpc`、`google.golang.org/protobuf`。严禁任何现成存储引擎/嵌入式数据库/事务库。
+- FE 侧**不得**引入任何第三方 SQL 解析/执行库。
+- 写路径顺序不可调换:**冲突检测 → WAL 追加 → fsync → 写 memtable → 回 OK**;不允许先回 OK 再落盘,不允许以"后台异步刷盘"跳过 fsync。
+- **提交状态只有一处**:`commit_ts` 在批记录里;不得引入第二个"提交标记"或两阶段提交。
+- **序号不得回退**:允许跳号;任何"序号必须连续"的假设(按号段做区间判断之类)都不允许出现。
+- FE **不得**读写 BE 数据目录;BE **不得**知道"表名/列名/SQL"(`proto/` 里不得出现这些概念;BE 只当"key 尾部 8 字节是版本"这一条结构约定)。
+- segment 文件一旦落盘不可修改。
+- 配置只放 `config/be.conf` / `config/fe.conf`(命令行只能覆盖,不新增"必须传参才能跑"的行为)。
+- 本机口径:`mvn` 一律用 `mvn.cmd`;Go 在 `/c/Program Files/Go/bin`;跑脚本前先确认没有残留 `be.exe`(脚本自己会 taskkill,但**不要与其它会话同时跑同一套脚本** —— 会互相踩)。
+- **不要执行 `git commit` / `git push`**,改动留在工作区。
+- 数据格式本次**不向后兼容**:必须实现格式版本守卫(老目录明确拒绝启动),不要"顺手兼容老数据"。
+
+## 不要做的事(超出范围即返工)
+
+不做:SSI 可串行化 / 间隙锁 / 读未提交 / savepoint / 嵌套事务 / 分布式事务 / 死锁检测 / 事务自动超时;二级索引、唯一索引、索引选择;compaction 与版本回收、GC 水位实现(规则写在规约 K53 里,**本期不实现**);行级索引、布隆过滤;`NOT` / `IS [NOT] NULL` / `LIKE` / `BETWEEN`、`ORDER BY`、`OFFSET`、`LIMIT m,n`、聚合 / `GROUP BY` / `HAVING` / `JOIN`、表达式与函数;`ALTER TABLE`;MySQL 协议、`EXPLAIN`、监控界面;组提交 / 并行 fsync 等性能优化。
+
+## 验证要求
+
+- 每一步跑 `cd be && go build ./... && go vet ./...`(FE 侧 `mvn.cmd compile`),并真跑相关单测
+- 交付时列出:改了/新增了哪些文件、**实际执行过的命令与真实输出**、§9 边界清单逐条落在哪段代码/哪个用例、SC-201~SC-211 哪条已验、哪条未验(未验要说明原因)、`specs/invariants.md` 的 INV-4/5/6/11 怎么验的
+- 崩溃注入的四种情形,必须给出**每一步的命令与输出**(不能只说"通过了")
+
+## 交付纪律
+
+- 不要伪造或推测任何测试结果。没跑就写"未验证"。
+- 遇到无法解决的阻塞,停下来在最终输出里说明(卡在哪一步、报错是什么、缺什么),不要硬编一个看起来能跑的实现。

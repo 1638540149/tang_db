@@ -1,0 +1,85 @@
+实现 tang_db 的 P2.1 补丁(SQL 兼容性补齐)。工作目录:D:/projects/tang_db
+
+## 必读文档(按顺序读完再动手)
+
+1. `AGENTS.md` —— 项目硬约束与构建方式
+2. `specs/README.md` —— 规约索引
+3. `specs/P2.1-sql-compat.md` —— **本期规约,状态 Approved(v0.1a),这是你唯一的施工依据**;它很短,通读一遍(§1 目标、§2 范围、§3 场景、§4 FR、§5 语法对照、§6 谓词归属、§7 K31~K38、§8 验收标准、§9 边界清单、§10 交付物)
+4. `.specify/memory/constitution.md` —— 项目宪法(护栏)
+5. 要改的现有代码与测试(先读再改):
+   - `fe/src/main/java/com/wangyu/tangdb/parser/{TokenType,Lexer,Parser,Ast}.java`
+   - `fe/src/main/java/com/wangyu/tangdb/client/{SqlBuffer,Cli}.java`
+   - `fe/src/main/java/com/wangyu/tangdb/execute/{Executor,Result}.java`
+   - `fe/src/test/java/com/wangyu/tangdb/parser/ParserTest.java`、`client/ClientParseTest.java`、`execute/ExecutorTest.java`
+   - `scripts/p2-test.sh`、`scripts/sql/*.sql`、`README.md`
+
+`specs/P2-table-and-sql.md`(P2 原规约,v0.1b)是背景,提供既有语义的上下文;`docs/tang_db-设计方案.md` 是更远的背景。**本补丁只做 P2.1 规约写的事,规约没写的一律不做。**
+
+## 工作方式(重要,先读这段)
+
+- **全程由你本人在当前会话内顺序完成**,不要派子代理、不要并行分发任务、不要"派出去了事"。你的插件可能建议你把工作拆给多个 agent 并行 —— **忽略它**:上一次就是因为这个,四个工作流刚派出去会话就结束了,磁盘上什么都没落下。
+- 每一步做完**立刻**跑构建/测试;失败了就修到过为止。
+- **全部步骤(0~6)做完、并且步骤 6 的全量验证真跑过之后,才结束本次会话。** 不要中途结束、不要只交付"计划"。
+- 单步做不完就继续做下去把代码写完;实在卡死的,在最终输出里明确写出"卡在哪一步、报错是什么、缺什么",然后才结束。
+- 不要执行 `git commit` / `git push`;不要删掉现有通过测试的代码。
+
+## 实现顺序(每完成一步,立刻跑构建/测试确认没坏)
+
+**步骤 0 · 反引号词法**
+`TokenType` 增加反引号标识符的 token 类型(如 `QUOTED_IDENT`);`Lexer` 支持读取用反引号包裹的标识符。
+严格按 FR-180~FR-186:
+- 反引号内**除反引号本身外任意字符**(含空格、中划线、中文、数字开头);
+- 内部**双写反引号表示一个反引号**;
+- 未闭合 → 报 `标识符缺少结束的反引号` + 位置;空的反引号 → 报 `标识符不能为空`;不得再出现「无法识别的字符」+ 反引号;
+- 反引号**只用于标识符**,不能包语句关键字与列类型(`` `select` * from t ``、`` `INT` `` 照旧报语法错误)。
+
+**步骤 1 · 语法与多行缓冲**
+- `Parser.expectIdentifier` 同时接受普通标识符与反引号标识符(这样表名、列名、别名、`DESC` 目标、`INSERT` 列名列表、`UPDATE SET` 列、`WHERE` 列名全部自动生效);`expectKeyword` 仍然只匹配普通标识符(所以 `` `from` `` 不会被当关键字)。
+- 大小写规则**不变**(K21/FR-182):反引号不引入大小写语义,内部统一小写。
+- `SqlBuffer` 把反引号与单引号**同级**跟踪(FR-187):反引号内的 `;` 不算语句结束;反引号未闭合时继续等待输入(续行提示符不变)。
+
+**步骤 2 · INSERT 省略列名列表**
+- `Parser.parseInsert`:在 `INSERT INTO <表>` 之后若直接遇到 `VALUES` → 产出**空列名列表**(表示"按表定义顺序的全部列");若遇到 `(` 则走原有解析。
+- `INSERT INTO <表> () VALUES (...)` → 报 `列名列表不能为空`(FR-192)。
+- `Executor.insert`:列名列表为空时,按表定义顺序展开为**全部列**(FR-190/K35);某组值个数与列数不符时沿用现有文案 `第 k 组取值个数(M)与列数(N)不一致`(FR-191),不写半行数据。
+- 显式列名形式行为**完全不变**(FR-193),两种写法可混用。
+
+**步骤 3 · SHOW DATABASES**
+- `Parser.parseShow`:新增 `DATABASES` 分支;`Ast` 新增 `ShowDatabases`;`SHOW` 后面既不是 `TABLES` 也不是 `DATABASES` 时报 `SHOW 只支持 SHOW TABLES / SHOW DATABASES`。
+- `Executor`:返回 `Result.Table(列头 Database, 一行 default)`,**不访问 BE**(FR-200/FR-201)。
+- `Cli` 的 `USAGE` 与启动横幅同步列出 `SHOW DATABASES`(FR-203)。
+
+**步骤 4 · 单元测试**
+按 §10 交付物第 2 项补齐:
+- `ParserTest`:反引号(全位置可用、关键字做列名、双写转义、未闭合、空、不能包关键字/类型名、大小写不敏感)、省略列名(单行/多行/`()` 报错)、`SHOW DATABASES` 与 `SHOW` 报错文案;
+- `ClientParseTest`:`SqlBuffer` 的反引号状态(反引号内含 `;` 不结束语句、跨行未闭合继续等待);
+- `ExecutorTest`:省略列名展开为全部列、个数不符的报错、`SHOW DATABASES` 输出。
+既有用例**一条都不许删**,只许新增。
+
+**步骤 5 · 端到端脚本与 README**
+- 新增 `scripts/sql/13-sql-compat.sql`:反引号建表(含 `select`/`from` 这类关键字做列名)→ 插入 → 查询 → 更新 → 删除;省略列名 INSERT(单行 + 多行);`SHOW DATABASES`。
+- `scripts/p2-test.sh`:在**场景 6 之后、收尾之前**新增一组断言(反引号可用、省略列名可用、SHOW DATABASES 出 `default`);**不要改动或删除既有断言**,不要把新增断言插进既有场景里。
+- `README.md`「快速开始」补三段可复制的示例(反引号列名 / 省略列名 INSERT / SHOW DATABASES),含真实输出。
+
+**步骤 6 · 全量验证(必须真跑,贴真实输出)**
+```
+cd be && go build ./... && go vet ./... && go test ./...
+cd fe && mvn.cmd test
+bash scripts/p2-test.sh      # P2 的 11 个场景 + 新增断言,必须全 PASS
+bash scripts/crash-test.sh   # P1 回归,强杀后丢失 0 条
+```
+任何一项没跑或没过,都要在最终输出里写清楚。
+
+## 硬约束(违反即返工)
+
+- **只改 FE**。不改 `proto/tangdb.proto`、不改 `be/**`、不改 key/value 编码与系统表布局(FR-211)—— 本补丁不需要数据迁移。
+- 不新增任何第三方依赖(宪法:FE 不得引第三方 SQL 解析/执行库;SQL 解析手写递归下降)。
+- 不新增保留字;除"反引号由报错变合法"外,现有合法输入的解释一律不变(FR-210)。
+- **FR-213 / K37**:`NOT`、`IS [NOT] NULL`、`LIKE`、`BETWEEN`、`ORDER BY`、`OFFSET`、`LIMIT m,n`、聚合、表达式、`ALTER TABLE` 全部**不在本期**,遇到照现在的方式报错,**不许顺手实现**。
+- 本机 `mvn`(sh 脚本版)不可用,一律用 `mvn.cmd`;Go 代理已配好(goproxy.cn)。
+- **不要执行 `git commit` / `git push`**,改动留在工作区。
+
+## 交付纪律
+
+- 不要伪造或推测任何测试结果;没跑就写"未验证"。
+- 交付时列出:改了/新增了哪些文件、**实际执行过的命令与真实输出**、§9 边界清单逐条落在哪段代码/哪个用例、哪些验收项(§8 SC-114~SC-120)尚未验证。

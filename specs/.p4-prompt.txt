@@ -1,0 +1,151 @@
+实现 tang_db 的 P4(索引:二级索引 / 唯一索引 / 索引选择 / EXPLAIN + 图形客户端元数据自省兼容)。工作目录:D:/projects/tang_db
+
+## 必读文档(按顺序读完再动手)
+
+1. `AGENTS.md` —— 项目硬约束与构建方式
+2. `specs/README.md` —— 规约索引
+3. `specs/P4-indexes.md` —— **本期规约,状态 Approved v0.1e,这是你唯一的施工依据**;必须通读,尤其 §2.1(做,含 F 组)/ §2.2(不做及归属)/ §2.3(保证与不保证)/ §3 十一个 BDD 场景(4 个 ★)/ §4 全部 FR(FR-456~FR-548)/ §5 数据与格式(尤其 §5.3 索引列编码、§5.4 `sys_indexes`、§5.5 回表二次校验、§5.6 状态机、§5.7 虚拟表规格)/ §6 七条外部评审必答项 / §7 K74~K98 / §8 SC-319~SC-341 / §9 三十条边界 / §12 已全部拍板的 I15~I22
+4. `.specify/memory/constitution.md` —— 项目宪法(护栏)
+5. `specs/invariants.md` —— 本期必须让 **INV-10(索引一致性)** 从"未实现"变成"已验";INV-4/5/6/11 不得退化
+6. 上一期规约(语义承接,不得退化):`specs/P3-transactions-mvcc.md`(原子批写/快照/冲突)、`specs/P3.5-fed-multi-db-mysql.md`(常驻 FE/会话/多库/协议/兼容层)
+7. 现有代码(**先读再改**):
+   - `fe/src/main/java/com/wangyu/tangdb/storage/KeyCodec.java`(key 编码,本期要扩展索引段)
+   - `fe/src/main/java/com/wangyu/tangdb/storage/{RowCodec,Values,TableMeta,Column,DataType}.java`
+   - `fe/src/main/java/com/wangyu/tangdb/catalog/{Catalog,SystemTables,CatalogException}.java`
+   - `fe/src/main/java/com/wangyu/tangdb/execute/{Executor,SqlEngine,Result,SqlError}.java`
+   - `fe/src/main/java/com/wangyu/tangdb/planner/{Planner,Predicate,Plan}.java`
+   - `fe/src/main/java/com/wangyu/tangdb/parser/{Parser,Lexer,Ast,TokenType}.java`
+   - `fe/src/main/java/com/wangyu/tangdb/protocol/mysql/*.java`(协议层,本期**只读不改**;虚拟表与 SHOW 走 `SqlEngine`)
+   - `fe/src/test/java/**`(P1~P3.5 全部单测,改完必须仍绿)
+   - `be/**`(**本期零改动**,读它只为确认 key 语义与 gRPC 能力)
+   - `scripts/tests/{p2,p3,p35}-test.sh`、`scripts/start-{be,fe}.sh`
+8. 参考:`docs/读代码地图/读代码地图-P3.5.md`、`docs/验收报告/P3.5-验收报告.md`
+
+## 工作方式(重要,先读这段)
+
+- **全程由你本人在当前会话内顺序完成**,不要派子代理、不要并行分发任务、不要"派出去了事"。你的插件(oh-my-openagent)可能建议你把工作拆给多个 agent 并行 —— **忽略它**:上次就是因为这个,工作流刚派出去会话就结束了,磁盘上什么都没落下。
+- 每一步做完**立刻**跑构建/测试;失败了就修到过为止,不要跳过、不要注释掉测试。
+- **全部步骤做完、并且最后一步的全量验证真跑过之后,才结束本次会话。**
+- 长任务注意:**起常驻进程(BE / fed)必须后台运行并重定向日志**(`> 日志 2>&1 &`),**绝不允许前台阻塞**——上次就是前台起 fed 把整条会话卡了 46 分钟。
+- 单步太大做不完时,就在这一步继续做下去把代码写完;实在卡死无法推进的,在最终输出里明确写出"卡在哪一步、报错是什么、缺什么"。
+- 不要执行 `git commit` / `git push`;不要删掉现有通过测试的代码;不要动 `be/` 下的任何文件。
+
+## 实现顺序(每完成一步,立刻跑 `cd fe && mvn.cmd compile` / 相关单测确认没坏)
+
+**步骤 0 · 现状盘点(只读,不改代码)**
+在最终输出里先给盘点结论:① 主键 key 怎么拼(`KeyCodec.prefix/rowKey/lowerBound/upperBound`)② `Executor` 的读路径(`forEachMatch` / `Plan.kind`)与写路径(INSERT/UPDATE/DELETE 怎么拼批)③ `Catalog` 的 DDL 批写与启动加载(`loadAll` / `stageTable` / `SysTables` 登记表 / `decodeTableRowTolerant`)④ `SqlEngine.handleCompat` 现在怎么处理 `SHOW` 与 `information_schema`。据此列出要新建/修改的类清单。
+
+**步骤 1 · 索引元数据与 catalog**
+- `SystemTables` 新增 `SYS_INDEXES = 5` 并加入 `REGISTERED_IDS`(K70);新 `TableMeta INDEXES`:`table_id BIGINT PK` / `index_id INT PK` / `name VARCHAR(64)` / `column_name VARCHAR(64)` / `is_unique BOOLEAN` / `state INT` / `build_cursor VARCHAR(256)` / `created_at VARCHAR(64)`;key = `table_id 4B BE + index_id 4B BE`(FR-479)
+- 启动时**幂等创建** `sys_indexes`(老目录直接可用,`format_version` 不变,FR-478/FR-474)
+- `Catalog` 新增索引缓存:`byTable(tableId) → List<IndexMeta>`、`find(tableId, indexId)`、`findByName(db, table, name)`;`createIndex` / `dropIndex` / `updateIndexState` / `updateBuildCursor` 全部走**一次批写**(FR-465/FR-477)
+- 索引 ID 分配:`sys_counters` 的 `next_index_id:<table_id>`,每表从 1 起、只增不复用(FR-464/K75)
+- 元数据校验:索引指向不存在的表/列、同表索引 ID 重复 → 启动报错指名对象(FR-476);表 dropped 时索引随表不可见(FR-480)
+
+**步骤 2 · 索引 key 编码(KeyCodec 扩展)**
+- 二级索引用户键:`[表ID 4B][索引ID 4B][索引列值保序编码][主键值保序编码]`
+- 唯一索引用户键:`[表ID 4B][索引ID 4B][索引列值保序编码]`(不含主键),value = 主键值保序编码(K76/§5.2)
+- 索引列值编码复用主键保序编码;`VARCHAR` 用 `0x00` 终止,值内含 `0x00` 时按 **K77**(`0x00 0xFF` 转义、`0x00 0x00` 结束)处理,**写路径与读路径必须共用同一函数**(FR-497/FR-521)
+- 索引点查/范围的用户键边界(含/不含)由本类统一产出,参照现有 `lowerBound/upperBound` 的 `AFTER_ALL_VERSIONS` 技巧
+- 单测:往返编解码、边界包含性、`0x00` 转义、索引值互为前缀时不串区间
+
+**步骤 3 · 索引 DDL 与状态机**
+- 语法(§2.1 A 组):`CREATE [UNIQUE] INDEX <idx> ON [<db>.]<tbl>(<col>)`、`DROP INDEX <idx> ON [<db>.]<tbl>`、建表内联 `UNIQUE(<col>)` / `INDEX(<col>)`(FR-456~462);自动命名 `<表>_<列>_idx` / `<表>_<列>_uk`
+- 校验:列不存在/主键列/同列重复建/索引名重复(1061)/非法名(FR-457~460);建表内联索引与建表**同一批**(FR-462)
+- 状态机 `BUILDING(0) → ACTIVE(1)`、`BUILDING → DROPPED(2)`;不允许 `ACTIVE → BUILDING`(K86);转 `ACTIVE` 的记录**最后写**(FR-470)
+- `SHOW INDEXES [FROM <t>]`(FR-471);`DESC` 保持原样(FR-472)
+
+**步骤 4 · 写入路径维护**
+- `INSERT`/`UPDATE`/`DELETE` 按 FR-483~FR-497:主键记录 + 每条 `ACTIVE`/`BUILDING` 索引记录**同一批记录**(K89)、同一 `commit_ts`;未改索引列不写(FR-486);同事务改同一行只落最终版本(FR-489);写集按用户键去重(FR-490)
+- 唯一校验:同快照下该唯一键已存在且非墓碑 → 整批不写、不取号、报 **1062**(K78/K80,信息含索引名+列名+值+已有主键);并发同一唯一键由 P3 写写冲突(1213)触发,**也翻译成 1062**
+- 事务内读己之写:走索引时必须能查到自己未提交的写入(FR-495)
+- 单测:多索引同时维护、改索引列(旧项墓碑+新项)、删行墓碑、唯一冲突(单会话/双事务)、超 `max_txn_write_bytes` 整批失败
+
+**步骤 5 · 读路径:索引扫描 + 回表 + 选择规则**
+- 等值(FR-498)与范围(FR-499)走索引;回表**同一快照**(FR-500)+ **二次校验**(FR-501:行的索引列值必须等于索引项值,不等就跳过)+ 墓碑跳过(FR-502)
+- 残余过滤照旧在 FE 做(FR-503);`LIMIT` 生效(FR-507);`UPDATE`/`DELETE` 的 `WHERE` 同样可走索引(FR-508)
+- RBO 规则(K82/FR-504/505):主键等值 > 主键范围 > 索引等值 > 索引范围 > 全表扫;同类多索引取索引 ID 最小者;`OR` 不合并、退化全表扫但**结果必须正确**(FR-506)
+- `BUILDING`/`DROPPED` 索引不参与选择、**退化全表扫且不报错**(FR-509/K88)
+- 读视图必须仍然走 `ReadView`(FR-510/511);扫描统计(索引项数/回表次数)进日志或 EXPLAIN 摘要(FR-512)
+- 单测:索引路径 vs 全表扫逐行对拍、改索引列后旧值查不到、`OR` 退化、`BUILDING` 退化、事务快照一致
+
+**步骤 6 · `EXPLAIN`**
+- 语法 `EXPLAIN <SELECT|UPDATE|DELETE ...>`(FR-513),输出**单列结果集**(列名 `plan`,K87)
+- 内容:访问路径(`PRIMARY POINT` / `PRIMARY RANGE` / `INDEX POINT` / `INDEX RANGE` / `TABLE SCAN`)、表名、索引名+列、key 范围十六进制摘要、残余过滤条件(FR-514~516)
+- **与执行共用同一计划构造入口**,不许另写推算逻辑(FR-517);`EXPLAIN INSERT`/DDL/事务语句明确报不支持(FR-518)
+
+**步骤 7 · 分批回填(建索引的核心难点)**
+- 非空表 `CREATE INDEX`:先写 `BUILDING` 元数据 → 分批(默认 1000 行,配置 `index_backfill_batch`)扫全表、每批独立提交写索引记录 + 更新 `build_cursor`(FR-467~468/K84/K85)
+- **回填期间的新写入也进索引**(I16/K89),所以转 `ACTIVE` 前**不需要**增量补扫
+- 回填中断(强杀/重启)→ 索引仍是 `BUILDING`,重跑同一条 `CREATE INDEX` 能**从游标续做**(FR-469/K86)
+- 唯一索引回填时若发现重复 → 索引转 `DROPPED` 并报重复值与前两个主键,不留半成品
+- 单测 + 脚本:回填中途强杀 → 重启后 `BUILDING` → 续做完成 → 索引完整
+
+**步骤 8 · 图形客户端元数据自省(F 组,§4.7 / §5.7)**
+- Parser 支持 `SHOW` 家族语法(FR-527~536):`FULL TABLES [FROM][LIKE/WHERE]`、`TABLE STATUS`、`CREATE TABLE`、`CREATE DATABASE`、`COLUMNS`/`FULL COLUMNS`、`INDEX`/`KEYS`、`ENGINES`、`COLLATION`、`CHARACTER SET`、`GRANTS`、`TRIGGERS`/`EVENTS`/`ROUTINES`、`VARIABLES`/`STATUS [LIKE]`、`WARNINGS`/`ERRORS`、`FULL PROCESSLIST`
+- `information_schema` 升级为**可查询虚拟表**(FR-537~540):17 张(§5.7 清单),投影裁剪 + `WHERE` + `LIMIT` + **单列 `ORDER BY`** + **`COUNT(*)`**(仅虚拟表,K98);同样的 `ORDER BY`/`COUNT(*)` 用在**用户表**上必须明确报"不支持(归 P5)"
+- `SHOW CREATE TABLE` 必须 **round-trip**:输出喂回 parser 能建出等价表(K96/SC-338)
+- `information_schema.STATISTICS` / `KEY_COLUMN_USAGE` / `TABLE_CONSTRAINTS` 的数据来自步骤 1 的索引元数据(FR-539);`Cardinality` 恒 `NULL`(§5.7)
+- `KILL [CONNECTION] <id>`(FR-541/K97,落日志);未覆盖的 SHOW/虚拟表 → `1235`/`1146` 且**不断连接**(FR-542);虚拟表**绝不能碰 BE**(FR-540);输出中**不得出现口令**(FR-544)
+- `SHOW ENGINES` / `ENGINES` 的 `Engine` 报 `InnoDB`(K93);`SHOW VARIABLES`/`STATUS` 给常用变量真值
+
+**步骤 9 · 单测 + 一键验收 + 演示脚本**
+- 新增 `fe/src/test/java/com/wangyu/tangdb/index/**` 与 `catalog|execute` 下的索引相关用例(编码、DDL、维护、读路径、EXPLAIN、回填、虚拟表、round-trip)
+- 新增 `scripts/tests/p4-test.sh`:覆盖 SC-319~SC-341,报告写 `tmp/p4-test/report.txt`;必须包含
+  - 索引读写闭环 + **索引路径 vs 全表扫逐行对拍**(场景 1)
+  - 改索引列(场景 2)、唯一冲突单会话/并发(场景 3/4)
+  - 崩溃:`after_fsync`/`after_memtable` 强杀后三条用户键同生同灭(场景 5)、**回填中途强杀可续**(场景 6)
+  - `EXPLAIN` 五种路径与实际扫描一致(场景 7)、`DROP INDEX`(场景 8)、老目录升级(场景 9)、事务内可见性(场景 10)
+  - **一致性对账 5000 次随机写改删后差异 0**(场景 11/INV-10)
+  - `SHOW` 家族逐条 + 虚拟表投影/WHERE/ORDER BY/COUNT(*) + round-trip(SC-335~SC-338)
+  - **内嵌回归**:`bash scripts/tests/p2-test.sh`、`p3-test.sh`、`p35-test.sh`
+  - 独立高位端口(BE 9900 / MySQL 9906 / 心跳 9991,K91)
+- 新增 `scripts/sql/41~4x-*.sql`(建索引 / 改索引列 / 唯一冲突 / 回填 / EXPLAIN / 客户端自省)
+- **客户端实测**:Navicat(或 DataRabbit 等已装的图形客户端)与 DataGrip 各跑一遍「连接 → 库表树 → 表结构/DDL/索引 → 建表 → 改数据 → 查询」,**命令/回显原样记录**;GUI 里拿不到回显的步骤就写"人工步骤 + 我点了什么看到什么",不许编造
+
+**步骤 10 · 全量验证(必须真跑,贴真实输出)**
+```
+cd be && go build ./... && go vet ./... && go test ./...
+cd fe && mvn.cmd test
+bash scripts/tests/p4-test.sh
+bash scripts/tests/p35-test.sh     # SC-317 回归
+bash scripts/tests/p3-test.sh
+bash scripts/tests/p2-test.sh
+bash scripts/tests/crash-test.sh   # P1 崩溃基线
+```
+另测两组性能并各自记录条件(SC-333):同一查询"全表扫 vs 索引"的耗时与扫描行数;单行 INSERT 在"无索引 / 1 个索引 / 3 个索引"下的 p50/p99。
+
+**步骤 11 · README**
+- 增「索引」章节:`CREATE [UNIQUE] INDEX` / `DROP INDEX` / 建表内联、`SHOW INDEXES`、`EXPLAIN` 用法与真实输出
+- 增「图形客户端」章节:Navicat / DataGrip 连接方式、已支持的元数据语句清单、**明确不支持清单**(`ALTER TABLE` 改结构、JOIN 类查询、`information_schema` 上的 JOIN/聚合)
+- 写明 `SHOW ENGINES` 报 `InnoDB` 是**客户端兼容**(真实引擎是自研 LSM,K93)
+- 写明 P4 **不需要清空数据目录**(`format_version` 不变、老目录直接可用)
+
+## 硬约束(违反即返工)
+
+- BE 侧只允许 `grpc` / `protobuf`;**本期 BE 预期零改动**(非改不可就先停下来在输出里说明理由)。
+- FE 侧**不得**引入任何第三方 SQL 解析/索引/协议库;不引 B+ 树/嵌入式索引库 —— 索引就是同一套有序 key。
+- FE **不得**读写 BE 数据目录;BE **不得**知道表名/列名/索引/SQL;`proto/` **零改动**。
+- 索引记录与主键记录**必须同批、同 `commit_ts`**;写路径顺序不得改动(冲突检测 → WAL → fsync → memtable → 回 OK)。
+- 唯一索引的 key **不含主键值**(K76),唯一性靠 P3 的写写冲突,不允许自造锁/预占表。
+- `MANIFEST.format_version` 不变;老数据目录**宽容读**(缺 `sys_indexes` 就幂等建)。
+- `information_schema` 虚拟表**纯内存**,不得访问 BE;`ORDER BY`/`COUNT(*)` **只准在虚拟表上生效**(K98)。
+- 本机口径:`mvn` 一律 `mvn.cmd`;Go 在 `/c/Program Files/Go/bin`;跑脚本前确认没有残留 `be.exe` / `fed` 进程;不要与其它会话同时跑脚本。
+- **不要执行 `git commit` / `git push`**;不要写 `docs/验收报告/P4-验收报告.md`、`docs/读代码地图/读代码地图-P4.md`(核验方写),你只负责代码、测试、脚本、README。
+
+## 不要做的事(超出范围即返工)
+
+不做:复合索引(归 P6);覆盖索引(P6);`ALTER TABLE` 任何形态(**P4 之后**,含 Navicat"设计表");索引统计信息/基数/直方图(P6);索引推荐/自动建索引/休眠索引(P14);表达式/路径/空间索引(P11/P12);倒排(P10);HNSW(P7);`DROP INDEX` 的物理回收(P5);唯一约束的 `NULL` 语义扩展;`NOT`/`IS [NOT] NULL`/`LIKE`/`BETWEEN`(P5);用户表上的 `ORDER BY`/`OFFSET`/聚合/`GROUP BY`/`JOIN`/子查询/`DISTINCT`(P5);表达式与函数(P7);`information_schema` 上的 JOIN/子查询/多列聚合(P5);`performance_schema`;视图/存储过程/触发器/事件的真实能力;`SHOW` 的全量 `GLOBAL`/`SESSION` 变量族;TLS;权限体系(P13);监控/慢查询(P8)。
+
+## 验证要求
+
+- 每步跑 `cd fe && mvn.cmd compile`(改到测试就跑 `mvn.cmd test`);BE 只在最后跑一次 `go build/vet/test` 证明零改动没坏
+- 交付时列出:新建/修改了哪些文件(按模块分组)、**实际执行过的命令与真实输出**、SC-319~SC-341 逐条"已验 / 未验 + 原因"、§9 的 30 条边界各自落在哪段代码或哪个用例、§2.2 每一项确认"确实没做"
+- 崩溃与回填的四个场景(SC-323/SC-324)必须给出**每一步的命令与输出**,不能只说"通过了"
+- 索引一致性对账(INV-10)要贴出"差异计数 = 0"的真实结论
+
+## 交付纪律
+
+- 不要伪造或推测任何测试结果。没跑就写"未验证"。
+- GUI 客户端步骤允许"人工操作说明",但**不许编造回显**;拿不到就明说拿不到。
+- 遇到无法解决的阻塞,停下来在最终输出里说明(卡在哪一步、报错是什么、缺什么),不要硬编一个看起来能跑的实现。

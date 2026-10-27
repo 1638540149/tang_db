@@ -1,0 +1,88 @@
+实现 tang_db P5 · 分析引擎:列式 + 压缩 + 向量化 + 排序/聚合/JOIN/子查询 + JSON + compaction + CSV 导入。工作目录:D:/projects/tang_db
+
+## 读什么(按这个顺序,别跳)
+
+1. `specs/P5-analytics-engine.md` —— **唯一施工依据**(v0.1b Approved)。全部读完再动手,尤其 §2.1 八组(I 组也在)、§2.2 不做清单、§3 BDD 场景、§4 FR-563~614、§5 数据与格式、§6 K103~K119、§8 SC-348~369、§9 边界 41~64。
+2. `specs/invariants.md` 的 INV-4/5/6/10/11(不许退化)与新增 **INV-17 / INV-18**。
+3. `AGENTS.md` + `.specify/memory/constitution.md`(依赖红线与边界纪律,违反即返工)。
+4. 既有实现:BE 侧 `be/internal/{wal,store,segment,manifest,exec}`、FE 侧 `fe/src/main/java/com/wangyu/tangdb/{parser,planner,execute,storage,protocol}`。**先读再改,不要凭想象写 API**。
+
+## 工作方式
+
+- **全程自己顺序完成,禁止派子代理**。
+- **每完成一组就 `cd fe && mvn.cmd test-compile && mvn.cmd test`(BE 改动则 `cd be && go build ./... && go vet ./... && go test ./...`),绿了再进下一组**;不要一口气写完再测。
+- 卡住超过 20 分钟没有进展,就在最后报告里**明说卡在哪、试过什么**,不要伪造"已完成"。
+
+## 分步实现顺序(每步都要能独立验证)
+
+**第 1 步 · 列存与压缩(A 组 / FR-563~570 / K103)**
+- 现状是"行式写、存时列式"的雏形(见 `be/internal/segment`),先把 column chunk 头、四种编码(RAW/RLE/DICT/BITPACK/PREFIX)、往返无损单测做出来。
+- 注意:压缩发生在**保序编码后的字节**上,不许改变比较语义(INV-18)。
+- 新增 `SHOW SEGMENTS`(自有诊断)与 `DATA_LENGTH` 真值。
+
+**第 2 步 · 点查行级定位(FR-568~570 / §7)**
+- Index Block 二分 + 块内偏移数组 + chunk 布隆(可配)+ 列裁剪。
+- 单测断言"1 万次随机点查触碰 chunk ≤ 2、segment ≤ 2";P99 不退化。
+
+**第 3 步 · 向量化算子骨架(B 组 / FR-571~576)**
+- batch 结构 + pull 接口,先做 Scan/Filter/Project 三个算子,再补 `EXPLAIN` 显示实际读取列。
+- **对拍**:同一查询走向量化路径与逐行路径结果逐行相等(FR-576)。
+
+**第 4 步 · 排序与分页(C 组 / FR-577~580)**
+- 多列 `ASC/DESC`、`NULL` 位置按 K105(TopN 堆 + 外部归并,临时文件 `data/BE/tmp` 且启动清理,K114)。
+
+**第 5 步 · 聚合(D 组 / FR-581~586 + FR-612)**
+- Hash Aggregate(`COUNT/SUM/AVG/MIN/MAX`、`COUNT(DISTINCT)`、`STDDEV/VARIANCE/GROUP_CONCAT`),`GROUP BY`/`HAVING`,K118/K119 口径。
+
+**第 6 步 · 谓词、表达式与函数(F 组 / FR-593~598 + FR-613)**
+- `NOT` / `IS [NOT] NULL` / `LIKE` / `BETWEEN`、三值逻辑、算术与 `CASE`、标量函数(含 `YEAR/MONTH/DAY`);每个函数一条单测(含 `NULL` 入参)。
+
+**第 7 步 · JOIN 与子查询(E 组 / FR-587~592 / K112)**
+- Hash Join(小表建表)+ NLJ 兜底;三表串联必须能跑(五表 TPC-H Q5 加分);`IN (子查询)`、标量子查询(多行报 1242)。
+
+**第 8 步 · JSON(I 组 / FR-609~611 / K117)**
+- `JSON` 列(BSON 式二进制子集)+ `json_extract`(对象嵌套、数组下标、路径不存在→`NULL`);JSON 列建索引/做主键明确报 1235。
+
+**第 9 步 · Compaction 与 GC 水位(G 组 / FR-599~604 / K104·K113)**
+- leveled 合并、MANIFEST 原子更新、旧文件后删;GC 水位 = 最老活跃快照,**等于水位必须保留**;读旧 MANIFEST 视图不阻塞查询。
+- 强杀在合并中途要能一致恢复(BDD ★P5-2);长事务持快照期间旧版本不得被回收(★P5-3 / INV-17)。
+
+**第 10 步 · CSV 导入(I 组 / FR-605~608·614 / K110 / K118)**
+- 独立命令 `scripts/tools/csv-import`(不要塞进 `fed`);走 WAL → fsync → memtable;分批提交 + 进度落盘;断点续传;失败报行号+列名。
+
+**第 11 步 · 性能与验收脚本(SC-356 / SC-362 / SC-365)**
+- `scripts/tests/p5-test.sh` 一键跑 SC-348~SC-364(含 TPC-H Q1/Q3/Q5/Q6/Q10 子集与四项门限),报告落 `tmp/p5-test/report.txt`。
+- 四项门限:写放大 < 3×、读放大 ≤ 2 segment、内存峰值 < memtable×3、100 万行恢复 < 60 s;**每项必须同时记录机器条件模板**(设计文档 §18)。
+- 新增 `scripts/sql/51~5x` 演示脚本。
+
+## 硬约束(违反即返工)
+
+- **依赖红线**:BE 只允许 `google.golang.org/grpc` 与 `google.golang.org/protobuf`;**FE 不得引第三方 SQL 解析 / 压缩 / 排序 / 存储库**。压缩、排序、JOIN、聚合全部自己写。
+- `proto/` 原则上不改;若确有必要,先停下来在报告里说明理由与兼容影响,**不要直接改**。
+- **先日志后数据**:WAL 追加 → fsync → memtable → 才返回 OK;不许"后台异步刷盘"绕过。
+- **segment 落盘不可变**:只写新文件 + 原子更新 MANIFEST。
+- FE/BE 边界:FE 不读写 BE 数据目录;BE 不懂表名/列名/SQL。
+- 用户表 `COUNT(*)`/`ORDER BY` 等从本期起**必须真支持**(不再是 1235);`UNION` / 相关子查询 / `EXISTS` / 窗口函数 / 统计信息 / CBO / 并行执行 / `ALTER TABLE` **仍然不做**(§2.2),别顺手做。
+
+## 验证要求(全部要真跑,贴真实输出)
+
+1. `cd be && go build ./... && go vet ./... && go test ./...`
+2. `cd fe && mvn.cmd test`(既有 283 用例一条不许坏)
+3. `bash scripts/tests/p5-test.sh`(新),报告 `tmp/p5-test/report.txt` 的 PASS/FAIL 真数
+4. 既有回归:`bash scripts/tests/p4-test.sh`、`p35-test.sh`、`p3-test.sh`、`p2-test.sh`、`scripts/tests/crash-test.sh`
+5. 真客户端:`MysqlErrorCheck`(`com.wangyu.tangdb.index.MysqlErrorCheck <port> root tangdb <db> "<sql>"`)跑一遍本期新增语句(多列排序、`GROUP BY`、JOIN、`json_extract`、`SHOW SEGMENTS`),贴 CODE=0/结果行数
+6. 性能:按 §18 条件模板记录机器与数据规模,**不达标要在报告里给原因**,不许改门限
+
+## 建环境与本机口径(踩过的坑)
+
+- `mvn` 一律用 `mvn.cmd`;Java 输出中文要 `-Dfile.encoding=UTF-8 -Dsun.stdout.encoding=UTF-8`。
+- **跑任何脚本前先 `cd fe && mvn.cmd test-compile` 一次**,否则脚本内部的 `mvn` 会重编译 `target/classes`,导致 `ClassNotFoundException: com.wangyu.tangdb.fed.Fed`(IDEA 也可能并发重编译)。
+- **同一时刻只跑一套测试脚本**:脚本会 taskkill 同名 be.exe / fed 并抢占高位端口,并发跑必然互相 reset。端口:BE 9900 / MySQL 9906 / 心跳 9991(p4-test)、9800/9806/9891(p35)、9600/9706/9691(p3)、9110(crash-test)。
+- **绝对不要动 3406 上所有者日常在跑的 fed 与 9100 的 BE**;`crash-test.sh` 已改为独立数据目录 `tmp/crash-test/data` 与独立端口,不要再改回 `data/BE`。
+- 起常驻进程必须后台 + 日志重定向,不许前台阻塞。
+
+## 交付纪律
+
+- 只交代码 / 测试 / 脚本 / `README.md` 相应段落。**不要写 `docs/验收报告/*` 与 `docs/读代码地图/*`**(核验方写)。
+- **不要 `git commit` / `git push`**。
+- 不做伪造成绩:没跑的检查写"未验证"并说明原因。
