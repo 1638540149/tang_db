@@ -1,0 +1,106 @@
+实现 tang_db P6 · 优化器:统计信息 + CBO 代价模型 + 连接顺序/算子选择 + 集合运算 + 相关子查询/EXISTS + DISTINCT/派生表 + P5 欠账回填。工作目录:D:/projects/tang_db
+
+## 读什么(按这个顺序,别跳)
+
+1. `specs/P6-optimizer.md` —— **唯一施工依据**(v0.1a Approved)。全部读完再动手,尤其 §2.1 九组、§2.2 不做清单、§2.4 认领的跨期挂账、§3 BDD 场景(★ 两条必须真跑)、§4 FR-615~675、§5 数据与格式(系统表 ID 7/8、直方图 JSON、11 项配置)、§6 K120~K137、§8 SC-370~390、§9 边界 65~92、§12 结论列(十项已定稿,不要再改口径)。
+2. `specs/invariants.md` 既有 INV-4/5/6/10/11/17/18(不许退化)与本期新增 **INV-19 / INV-20**(规约 §10 要求登记,内容由核验方补,你按"统计与用户数据同事务语义"、"CBO 只改执行方式不改结果"两条实现即可)。
+3. `AGENTS.md` + `.specify/memory/constitution.md`(依赖红线与边界纪律,违反即返工)。
+4. 既有实现(先读再改,不要凭想象写 API):
+   - FE:`fe/src/main/java/com/wangyu/tangdb/{parser,planner,query,execute,catalog,storage,client}`;
+   - 重点几处:`planner/Planner.java`(索引选择)、`query/QueryEngine.java`(join/聚合/排序/explain)、`query/Sorter.java`(溢写,复用)、`query/Aggregates.java`、`execute/SqlEngine.java`(information_schema 门禁在 457-464 行)、`execute/Executor.java`(EXPLAIN、importInsert、索引回填)、`catalog/SystemTables.java`(系统表 ID 登记表);
+   - BE:`be/internal/{wal,memtable,segment,store,exec,server}`。本期 **BE 与 `proto/` 都不改**,只读不改。
+
+## 工作方式
+
+- **全程自己顺序完成,禁止派子代理**。
+- **每完成一步就 `cd fe && mvn.cmd test-compile && mvn.cmd test`**(BE 侧不改,不需要 go 测试;但收尾仍要跑一次 `cd be && go build ./... && go vet ./... && go test ./...` 证明没误改)。绿了再进下一步;不要一口气写完再测。
+- 卡住超过 20 分钟没有进展,就在最后报告里**明说卡在哪、试过什么**,不要伪造"已完成"。
+
+## 分步实现顺序(每步都要能独立验证)
+
+> **顺序可行性说明(重要)**:规约 §2.1 的组序是产品视角。实现的硬依赖是:①`optimizer_enabled` 开关 + `CostModel` 骨架必须先于任何 CBO 选择;②**派生表(G 组)必须先于 information_schema 放开(H 组)**,因为客户端自省语句就是 `LEFT JOIN (SELECT ... GROUP BY ...)`;③集合运算(E 组)先于自省里的 `UNION` 探针。按下面 10 步走,不要按组号顺序。
+
+**第 1 步 · 计划骨架 + 不变性开关(FR-632 / FR-633 / FR-671 的骨架)**
+- 新增 `fe.conf` 的 `optimizer_enabled`(默认 `true`);`false` 时所有新选择逻辑短路,**行为与 P5 完全一致**(这条是所有后续对拍的地基)。
+- 新增 `CostModel` 单类集中放 §4.2 的 9 个代价常量(K137);`EXPLAIN` 追加 `估算: rows=N, cost=C` 与 `依据: 统计/默认` 两类行(此时数据可以先只有 `依据: 默认`)。
+- 验收:`mvn.cmd test` 全绿 + 既有 `EXPLAIN` 断言只多行不少行。
+
+**第 2 步 · 统计信息采集与持久化(A 组 / FR-615~625 / K121~K126)**
+- 系统表 ID 7 `sys_table_stats`、ID 8 `sys_column_stats`(§5.1 的 key 与列顺序写死,`REGISTERED_IDS` 扩到含 7/8);一次 ANALYZE 的全部写入必须是**一个批记录**。
+- `ANALYZE TABLE [db.]t [(c1,...)]`、`SHOW STATS [FROM t]`;精确 distinct ≤10 万行,超过用**自研 HyperLogLog**(p=14,m=16384);等深 64 桶直方图存进 `histogram JSON` 列(§5.2)。
+- 采样:≤20 万行全量,超过每 20 batch 取 1;`sample_permille` 落库。
+- 验收:边界 65~72 与 SC-370/SC-371/★SC-372/★SC-373/SC-388/SC-389。
+
+**第 3 步 · 基数估算与代价(B 组 / FR-626~634)**
+- 选择率公式表(§FR-626~628)、访问路径代价比较(FR-630)、`EXPLAIN` 显示候选路径各自的估算(FR-631)。
+- 统计过期:行数变化 >20% 置 stale,`EXPLAIN` 标注并回落默认(FR-623 / FR-625)。
+
+**第 4 步 · 连接顺序与物理算子(C 组 / FR-635~643)**
+- 连接顺序:≤4 表穷举 left-deep,>4 贪心;build 侧按估算行数(不再是 `estimateWidth`);等值 → Hash,两侧已排序 → Sort-Merge,非等值 → NLJ;溢写复用 `Sorter`(K130)。
+- 聚合 Hash vs Sort-based、排序内存 vs 外部归并、TopN 阈值、空集短路。
+- 验收:SC-376、SC-386、SC-387(性能门限)。
+
+**第 5 步 · 谓词下推与列裁剪(D 组 / FR-644~649)**
+- 谓词前移、`HAVING` 折 `WHERE`、常量折叠、`LIMIT` 下推(`ScanRequest.limit`)、FE 侧列裁剪(`EXPLAIN` 给"读取 k / n 列")。
+- 验收:SC-384、SC-385、边界 85~87。
+
+**第 6 步 · 集合运算(E 组 / FR-650~655)**
+- `UNION` / `UNION ALL` / `INTERSECT` / `EXCEPT`(`MINUS` 别名),列对齐与类型提升,优先级与括号规则,Hash Distinct + 溢写;`INTERSECT ALL` / `EXCEPT ALL` 报 1235。
+- 验收:SC-377、边界 73~77。
+
+**第 7 步 · 相关子查询与量词(F 组 / FR-656~661)**
+- 逐行驱动 + 参数化探测 + LRU 结果缓存(`subquery_cache_max_entries`);`EXISTS`/`NOT EXISTS`/`= ANY`/`> ALL` 三值语义;仅"安全形态"去相关;同一快照。
+- 验收:SC-378、边界 81~84。
+
+**第 8 步 · DISTINCT 与派生表(G 组 / FR-662~666)**
+- `SELECT DISTINCT`(hash + 溢写,与 `GROUP BY` 对拍);`FROM (SELECT ...) 别名`,嵌套上限 8 层,列别名,横向相关报 1235。
+- 验收:SC-379、SC-380、边界 78~80。
+
+**第 9 步 · information_schema 放开(H 组 / FR-667~671)**
+- 删掉 `SqlEngine.java:457-464` 的语句文本门禁,虚拟表查询进统一计划器;虚拟表估算用固定值(不扫虚拟表);补 `PARAMETERS` 空表(虚拟表 17→18);把"归 P5"这类过期文案全部改对。
+- **必须用真实客户端自省语句验证**:`information_schema.ROUTINES LEFT JOIN (SELECT ... GROUP_CONCAT ... GROUP BY ...) PARAMS` 与 `COUNT(*) ... UNION ...` 两句按原句执行。
+- 验收:SC-381、SC-383、边界 88~89。
+
+**第 10 步 · 门限、脚本与文档(I 组 / FR-672~675)**
+- `SHOW STATS` 增分析耗时/扫描行数;性能对比脚本:Q1/Q3/Q5/Q6/Q10 在 `optimizer_enabled=true/false` 下各跑三次取中位数。
+- 新增 `scripts/tests/p6-test.sh` 一键跑 SC-370~SC-390,**端口固定 BE 9950 / MySQL 9956 / 心跳 9961**(已核过与其它脚本不撞),数据目录 `tmp/p6-test/`,报告 `tmp/p6-test/report.txt`。
+- 新增 `scripts/sql/61~6x` 演示脚本(ANALYZE/SHOW STATS、集合运算、相关子查询、派生表各一份)。
+- `README.md` 补 `ANALYZE` / `SHOW STATS` / 集合运算 / 派生表的用法段落。
+
+## 硬约束(违反即返工)
+
+- **依赖红线**:FE **不得引入第三方 SQL 解析 / 统计 / 压缩 / 排序库**;HyperLogLog、直方图、CBO 全部手写。BE 侧本期零改动。
+- **`proto/` 与磁盘格式都不改**:统计走已有的 `Scan`/`CommitTxn` 通道(K121/K125);不需要数据迁移,老目录直接可用。
+- **先日志后数据**不变;统计写入也走同一条批写路径。
+- FE/BE 边界:FE 不读写 BE 数据目录;BE 不懂表名/列名/SQL。
+- **CBO 只改"怎么跑",绝不改结果**(FR-634):任何会被估算改变结果集内容或行序的改写禁止;`optimizer_enabled=false` 必须与 P5 结果逐行一致。
+- 列裁剪**只做 FE 侧**(K136 / I37=A):不许为了减少网络量去改 `proto` 或让 BE 解行格式。
+
+## 不要做(超范围即返工,§2.2)
+
+窗口函数与 `GROUPING SETS`/`ROLLUP`/`CUBE`(P14 之后)、自适应优化与智能索引(P14)、表达式/函数/路径索引(P11 之后)、JSON 路径索引、并行执行(P8 之后)、网络级列裁剪、多列统计与倾斜处理、`EXPLAIN ANALYZE`(P8)、视图/存储过程/触发器/`WITH`、`ALTER TABLE` 任何形态、`NOW()/DATE_ADD/TIMESTAMP`(P12)、`VECTOR`/HNSW 一切(P7)、`ANALYZE` 自动触发。`INTERSECT ALL` / `EXCEPT ALL` 报 1235 即可。
+
+## 验证要求(全部要真跑,贴真实输出)
+
+1. `cd be && go build ./... && go vet ./... && go test ./...`(证明 BE 未被误改)
+2. `cd fe && mvn.cmd test`(既有 **319 用例一条不许坏**,新增用例单独计数)
+3. `bash scripts/tests/p6-test.sh`(新),报告 `tmp/p6-test/report.txt` 的 PASS/FAIL 真数,★SC-372 / ★SC-373 必须真跑(强杀 + 并发)
+4. 既有回归:`bash scripts/tests/p4-test.sh`、`p35-test.sh`、`p3-test.sh`、`p2-test.sh`、`scripts/tests/crash-test.sh`(逐个单跑,不要并发)
+5. 真客户端探针:`com.wangyu.tangdb.index.MysqlErrorCheck <port> root tangdb <db> "<sql>"` 跑本期新增语句(ANALYZE / SHOW STATS / UNION / EXISTS / DISTINCT / 派生表 / information_schema JOIN),贴 CODE=0 与结果行数
+6. 性能:按 §I 组口径记录 Q1/Q3/Q5/Q6/Q10 的 true/false 对比(三次中位数),**不达标要在报告里给原因,不许改门限**
+
+## 建环境与本机口径(踩过的坑)
+
+- `mvn` 一律用 `mvn.cmd`;Java 输出中文要 `-Dfile.encoding=UTF-8 -Dsun.stdout.encoding=UTF-8 -Dsun.stderr.encoding=UTF-8`。
+- **跑任何脚本前先 `cd fe && mvn.cmd test-compile` 一次**,否则脚本内部重编译 `target/classes` 会出 `ClassNotFoundException: com.wangyu.tangdb.fed.Fed`(IDEA 也可能并发重编译,必要时让所有者先退出 IDEA)。
+- **同一时刻只跑一套测试脚本**:脚本会 `taskkill` 掉同名 be.exe/fed 并抢占高位端口。已知占用:BE 9110(crash)/9200/9600/9700/9800/9900,MySQL 9406/9706/9716/9806/9906,心跳 9291/9691/9791/9891/9991。**本期用 9950/9956/9961**,不许复用别的脚本的号。
+- **绝对不要动 9100 上的 BE 与 3406 上的 fed**(所有者日常环境);新脚本的数据目录只能落 `tmp/p6-test/`。
+- 起常驻进程必须后台 + 日志重定向,不许前台阻塞;脚本里禁用裸 `wait`(只 `wait "$PID"`)。
+- 强杀后重启前要 `wait_port_free <port>` 轮询到端口空闲,否则周期性假红。
+- `ps -W` 第 4 列才是 WINPID(netstat 第 5 列),kill 前核对命令行,别按进程名一把杀 `java.exe`(里面有 IDEA 子进程)。
+
+## 交付纪律
+
+- 只交代码 / 测试 / 脚本 / `README.md` 相应段落。**不要写 `docs/验收报告/*` 与 `docs/读代码地图/*`**(核验方写),也不要改 `specs/*`(规约由所有者与核验方维护)。
+- **不要 `git commit` / `git push`**。
+- 不做伪造成绩:没跑的检查写"未验证"并说明原因;`EXPLAIN` 里的估算数字取自真实统计,不许写死。

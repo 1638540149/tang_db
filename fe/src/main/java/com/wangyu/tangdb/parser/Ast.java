@@ -22,7 +22,7 @@ public final class Ast {
             ShowSegments, ShowCreateTable, ShowCreateDatabase, ShowColumns, Describe,
             Insert, Update, Delete, Select, SelectLiterals, Explain, Kill,
             Begin, Commit, Rollback, CreateDatabase, DropDatabase, Use,
-            CreateIndex, DropIndex, SelectQuery, ShowImportTasks {
+            CreateIndex, DropIndex, SelectQuery, ShowImportTasks, Analyze, ShowStats, SetQuery {
     }
 
     // ------------------------------------------------------------ P3.5:库
@@ -141,6 +141,19 @@ public final class Ast {
 
     /** SHOW IMPORT TASKS:CSV 导入任务列表(FR-614;常驻任务归 P9)。 */
     public record ShowImportTasks() implements Statement {
+    }
+
+    /**
+     * ANALYZE TABLE [db.]t [(c1, c2)](SPEC-P6 FR-615)。
+     *
+     * @param columns 空列表 = 分析全部列
+     */
+    public record Analyze(String database, String table, List<String> columns)
+            implements Statement {
+    }
+
+    /** SHOW STATS [FROM [db.]t](SPEC-P6 FR-622 / K120:自有诊断语句)。 */
+    public record ShowStats(String database, String table) implements Statement {
     }
 
     /** SHOW SEGMENTS [FROM <tbl>]:自有诊断语句(FR-566),给出列式压缩真实统计。 */
@@ -286,7 +299,8 @@ public final class Ast {
      * P5 的复杂查询(表达式 / 函数 / 聚合 / JOIN / 子查询)走这棵新的表达式树。</p>
      */
     public sealed interface Expr permits Lit, Col, Arith, Neg, Not, Cmp, LogicalAnd, LogicalOr,
-            IsNull, Like, Between, InExpr, InSubquery, ScalarSubquery, Func, Case, Cast {
+            IsNull, Like, Between, InExpr, InSubquery, ScalarSubquery, Func, Case, Cast,
+            Exists, Quantified {
     }
 
     /** 字面量;text 保留原文用于表达式投影的列名(K107)。 */
@@ -345,7 +359,22 @@ public final class Ast {
     public record InSubquery(Expr operand, QueryBody query, boolean negated) implements Expr {
     }
 
+    /** 标量子查询(可相关;SPEC-P6 F 组)。 */
     public record ScalarSubquery(QueryBody query) implements Expr {
+    }
+
+    /** {@code EXISTS (子查询)}(FR-657);{@code NOT EXISTS} 由外层 {@link Not} 表达。 */
+    public record Exists(QueryBody query) implements Expr {
+    }
+
+    /** 比较量词:量词是 ANY / SOME / ALL(FR-658);{@code <> ALL} ≡ {@code NOT IN}。 */
+    public enum Quantifier {
+        ANY,
+        ALL
+    }
+
+    public record Quantified(Op op, Expr operand, QueryBody query, Quantifier quantifier)
+            implements Expr {
     }
 
     /** 函数 / 聚合:name 统一大写;star 仅 COUNT(*) 使用。 */
@@ -384,14 +413,57 @@ public final class Ast {
     public record OrderItem(Expr expr, boolean descending) {
     }
 
-    /** 一条完整查询(不含 EXPLAIN 外壳)。 */
+    /**
+     * 一条完整查询(不含 EXPLAIN 外壳)。
+     *
+     * <p>{@code distinct} = {@code SELECT DISTINCT}(SPEC-P6 FR-662);P5 之前恒为 false。</p>
+     */
     public record QueryBody(List<SelectItem> items, FromClause from, Expr where,
                             List<Expr> groupBy, Expr having, List<OrderItem> orderBy,
-                            Integer limit, Integer offset) {
+                            Integer limit, Integer offset, boolean distinct) {
+
+        /** 兼容 P5 的 8 参构造(distinct = false)。 */
+        public QueryBody(List<SelectItem> items, FromClause from, Expr where,
+                         List<Expr> groupBy, Expr having, List<OrderItem> orderBy,
+                         Integer limit, Integer offset) {
+            this(items, from, where, groupBy, having, orderBy, limit, offset, false);
+        }
     }
 
     /** P5 的 SELECT 语句;执行入口与老 {@link Select} 分开,但共用同一套语义。 */
     public record SelectQuery(QueryBody body) implements Statement {
+    }
+
+    // ============================================================ SPEC-P6:E 组集合运算
+
+    /** 集合运算的类型({@code MINUS} 解析成 {@link #EXCEPT})。 */
+    public enum SetOpType {
+        UNION,
+        INTERSECT,
+        EXCEPT
+    }
+
+    /** 集合运算表达式的节点。 */
+    public sealed interface QueryExpr permits BodyExpr, SetExpr, OrderedExpr {
+    }
+
+    /** 一支朴素查询。 */
+    public record BodyExpr(QueryBody body) implements QueryExpr {
+    }
+
+    /** {@code left <op> [ALL] right};{@code orderBy/limit/offset} 是括号内的本支尾部。 */
+    public record SetExpr(QueryExpr left, SetOpType op, boolean all, QueryExpr right,
+                          List<OrderItem> orderBy, Integer limit, Integer offset)
+            implements QueryExpr {
+    }
+
+    /** 带尾部(ORDER BY / LIMIT / OFFSET)的表达式:整体尾部与括号内分支共用。 */
+    public record OrderedExpr(QueryExpr inner, List<OrderItem> orderBy, Integer limit,
+                              Integer offset) implements QueryExpr {
+    }
+
+    /** 顶层集合运算语句(FR-650 ~ FR-655)。 */
+    public record SetQuery(QueryExpr expr) implements Statement {
     }
 
 }

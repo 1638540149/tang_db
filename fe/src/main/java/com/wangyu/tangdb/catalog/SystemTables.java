@@ -51,11 +51,15 @@ public final class SystemTables {
     public static final long SYS_INDEXES = 5;
     /** SPEC-P5 §5.3 / FR-614:CSV 导入任务与断点状态。 */
     public static final long SYS_IMPORT_STATE = 6;
+    /** SPEC-P6 §5.1 / FR-621:表级统计。 */
+    public static final long SYS_TABLE_STATS = 7;
+    /** SPEC-P6 §5.1 / FR-621:列级统计。 */
+    public static final long SYS_COLUMN_STATS = 8;
 
-    /** 系统表 ID 登记表(FR-426 / K70 / FR-473 / SPEC-P5 FR-614):不在其中的 ID 即用户表。 */
+    /** 系统表 ID 登记表(FR-426 / K70 / FR-473 / SPEC-P5 FR-614 / SPEC-P6 §5.1)。 */
     public static final Set<Long> REGISTERED_IDS =
             Set.of(SYS_TABLES, SYS_COLUMNS, SYS_DATABASES, SYS_COUNTERS, SYS_INDEXES,
-                    SYS_IMPORT_STATE);
+                    SYS_IMPORT_STATE, SYS_TABLE_STATS, SYS_COLUMN_STATS);
 
     /** 预留区上界(6~63 预留给后续元数据族,当前未登记)。 */
     public static final long RESERVED_MAX_TABLE_ID = 63;
@@ -161,12 +165,83 @@ public final class SystemTables {
                     new Column("updated_at", DataType.VARCHAR, 64, false, false, 12)),
             true);
 
+    /**
+     * SPEC-P6 §5.1:表级统计。key = db_name(保序)+ table_id(4B BE)。
+     *
+     * <p>末尾两列 {@code analyze_millis} / {@code scanned_rows} 是 FR-672 / FR-675
+     * 要求的可观测列;放这里是为了重启后 SHOW STATS 与重启前一致(SC-388)。</p>
+     */
+    public static final TableMeta TABLE_STATS = new TableMeta(
+            SYS_TABLE_STATS, "sys_table_stats", TableMeta.STATE_ACTIVE, "",
+            List.of(
+                    new Column("db_name", DataType.VARCHAR, 64, false, true, 0),
+                    new Column("table_name", DataType.VARCHAR, 64, false, false, 1),
+                    new Column("row_count", DataType.BIGINT, 0, false, false, 2),
+                    new Column("total_bytes", DataType.BIGINT, 0, false, false, 3),
+                    new Column("analyzed_commit_ts", DataType.BIGINT, 0, false, false, 4),
+                    new Column("sample_permille", DataType.INT, 0, false, false, 5),
+                    new Column("last_analyze", DataType.VARCHAR, 32, false, false, 6),
+                    new Column("stale", DataType.BOOLEAN, 0, false, false, 7),
+                    new Column("analyze_millis", DataType.BIGINT, 0, false, false, 8),
+                    new Column("scanned_rows", DataType.BIGINT, 0, false, false, 9)),
+            true);
+
+    /** SPEC-P6 §5.1:列级统计。key = table_id(4B BE)+ ordinal(2B BE)。 */
+    public static final TableMeta COLUMN_STATS = new TableMeta(
+            SYS_COLUMN_STATS, "sys_column_stats", TableMeta.STATE_ACTIVE, "",
+            List.of(
+                    new Column("table_id", DataType.BIGINT, 0, false, true, 0),
+                    new Column("ordinal", DataType.INT, 0, false, false, 1),
+                    new Column("column_name", DataType.VARCHAR, 64, false, false, 2),
+                    new Column("null_count", DataType.BIGINT, 0, false, false, 3),
+                    new Column("distinct_count", DataType.BIGINT, 0, false, false, 4),
+                    new Column("distinct_is_approx", DataType.BOOLEAN, 0, false, false, 5),
+                    new Column("min_value", DataType.VARCHAR, 64, true, false, 6),
+                    new Column("max_value", DataType.VARCHAR, 64, true, false, 7),
+                    new Column("histogram", DataType.JSON, 0, false, false, 8)),
+            true);
+
     private SystemTables() {
     }
 
     /** 表 ID 是否属于系统表登记表(FR-426:不在登记表内即用户表)。 */
     public static boolean isSystemTable(long tableId) {
         return REGISTERED_IDS.contains(tableId);
+    }
+
+    /** sys_table_stats 的主键编码:db_name(保序)+ table_id(4B 大端)。 */
+    public static byte[] tableStatsKey(String dbName, long tableId) {
+        return KeyCodec.systemRowKey(SYS_TABLE_STATS,
+                KeyCodec.concat(KeyCodec.encodePrimaryKey(DataType.VARCHAR,
+                        dbName == null ? "" : dbName.toLowerCase()), KeyCodec.be4(tableId)));
+    }
+
+    /** sys_column_stats 的主键编码:table_id(4B 大端)+ ordinal(2B 大端)。 */
+    public static byte[] columnStatsKey(long tableId, int ordinal) {
+        return KeyCodec.systemRowKey(SYS_COLUMN_STATS,
+                KeyCodec.concat(KeyCodec.be4(tableId), KeyCodec.be2(ordinal)));
+    }
+
+    /** sys_table_stats 行(列顺序与 {@link #TABLE_STATS} 一致)。 */
+    public static byte[] encodeTableStatsRow(String dbName, String tableName, long rowCount,
+                                             long totalBytes, long analyzedCommitTs,
+                                             int samplePermille, String lastAnalyze, boolean stale,
+                                             long analyzeMillis, long scannedRows) {
+        return RowCodec.encode(TABLE_STATS, new Object[]{
+                dbName, tableName, rowCount, totalBytes, analyzedCommitTs, samplePermille,
+                lastAnalyze, stale, analyzeMillis, scannedRows});
+    }
+
+    /** sys_column_stats 行(列顺序与 {@link #COLUMN_STATS} 一致)。 */
+    public static byte[] encodeColumnStatsRow(long tableId, int ordinal, String columnName,
+                                              long nullCount, long distinctCount,
+                                              boolean distinctIsApprox, String minValue,
+                                              String maxValue, String histogramJson) {
+        return RowCodec.encode(COLUMN_STATS, new Object[]{
+                tableId, ordinal, columnName, nullCount, distinctCount, distinctIsApprox,
+                minValue, maxValue, histogramJson == null
+                        ? "{}".getBytes(StandardCharsets.UTF_8)
+                        : histogramJson.getBytes(StandardCharsets.UTF_8)});
     }
 
     /** sys_tables 的主键编码:table_id 4B 大端。 */

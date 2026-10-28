@@ -260,10 +260,15 @@ class QueryFeaturesTest {
     }
 
     @Test
-    void correlatedSubqueryIsExplicitlyUnsupported() {
-        SqlError e = assertThrows(SqlError.class, () ->
-                table("SELECT id FROM p WHERE id IN (SELECT pid FROM o WHERE o.pid = p.id)"));
-        assertEquals(SqlError.ER_NOT_SUPPORTED_YET, e.code(), "相关子查询归 P6");
+    void correlatedSubqueryRunsPerOuterRowSinceP6() {
+        // SPEC-P6 FR-656:相关子查询按外层行驱动执行;结果与朴素实现一致。
+        Result.Table correlated = table(
+                "SELECT id FROM p WHERE id IN (SELECT pid FROM o WHERE o.pid = p.id) ORDER BY id");
+        assertEquals(List.of(1, 2), ints(correlated));
+        assertEquals(2L, one("SELECT COUNT(*) FROM p WHERE EXISTS "
+                + "(SELECT 1 FROM o WHERE o.pid = p.id)"));
+        assertEquals(3L, one("SELECT COUNT(*) FROM p WHERE NOT EXISTS "
+                + "(SELECT 1 FROM o WHERE o.pid = p.id)"));
     }
 
     // ============================================================ I 组:JSON

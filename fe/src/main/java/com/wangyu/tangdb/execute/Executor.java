@@ -33,6 +33,7 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -93,6 +94,11 @@ public final class Executor {
     /** 当前 DML 是否维护了索引(用于把 max_txn_write_bytes 错误说明成"含索引写入",FR-493)。 */
     private boolean currentStatementWritesIndexes;
 
+    // ---- P6:优化器开关与统计信息(§5.3) ----
+    private com.wangyu.tangdb.planner.OptimizerConfig optimizer =
+            com.wangyu.tangdb.planner.OptimizerConfig.defaults();
+    private com.wangyu.tangdb.stats.StatsService stats;
+
     public Executor(KvStore kv, Catalog catalog) {
         this.kv = kv;
         this.catalog = catalog;
@@ -131,6 +137,57 @@ public final class Executor {
     public Executor withVectorized(boolean enabled) {
         this.vectorized = enabled;
         return this;
+    }
+
+    /** 注入优化器配置(SPEC-P6 §5.3);未注入时用规约默认值。 */
+    public Executor withOptimizer(com.wangyu.tangdb.planner.OptimizerConfig config) {
+        if (config != null && !config.equals(this.optimizer)) {
+            this.optimizer = config;
+            this.stats = null; // 统计服务的配置跟着优化器配置走
+        }
+        return this;
+    }
+
+    /** 注入统计服务(常驻 FE 共享一份;单测里按需创建)。 */
+    public Executor withStats(com.wangyu.tangdb.stats.StatsService service) {
+        this.stats = service;
+        return this;
+    }
+
+    /** 虚拟表访问器(information_schema 走统一计划器,FR-667)。 */
+    private com.wangyu.tangdb.execute.VirtualTables virtualTables() {
+        return new com.wangyu.tangdb.execute.VirtualTables() {
+            @Override
+            public java.util.List<Column> columns(String tableName) {
+                MetaCommands.VTable table = meta().virtual(tableName);
+                return table == null ? null : table.columns();
+            }
+
+            @Override
+            public java.util.List<Object[]> rows(String tableName) {
+                MetaCommands.VTable table = meta().virtual(tableName);
+                return table == null ? java.util.List.of() : table.rows();
+            }
+
+            @Override
+            public long estimatedRows(String tableName) {
+                return MetaCommands.estimateRows(tableName);
+            }
+        };
+    }
+
+    /** 查询引擎参数(含优化器 / 统计 / 虚拟表)。 */
+    private QueryEngine.Options queryOptions() {
+        return new QueryEngine.Options(currentDatabase, queryBatchRows, sortSpillBytes, sortTmpDir,
+                vectorized, optimizer, stats()).withVirtualTables(virtualTables());
+    }
+
+    /** 统计服务(懒创建:单测里 new Executor(kv, catalog) 也能用 ANALYZE)。 */
+    public com.wangyu.tangdb.stats.StatsService stats() {
+        if (stats == null) {
+            stats = new com.wangyu.tangdb.stats.StatsService(kv, catalog, optimizer);
+        }
+        return stats;
     }
 
     /** SHOW WARNINGS 的口径(边界 63)。 */
@@ -250,6 +307,12 @@ public final class Executor {
         if (statement instanceof Ast.ShowImportTasks) {
             return showImportTasks();
         }
+        if (statement instanceof Ast.Analyze analyze) {
+            return analyze(analyze);
+        }
+        if (statement instanceof Ast.ShowStats showStats) {
+            return showStats(showStats);
+        }
         if (statement instanceof Ast.ShowCreateTable show) {
             return meta().showCreateTable(show);
         }
@@ -279,6 +342,9 @@ public final class Executor {
         }
         if (statement instanceof Ast.SelectQuery query) {
             return selectQuery(query);
+        }
+        if (statement instanceof Ast.SetQuery setQuery) {
+            return selectSet(setQuery);
         }
         if (statement instanceof Ast.Select select) {
             return select(select);
@@ -799,6 +865,79 @@ public final class Executor {
                 "error_summary", "updated_at"), rows);
     }
 
+    // ------------------------------------------------------------ ANALYZE / SHOW STATS(SPEC-P6)
+
+    /**
+     * {@code ANALYZE TABLE [db.]t [(c1,...)]}(FR-615 ~ FR-621)。
+     *
+     * <p>显式事务里执行 → 1235(FR-624);扫描走统一 {@link ReadView},统计写入是
+     * 一个批记录(FR-621)。表不存在 1146、列不存在 1054。</p>
+     */
+    private Result analyze(Ast.Analyze analyze) {
+        if (active != null) {
+            throw new SqlError(SqlError.ER_NOT_SUPPORTED_YET, "42000",
+                    "ANALYZE 不能在事务中执行,请先 COMMIT 或 ROLLBACK");
+        }
+        String db = resolveDatabase(analyze.database());
+        TableMeta table = catalog.require(db, analyze.table());
+        List<Column> targets = new ArrayList<>();
+        if (analyze.columns().isEmpty()) {
+            targets.addAll(table.columns());
+        } else {
+            Set<String> seen = new HashSet<>();
+            for (String name : analyze.columns()) {
+                Column column = table.column(name);
+                if (column == null) {
+                    throw new CatalogException("列 " + name + " 不存在(表 " + table.name() + ")",
+                            SqlError.ER_BAD_FIELD_ERROR);
+                }
+                if (seen.add(column.name())) {
+                    targets.add(column);
+                }
+            }
+        }
+
+        long snapshot = 0;
+        TransactionStore.TxnHandle handle = null;
+        ReadView view;
+        if (kv instanceof TransactionStore store) {
+            handle = store.beginTxn();
+            snapshot = handle.snapshot();
+            view = ReadViews.at(kv, snapshot);
+        } else {
+            view = ReadViews.latest(kv);
+        }
+        com.wangyu.tangdb.stats.StatsService.AnalyzeResult result;
+        try {
+            result = stats().analyze(table, targets, view, snapshot);
+        } finally {
+            if (handle != null) {
+                try {
+                    ((TransactionStore) kv).abort(handle.txnId());
+                } catch (RuntimeException ignored) {
+                    // 句柄过期无害,不覆盖 ANALYZE 的真实结果/异常。
+                }
+            }
+        }
+        StringBuilder text = new StringBuilder("OK, 表 ").append(table.name())
+                .append(" 统计已更新(行数 ").append(result.table().rowCount())
+                .append(",列 ").append(result.columns().size())
+                .append(",扫描 ").append(result.scannedRows()).append(" 行")
+                .append(",耗时 ").append(result.durationMillis()).append(" ms");
+        if (result.sampled()) {
+            text.append(",抽样率 ").append(result.table().samplePermille()).append("‰");
+        }
+        return new Result.Message(text.append(')').toString());
+    }
+
+    /** {@code SHOW STATS [FROM [db.]t]}(FR-622 / FR-672 / FR-675)。 */
+    private Result showStats(Ast.ShowStats show) {
+        String db = resolveDatabase(show.database());
+        TableMeta table = show.table() == null ? null : catalog.require(db, show.table());
+        List<Object[]> rows = stats().showStats(table, db);
+        return new Result.Table(com.wangyu.tangdb.stats.StatsService.showStatsColumns(), rows);
+    }
+
     private static String encodingText(Map<String, Integer> encodings) {
         if (encodings.isEmpty()) {
             return "-";
@@ -821,9 +960,19 @@ public final class Executor {
         TableMeta table;
         Plan plan;
         Ast.Condition where;
-        if (inner instanceof Ast.SelectQuery query) {
+        if (inner instanceof Ast.SetQuery setQuery) {
             QueryEngine.Options options = new QueryEngine.Options(currentDatabase,
-                    queryBatchRows, sortSpillBytes, sortTmpDir, vectorized);
+                    queryBatchRows, sortSpillBytes, sortTmpDir, vectorized, optimizer, stats());
+            QueryEngine engine = new QueryEngine(kv, catalog, currentView(null), options,
+                    message -> warnings.add(message));
+            List<Object[]> planRows = new ArrayList<>();
+            for (String line : engine.explainSet(setQuery.expr())) {
+                planRows.add(new String[]{line});
+            }
+            return new Result.Table(List.of("plan"), planRows);
+        }
+        if (inner instanceof Ast.SelectQuery query) {
+            QueryEngine.Options options = queryOptions();
             QueryEngine engine = new QueryEngine(kv, catalog, currentView(null), options,
                     message -> warnings.add(message));
             List<Object[]> planRows = new ArrayList<>();
@@ -845,7 +994,8 @@ public final class Executor {
             throw new SqlError(SqlError.ER_NOT_SUPPORTED_YET, "42000",
                     "不支持解释该语句(EXPLAIN 只支持 SELECT / UPDATE / DELETE)");
         }
-        plan = planFor(table, where);
+        Planner.Choice choice = planChoice(table, where);
+        plan = choice.plan();
 
         List<Object[]> rows = new ArrayList<>();
         rows.add(new String[]{"访问路径: " + explainLabel(plan)});
@@ -859,7 +1009,138 @@ public final class Executor {
         rows.add(new String[]{"残余过滤: " + (where == null ? "无" : formatCondition(where))
                 + "(由 FE 按谓词执行)"});
         rows.add(new String[]{"扫描方式: " + describeScan(plan)});
+        // ---- SPEC-P6 D 组:下推 / 列裁剪 / LIMIT 下推(只追加,不改上面 P4 的既有行) ----
+        if (where != null) {
+            rows.add(new String[]{"已下推: " + formatCondition(where)
+                    + "(单表谓词在扫描时执行,残余仍由 FE 校验)"});
+        }
+        int[] columnCounts = legacyColumnCounts(table, inner instanceof Ast.Select sel ? sel : null);
+        if (columnCounts != null) {
+            rows.add(new String[]{"列: 读取 " + columnCounts[0] + " / 表 " + table.columnCount()
+                    + " 列"});
+        }
+        if (inner instanceof Ast.Select sel) {
+            List<String> read = legacyColumnNames(table, sel);
+            if (!read.isEmpty()) {
+                rows.add(new String[]{"实际读取列: " + String.join(", ", read)});
+            }
+        }
+        if (inner instanceof Ast.Select sel && sel.limit() != null && sel.where() == null) {
+            rows.add(new String[]{"LIMIT 下推: 扫描 limit="
+                    + (sel.limit() + (sel.offset() == null ? 0 : sel.offset()))});
+        }
+        // ---- SPEC-P6 §5.4:追加"候选 / 估算 / 依据"三类行(不改上面 P4 的既有行) ----
+        for (Planner.Candidate candidate : choice.candidates()) {
+            rows.add(new String[]{"候选: " + candidate.label() + " rows=" + candidate.rows()
+                    + ", cost=" + formatCost(candidate.cost())});
+        }
+        Planner.Candidate chosen = choice.chosen();
+        rows.add(new String[]{"估算: rows=" + chosen.rows() + ", cost="
+                + formatCost(chosen.cost())});
+        rows.add(new String[]{"依据: " + evidenceText(choice)});
         return new Result.Table(List.of("plan"), rows);
+    }
+
+    /** 旧路径的"读取列数":投影 + WHERE 引用到的列(去重)。 */
+    private static int[] legacyColumnCounts(TableMeta table, Ast.Select select) {
+        if (select == null || select.countStar()) {
+            return null;
+        }
+        Set<Integer> indexes = new LinkedHashSet<>();
+        try {
+            Planner.Projection projection = Planner.projection(table, select);
+            for (int index : projection.indexes()) {
+                indexes.add(index);
+            }
+        } catch (RuntimeException e) {
+            return null;
+        }
+        collectConditionColumns(table, select.where(), indexes);
+        return new int[]{indexes.size()};
+    }
+
+    /** 旧路径的"实际读取列"名称(投影 + WHERE 列,去重保序)。 */
+    private static List<String> legacyColumnNames(TableMeta table, Ast.Select select) {
+        Set<String> names = new LinkedHashSet<>();
+        if (select.star()) {
+            for (Column column : table.columns()) {
+                names.add(column.name());
+            }
+        } else if (!select.countStar()) {
+            for (Ast.Item item : select.items()) {
+                Column column = table.column(item.column());
+                if (column != null) {
+                    names.add(column.name());
+                }
+            }
+        }
+        collectConditionColumnNames(table, select.where(), names);
+        return new ArrayList<>(names);
+    }
+
+    private static void collectConditionColumnNames(TableMeta table, Ast.Condition condition,
+                                                    Set<String> out) {
+        if (condition == null) {
+            return;
+        }
+        if (condition instanceof Ast.And and) {
+            collectConditionColumnNames(table, and.left(), out);
+            collectConditionColumnNames(table, and.right(), out);
+            return;
+        }
+        if (condition instanceof Ast.Or or) {
+            collectConditionColumnNames(table, or.left(), out);
+            collectConditionColumnNames(table, or.right(), out);
+            return;
+        }
+        String columnName = condition instanceof Ast.Compare cmp ? cmp.column()
+                : condition instanceof Ast.In in ? in.column() : null;
+        if (columnName != null) {
+            Column column = table.column(columnName);
+            if (column != null) {
+                out.add(column.name());
+            }
+        }
+    }
+
+    private static void collectConditionColumns(TableMeta table, Ast.Condition condition,
+                                                Set<Integer> out) {
+        if (condition == null) {
+            return;
+        }
+        if (condition instanceof Ast.And and) {
+            collectConditionColumns(table, and.left(), out);
+            collectConditionColumns(table, and.right(), out);
+            return;
+        }
+        if (condition instanceof Ast.Or or) {
+            collectConditionColumns(table, or.left(), out);
+            collectConditionColumns(table, or.right(), out);
+            return;
+        }
+        String columnName = condition instanceof Ast.Compare cmp ? cmp.column()
+                : condition instanceof Ast.In in ? in.column() : null;
+        if (columnName != null) {
+            Column column = table.column(columnName);
+            if (column != null) {
+                out.add(column.ordinal());
+            }
+        }
+    }
+
+    static String formatCost(double cost) {
+        if (Double.isInfinite(cost)) {
+            return "INF";
+        }
+        return String.format(java.util.Locale.ROOT, "%.1f", cost);
+    }
+
+    static String evidenceText(Planner.Choice choice) {
+        return switch (choice.evidence()) {
+            case STATS -> "统计(t=" + choice.analyzedAt() + ")";
+            case STALE -> "统计已过期(t=" + choice.analyzedAt() + "),回落默认";
+            case DEFAULT -> "默认(未 ANALYZE)";
+        };
     }
 
     private static String explainLabel(Plan plan) {
@@ -1044,6 +1325,9 @@ public final class Executor {
             written++;
         }
         flushWrites(local);
+        if (!bulkImport && active == null) {
+            stats().recordRowDelta(table.id(), written); // FR-623:分析后行数变化用于 stale 判定
+        }
         return affected(written);
     }
 
@@ -1189,6 +1473,9 @@ public final class Executor {
             return true;
         });
         flushWrites(local);
+        if (active == null) {
+            stats().recordRowDelta(table.id(), -count[0]); // 删除使行数下降(FR-623)
+        }
         return affected(count[0]);
     }
 
@@ -1224,11 +1511,18 @@ public final class Executor {
 
     /** P5 查询(表达式 / 聚合 / JOIN / 子查询 / 排序)。 */
     private Result selectQuery(Ast.SelectQuery query) {
-        QueryEngine.Options options = new QueryEngine.Options(currentDatabase,
-                queryBatchRows, sortSpillBytes, sortTmpDir, vectorized);
+        QueryEngine.Options options = queryOptions();
         QueryEngine engine = new QueryEngine(kv, catalog, currentView(null), options,
                 message -> warnings.add(message));
         return engine.execute(query.body());
+    }
+
+    /** 顶层集合运算(SPEC-P6 E 组);计划与执行共用 QueryEngine 的同一套估算。 */
+    private Result selectSet(Ast.SetQuery query) {
+        QueryEngine.Options options = queryOptions();
+        QueryEngine engine = new QueryEngine(kv, catalog, currentView(null), options,
+                message -> warnings.add(message));
+        return engine.executeSet(query.expr());
     }
 
     /** 无 FROM 的字面量投影(FR-560):一行,列名为字面量文本。 */
@@ -1245,12 +1539,12 @@ public final class Executor {
 
     private Result select(Ast.Select select) {
         if (select.countStar()) {
-            throw MetaCommands.notSupported("用户表上的 COUNT(*) 不支持(归 P5);"
-                    + "虚拟表 information_schema.* 上可用");
+            throw SqlError.from(new CatalogException("COUNT(*) 应由统一计划器执行"
+                    + "(该入口只处理虚拟表的简单形态)"));
         }
         if (!select.orderBy().isEmpty()) {
-            throw MetaCommands.notSupported("用户表上的 ORDER BY 不支持(归 P5);"
-                    + "虚拟表 information_schema.* 上支持多列 ORDER BY");
+            throw SqlError.from(new CatalogException("ORDER BY 应由统一计划器执行"
+                    + "(该入口只处理虚拟表的简单形态)"));
         }
         TableMeta table = requireTable(select.database(), select.table());
         Plan plan = planFor(table, select.where());
@@ -1265,9 +1559,11 @@ public final class Executor {
         // 分页语义(FR-551):先过滤(forEachMatch 已按计划 + 残余谓词过滤)→ 再跳过 offset
         // → 再截断 count。索引路径与全表扫路径都经过这里,行为天然一致(FR-552)。
         int[] skipped = {0};
+        // FR-647:无谓词时把 LIMIT 下推到扫描(返回的 key 里主键在前、索引项在后)。
+        int scanLimit = (limit != null && select.where() == null) ? limit + offset : 0;
         // 事务内:固定快照 + 读己之写;事务外:最新已提交(FR-343 / FR-500 / FR-510)。
         ReadView view = currentView(null);
-        forEachMatch(plan, table, view, (key, values) -> {
+        RowVisitor visitor = (key, values) -> {
             if (skipped[0] < offset) {
                 skipped[0]++;
                 return true;
@@ -1278,13 +1574,26 @@ public final class Executor {
             }
             rows.add(projected);
             return limit == null || rows.size() < limit;
-        });
+        };
+        int visited = forEachMatch(plan, table, view, scanLimit, visitor);
+        if (scanLimit > 0 && limit != null && rows.size() < limit) {
+            // 墓碑 / 索引项占位可能让"截断的扫描"少给行 → 退回完整扫描,保证结果正确。
+            rows.clear();
+            skipped[0] = 0;
+            forEachMatch(plan, table, view, 0, visitor);
+        }
         return new Result.Table(projection.names(), rows);
     }
 
     /** 与执行共用同一个计划构造入口(FR-517):查询、DML、EXPLAIN 都走这里。 */
     private Plan planFor(TableMeta table, Ast.Condition where) {
-        return Planner.access(table, where, catalog.activeIndexes(table.id()));
+        return planChoice(table, where).plan();
+    }
+
+    /** SPEC-P6:访问路径选择(含候选与估算依据),EXPLAIN 与执行共用。 */
+    private Planner.Choice planChoice(TableMeta table, Ast.Condition where) {
+        return Planner.choose(table, where, catalog.activeIndexes(table.id()), stats(),
+                optimizer.enabled());
     }
 
     /** 需要写入维护的索引:ACTIVE 与 BUILDING(FR-491 / K89);DROPPED 不维护。 */
@@ -1311,6 +1620,11 @@ public final class Executor {
      * @return 实际回调的行数
      */
     private int forEachMatch(Plan plan, TableMeta table, ReadView view, RowVisitor visitor) {
+        return forEachMatch(plan, table, view, 0, visitor);
+    }
+
+    private int forEachMatch(Plan plan, TableMeta table, ReadView view, int scanLimit,
+                             RowVisitor visitor) {
         int count = 0;
         lastIndexEntriesScanned = 0;
         lastTableLookups = 0;
@@ -1332,7 +1646,7 @@ public final class Executor {
                 }
             }
             case RANGE -> {
-                List<KeyValue> kvs = view.scan(plan.start(), plan.end(), 0);
+                List<KeyValue> kvs = view.scan(plan.start(), plan.end(), scanLimit);
                 for (KeyValue row : kvs) {
                     if (KeyCodec.indexId(row.key()) != KeyCodec.INDEX_ID_PRIMARY) {
                         continue; // P4:同一表前缀下还有索引项,全表/主键范围扫描必须跳过它们

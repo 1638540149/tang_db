@@ -781,6 +781,9 @@ public final class Catalog {
         ensureTable(SystemTables.INDEXES);
         // SPEC-P5 FR-614:导入任务状态表同样幂等补齐。
         ensureTable(SystemTables.IMPORT_STATE);
+        // SPEC-P6 §5.1:统计信息两张系统表(老目录启动时幂等创建,不需要数据迁移)。
+        ensureTable(SystemTables.TABLE_STATS);
+        ensureTable(SystemTables.COLUMN_STATS);
         if (kv.get(SystemTables.counterKey(SystemTables.COUNTER_NEXT_TABLE_ID)) == null) {
             kv.put(SystemTables.counterKey(SystemTables.COUNTER_NEXT_TABLE_ID),
                     SystemTables.encodeCounterRow(SystemTables.COUNTER_NEXT_TABLE_ID,

@@ -39,9 +39,10 @@ public final class Aggregates {
                         "不支持的聚合函数: " + func.name());
         }
         if (func.distinct() && !name.equals("COUNT")) {
-            // SUM(DISTINCT) / AVG(DISTINCT) 归 P6(SPEC-P5 §2.2)。
+            // SUM(DISTINCT) / AVG(DISTINCT) 未被 P6 认领(SPEC-P6 §2.4 的挂账清单里没有它)。
             throw new SqlError(SqlError.ER_NOT_SUPPORTED_YET, "42000",
-                    name + "(DISTINCT ...) 归 P6(本期只支持 COUNT(DISTINCT ...))");
+                    name + "(DISTINCT ...) 暂不支持(SELECT DISTINCT 已支持;"
+                            + "聚合内 DISTINCT 只支持 COUNT(DISTINCT ...))");
         }
         return new Accumulator(func, name, evaluator, warnings);
     }

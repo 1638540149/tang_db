@@ -11,7 +11,7 @@ import com.wangyu.tangdb.storage.StoreException;
  * <p>协议层把任何执行失败都转成 {@link SqlError} 再编码成 ERR 包;CLI 只读 message。
  * 错误码常量命名沿用 MySQL 的 ER_* 符号,便于对照。</p>
  */
-public final class SqlError extends RuntimeException {
+public class SqlError extends RuntimeException {
 
     private static final long serialVersionUID = 1L;
 
@@ -43,10 +43,36 @@ public final class SqlError extends RuntimeException {
     public static final int ER_MIX_OF_GROUP_FUNC_AND_FIELDS = 1140; // 聚合与普通列混用
     public static final int ER_WRONG_ARGUMENTS = 1210;        // 函数参数 / 类型不可比较
     public static final int ER_SUBQUERY_NO_1_ROW = 1242;      // 标量子查询返回多行(K108)
-    public static final int ER_WRONG_VALUE_COUNT_ON_ROW = 1136; // 列数不符
+    public static final int ER_WRONG_VALUE_COUNT_ON_ROW = 1136; // INSERT 取值个数与列数不符
+    /** 集合运算两支列数 / 类型无法对齐(SPEC-P6 FR-650)。 */
+    public static final int ER_WRONG_NUMBER_OF_COLUMNS_IN_SELECT = 1222;
 
     private final int code;
     private final String sqlState;
+
+    /**
+     * 未知列(1054)。带上限定名与列名,便于 QueryEngine 判定"这是外层列引用"并转成相关子查询
+     * (SPEC-P6 FR-656):普通 1054 与相关引用在错误码上相同,但语义完全不同。
+     */
+    public static final class BadField extends SqlError {
+        private static final long serialVersionUID = 1L;
+        private final String qualifier;
+        private final String name;
+
+        public BadField(String qualifier, String name, String message) {
+            super(ER_BAD_FIELD_ERROR, "42S22", message);
+            this.qualifier = qualifier;
+            this.name = name;
+        }
+
+        public String qualifier() {
+            return qualifier;
+        }
+
+        public String name() {
+            return name;
+        }
+    }
 
     public SqlError(int code, String sqlState, String message) {
         super(message);
@@ -67,7 +93,10 @@ public final class SqlError extends RuntimeException {
         if (t instanceof SqlError se) {
             return se;
         }
-        if (t instanceof ParseException) {
+        if (t instanceof ParseException pe) {
+            if (pe.code() != 0) {
+                return new SqlError(pe.code(), "42000", pe.getMessage());
+            }
             return new SqlError(ER_SYNTAX_ERROR, "42000", t.getMessage());
         }
         if (t instanceof ConflictException) {
@@ -111,6 +140,7 @@ public final class SqlError extends RuntimeException {
             case ER_WRONG_ARGUMENTS -> "HY000";
             case ER_SUBQUERY_NO_1_ROW -> "21000";
             case ER_WRONG_VALUE_COUNT_ON_ROW -> "21S01";
+            case ER_WRONG_NUMBER_OF_COLUMNS_IN_SELECT -> "21000";
             default -> "HY000";
         };
     }

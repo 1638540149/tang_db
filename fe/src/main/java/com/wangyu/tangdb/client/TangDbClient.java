@@ -55,6 +55,13 @@ public class TangDbClient implements AutoCloseable, KvStore, TransactionStore {
     /** 扫描可能返回大量数据,给它比点操作更宽的截止时间。 */
     private static final long SCAN_DEADLINE_SECONDS = 60L;
 
+    /**
+     * 批量提交(CSV 导入 / ANALYZE 的统计批写)遇到后台 compaction 时,5 秒会误判超时
+     * (SPEC-P6 的 10 万行导入实测在 compaction 期间单批可超过 5s)。放宽只影响
+     * "失败多久被发现",不影响正确性。
+     */
+    private static final long COMMIT_DEADLINE_SECONDS = 60L;
+
     /** 关闭 channel 时等待在途 RPC 结束的时间。 */
     private static final long SHUTDOWN_TIMEOUT_SECONDS = 5L;
 
@@ -343,7 +350,7 @@ public class TangDbClient implements AutoCloseable, KvStore, TransactionStore {
 
         CommitTxnResponse response;
         try {
-            response = stubWithDeadline().commitTxn(builder.build());
+            response = stubWithDeadline(COMMIT_DEADLINE_SECONDS).commitTxn(builder.build());
         } catch (StatusRuntimeException e) {
             throw new StoreException(translate(e, host, port).getMessage(), e);
         }

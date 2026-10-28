@@ -31,6 +31,21 @@ public final class ReadViews {
         };
     }
 
+    /** 固定快照读(ANALYZE 用:统计与用户数据同一快照,FR-621 的同事务语义)。 */
+    public static ReadView at(KvStore kv, long snapshot) {
+        return new ReadView() {
+            @Override
+            public byte[] get(byte[] userKey) {
+                return kv.get(userKey, snapshot);
+            }
+
+            @Override
+            public List<KeyValue> scan(byte[] start, byte[] end, int limit) {
+                return kv.scan(start, end, snapshot, limit);
+            }
+        };
+    }
+
     /** 事务内:固定快照 + 写集叠加(读己之写)。 */
     public static ReadView ofTransaction(KvStore kv, Transaction txn) {
         return new ReadView() {

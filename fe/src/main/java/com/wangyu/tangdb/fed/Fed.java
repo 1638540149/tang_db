@@ -100,7 +100,8 @@ public final class Fed implements AutoCloseable {
                 java.nio.file.Path.of(config.sortTmpDir()));
         SqlEngine engine = new SqlEngine(client, catalog, sessions, registry,
                 config.heartbeatEnabled(), config.user(), config.indexBackfillBatch(),
-                config.queryBatchRows(), config.sortSpillBytes(), config.sortTmpDir());
+                config.queryBatchRows(), config.sortSpillBytes(), config.sortTmpDir(),
+                config.optimizer());
         byte[] storedHash = NativePassword.deriveStoredHash(config.password());
 
         MysqlServer mysqlServer;

@@ -27,7 +27,8 @@ class VirtualSchemaTest {
             "SCHEMATA", "TABLES", "COLUMNS", "STATISTICS", "KEY_COLUMN_USAGE",
             "TABLE_CONSTRAINTS", "REFERENTIAL_CONSTRAINTS", "VIEWS", "ROUTINES", "TRIGGERS",
             "EVENTS", "PROCESSLIST", "CHARACTER_SETS", "COLLATIONS", "ENGINES", "PARTITIONS",
-            "USER_PRIVILEGES");
+            "USER_PRIVILEGES",
+            "PARAMETERS"); // SPEC-P6 FR-669:17 → 18
 
     private FakeKvStore kv;
     private Catalog catalog;
@@ -57,7 +58,7 @@ class VirtualSchemaTest {
     }
 
     @Test
-    void allSeventeenVirtualTablesAreQueryable() {
+    void allEighteenVirtualTablesAreQueryable() {
         for (String name : VIRTUAL_TABLES) {
             Result.Table result = table("SELECT * FROM information_schema." + name);
             assertFalse(result.columns().isEmpty(), name + " 列定义不能为空");
@@ -152,13 +153,25 @@ class VirtualSchemaTest {
     }
 
     @Test
-    void unsupportedQueryShapesOnInformationSchemaReturn1235() {
-        for (String sql : List.of(
-                "SELECT * FROM information_schema.TABLES JOIN information_schema.COLUMNS",
-                "SELECT DISTINCT TABLE_NAME FROM information_schema.TABLES")) {
-            SqlError e = assertThrows(SqlError.class, () -> engine.execute(session, sql), sql);
-            assertEquals(SqlError.ER_NOT_SUPPORTED_YET, e.code(), sql);
+    void joinsAndDistinctOnInformationSchemaWorkSinceP6() {
+        // SPEC-P6 FR-667:门禁移除后 JOIN / DISTINCT 走统一计划器,不再 1235
+        Result.Table joined = table("SELECT T.TABLE_NAME, C.COLUMN_NAME "
+                + "FROM information_schema.TABLES T JOIN information_schema.COLUMNS C "
+                + "ON T.TABLE_NAME = C.TABLE_NAME WHERE T.TABLE_NAME = 't' ORDER BY C.COLUMN_NAME");
+        assertFalse(joined.rows().isEmpty());
+
+        Result.Table distinct = table("SELECT DISTINCT TABLE_NAME FROM information_schema.TABLES");
+        assertFalse(distinct.rows().isEmpty());
+        List<Object> names = new ArrayList<>();
+        for (Object[] row : distinct.rows()) {
+            names.add(row[0]);
         }
+        assertTrue(names.contains("t"), names.toString());
+
+        // FR-669:PARAMETERS 恒 0 行,列与 MySQL 对齐
+        Result.Table parameters = table("SELECT * FROM information_schema.PARAMETERS");
+        assertTrue(parameters.rows().isEmpty());
+        assertTrue(parameters.columns().contains("SPECIFIC_NAME"), parameters.columns().toString());
     }
 
     @Test

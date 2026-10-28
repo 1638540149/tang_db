@@ -554,6 +554,30 @@ public final class MetaCommands {
 
     // ============================================================ 虚拟表定义
 
+    /** 统一计划器用的虚拟表入口(SPEC-P6 FR-667);未知表返回 null。 */
+    public VTable virtual(String name) {
+        return name == null ? null : virtualTable(name.toLowerCase(Locale.ROOT));
+    }
+
+    /**
+     * 虚拟表的固定行数估算(FR-668/K134):TABLES = 库数 × 表数上限、COLUMNS = 列数上限,
+     * 其余固定小常数。**不为了估算去扫虚拟表**,避免每次客户端自省都全量枚举。
+     */
+    public static long estimateRows(String name) {
+        return switch (name == null ? "" : name.toLowerCase(Locale.ROOT)) {
+            case "tables" -> 1_000;
+            case "columns" -> 10_000;
+            case "statistics", "key_column_usage" -> 10_000;
+            case "schemata" -> 100;
+            case "collations", "character_sets", "engines" -> 100;
+            case "processlist" -> 100;
+            case "user_privileges" -> 10;
+            case "partitions", "referential_constraints", "views", "routines", "triggers",
+                    "events", "parameters", "table_constraints" -> 0;
+            default -> 100;
+        };
+    }
+
     private VTable virtualTable(String name) {
         return switch (name) {
             case "schemata" -> schemata();
@@ -617,6 +641,13 @@ public final class MetaCommands {
                     c("LAST_ALTERED"), c("LAST_EXECUTED"), c("EVENT_COMMENT"), n("ORIGINATOR"),
                     c("CHARACTER_SET_CLIENT"), c("COLLATION_CONNECTION"),
                     c("DATABASE_COLLATION")), List.of());
+            case "parameters" -> new VTable("PARAMETERS", cols(
+                    c("SPECIFIC_CATALOG"), c("SPECIFIC_SCHEMA"), c("SPECIFIC_NAME"),
+                    n("ORDINAL_POSITION"), c("PARAMETER_MODE"), c("PARAMETER_NAME"),
+                    c("DATA_TYPE"), n("CHARACTER_MAXIMUM_LENGTH"),
+                    n("CHARACTER_OCTET_LENGTH"), n("NUMERIC_PRECISION"), n("NUMERIC_SCALE"),
+                    n("DATETIME_PRECISION"), c("CHARACTER_SET_NAME"), c("COLLATION_NAME"),
+                    c("DTD_IDENTIFIER"), c("ROUTINE_TYPE")), List.of());
             case "user_privileges" -> new VTable("USER_PRIVILEGES", cols(
                     c("GRANTEE"), c("TABLE_CATALOG"), c("PRIVILEGE_TYPE"), c("IS_GRANTABLE")),
                     List.<Object[]>of(new Object[]{
@@ -852,7 +883,7 @@ public final class MetaCommands {
     }
 
     /** 内存虚拟表:显示列名 + 列定义(小写,供谓词绑定)+ 行。 */
-    private static final class VTable {
+    public static final class VTable {
         private final String name;
         private final List<String> displayNames;
         private final List<Column> columns;
@@ -871,15 +902,23 @@ public final class MetaCommands {
             this.rows = List.copyOf(rows);
         }
 
-        List<Column> columns() {
+        public List<Column> columns() {
             return columns;
         }
 
-        String nameAt(int i) {
+        public String tableName() {
+            return name;
+        }
+
+        public String nameAt(int i) {
             return displayNames.get(i);
         }
 
-        List<Object[]> rows() {
+        public List<String> displayNames() {
+            return displayNames;
+        }
+
+        public List<Object[]> rows() {
             return new ArrayList<>(rows);
         }
 

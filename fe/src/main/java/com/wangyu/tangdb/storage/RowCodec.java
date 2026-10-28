@@ -64,6 +64,16 @@ public final class RowCodec {
 
     /** 解码一行;版本不识别、表 ID 不符、列数不符都报错。 */
     public static Decoded decode(TableMeta table, byte[] data) {
+        return decode(table, data, null);
+    }
+
+    /**
+     * 列裁剪解码(SPEC-P6 FR-648 / K136):{@code needed[i] == false} 的列只跳过字节、
+     * 不分配值(null)。只在 FE 侧减少解码工作,不减少网络传输与解压量(§2.2 口径)。
+     *
+     * @param needed 与列数等长;null 表示全部解码
+     */
+    public static Decoded decode(TableMeta table, byte[] data, boolean[] needed) {
         if (data == null || data.length < 1) {
             throw new StoreException("行数据为空");
         }
@@ -106,6 +116,10 @@ public final class RowCodec {
                 continue;
             }
             Column column = table.columns().get(i);
+            if (needed != null && i < needed.length && !needed[i]) {
+                pos = skipColumn(data, pos, column.type());
+                continue;
+            }
             switch (column.type()) {
                 case INT:
                     require(data, pos, 4);
@@ -159,6 +173,32 @@ public final class RowCodec {
             throw new StoreException("行数据尾部有多余字节(表 " + table.name() + ")");
         }
         return new Decoded(false, values);
+    }
+
+    /** 跳过一列的字节(列裁剪解码用)。 */
+    private static int skipColumn(byte[] data, int pos, DataType type) {
+        switch (type) {
+            case INT, DATE -> {
+                require(data, pos, 4);
+                return pos + 4;
+            }
+            case BIGINT, DOUBLE -> {
+                require(data, pos, 8);
+                return pos + 8;
+            }
+            case BOOLEAN -> {
+                require(data, pos, 1);
+                return pos + 1;
+            }
+            case VARCHAR, JSON -> {
+                require(data, pos, 4);
+                int len = readLe4Int(data, pos);
+                pos += 4;
+                require(data, pos, len);
+                return pos + len;
+            }
+            default -> throw new StoreException("不支持的列类型: " + type);
+        }
     }
 
     private static int writeColumnValue(byte[] buf, int pos, Column column, Object value) {

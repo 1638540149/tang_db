@@ -31,10 +31,16 @@ public final class Parser {
      */
     private static final java.util.Set<String> ITEM_FOLLOW_KEYWORDS = java.util.Set.of(
             "FROM", "WHERE", "ORDER", "GROUP", "HAVING", "LIMIT", "OFFSET",
-            "AND", "OR", "IN", "ASC", "DESC", "UNION", "JOIN", "ON");
+            "AND", "OR", "IN", "ASC", "DESC", "UNION", "JOIN", "ON", "INTERSECT",
+            "EXCEPT", "MINUS");
+
+    /** 派生表嵌套上限(SPEC-P6 FR-665 / K133)。 */
+    private static final int MAX_DERIVED_DEPTH = 8;
 
     private final List<Token> tokens;
     private int index;
+    /** 派生表嵌套层数(解析期计数,超过上限报 1235)。 */
+    private int derivedDepth;
 
     public Parser(List<Token> tokens) {
         this.tokens = tokens;
@@ -53,6 +59,10 @@ public final class Parser {
 
     private Ast.Statement parseStatement() {
         Token t = current();
+        if (t.type() == TokenType.LPAREN) {
+            // 括号开头的集合运算:(SELECT ...) UNION (SELECT ...)
+            return new Ast.SetQuery(parseSetExpression(false));
+        }
         if (t.type() != TokenType.IDENT) {
             throw error("期望一条 SQL 语句,实际是 " + describe(t));
         }
@@ -67,11 +77,14 @@ public final class Parser {
             case "DELETE" -> parseDelete();
             case "SELECT" -> parseSelect();
             case "EXPLAIN" -> parseExplain();
+            case "ANALYZE" -> parseAnalyze();
             case "KILL" -> parseKill();
             case "BEGIN" -> parseBegin();
             case "COMMIT" -> parseCommit();
             case "ROLLBACK" -> parseRollback();
             case "USE" -> parseUse();
+            case "WITH" -> throw new ParseException(
+                    "语法错误: WITH(CTE)不支持(归 P8 之后;当前可用派生表)", t.line(), t.column(), 1235);
             default -> throw error("不支持的语句: " + t.text()
                     + "(支持 CREATE/DROP/TRUNCATE/SHOW/DESC/INSERT/UPDATE/DELETE/SELECT/EXPLAIN/KILL"
                     + "/BEGIN/COMMIT/ROLLBACK/USE)");
@@ -167,7 +180,7 @@ public final class Parser {
         expect(TokenType.LPAREN, "索引列的 '('");
         String column = expectIdentifier("索引列名");
         if (match(TokenType.COMMA)) {
-            throw error("本期只支持单列索引(复合索引归 P6)");
+            throw error("只支持单列索引(复合索引不在本期范围)");
         }
         expect(TokenType.RPAREN, "索引列的 ')'");
         return new Ast.CreateIndex(ref.database(), ref.table(), name, column, unique);
@@ -201,7 +214,7 @@ public final class Parser {
         expect(TokenType.LPAREN, "内联索引的 '('");
         String column = expectIdentifier("索引列名");
         if (match(TokenType.COMMA)) {
-            throw error("本期只支持单列索引(复合索引归 P6)");
+            throw error("只支持单列索引(复合索引不在本期范围)");
         }
         expect(TokenType.RPAREN, "内联索引的 ')'");
         return new Ast.InlineIndex(name, column, unique);
@@ -414,6 +427,17 @@ public final class Parser {
             expectKeyword("TASKS");
             return new Ast.ShowImportTasks();
         }
+        if (matchKeyword("STATS")) {
+            // SHOW STATS [FROM|IN [db.]t](SPEC-P6 FR-622 / K120)
+            String db = null;
+            String table = null;
+            if (matchKeyword("FROM") || matchKeyword("IN")) {
+                Ref ref = parseTableRef("表名");
+                db = ref.database();
+                table = ref.table();
+            }
+            return new Ast.ShowStats(db, table);
+        }
         if (matchKeyword("SEGMENTS")) {
             String db = null;
             String table = null;
@@ -588,6 +612,28 @@ public final class Parser {
         return new Ast.Explain(inner);
     }
 
+    /**
+     * {@code ANALYZE TABLE [db.]t [(c1 [, c2 ... ])]}(SPEC-P6 FR-615)。
+     *
+     * <p>列名列表可省略(全列);空列表 {@code ()} 报语法错,不做半实现。</p>
+     */
+    private Ast.Statement parseAnalyze() {
+        expectKeyword("ANALYZE");
+        expectKeyword("TABLE");
+        Ref ref = parseTableRef("表名");
+        List<String> columns = new ArrayList<>();
+        if (match(TokenType.LPAREN)) {
+            if (current().type() == TokenType.RPAREN) {
+                throw error("ANALYZE 的列列表不能为空(要分析全部列请省略括号)");
+            }
+            do {
+                columns.add(expectIdentifier("列名"));
+            } while (match(TokenType.COMMA));
+            expect(TokenType.RPAREN, "列列表的 ')'");
+        }
+        return new Ast.Analyze(ref.database(), ref.table(), columns);
+    }
+
     private Ast.Statement parseKill() {
         expectKeyword("KILL");
         matchKeyword("CONNECTION");
@@ -693,22 +739,170 @@ public final class Parser {
             }
             index = save;
         }
+        Ast.QueryExpr expr = parseSetExpression(true);
+        if (expr instanceof Ast.BodyExpr bodyExpr) {
+            Ast.QueryBody body = bodyExpr.body();
+            if (isLiteralOnly(body.items())) {
+                throw new ParseException("语法错误: 带 FROM 的常量投影不支持(边界 39);"
+                        + "请显式给出列或表达式", 0, 0);
+            }
+            if (canLegacy(body)) {
+                return toLegacy(body);
+            }
+            return new Ast.SelectQuery(body);
+        }
+        return new Ast.SetQuery(expr);
+    }
+
+    // ------------------------------------------------------------ SPEC-P6:E 组集合运算
+
+    /** {@code INTERSECT} 优先级高于 {@code UNION} / {@code EXCEPT},同级左结合(FR-652)。 */
+    private Ast.QueryExpr parseSetExpression(boolean firstConsumed) {
+        Ast.QueryExpr left = parseUnionLevel(firstConsumed);
+        Tail tail = parseTail();
+        if (left instanceof Ast.BodyExpr bodyExpr) {
+            // 单支:尾部直接并进 QueryBody(P5 行为完全不变)
+            return new Ast.BodyExpr(withTail(bodyExpr.body(), tail));
+        }
+        return tail.isEmpty() ? left
+                : new Ast.OrderedExpr(left, tail.orderBy(), tail.limit(), tail.offset());
+    }
+
+    private Ast.QueryExpr parseUnionLevel(boolean firstConsumed) {
+        Ast.QueryExpr left = parseIntersectLevel(firstConsumed);
+        while (true) {
+            Ast.SetOpType op = peekSetOpType();
+            if (op == null) {
+                return left;
+            }
+            boolean all = consumeSetOp(op);
+            Ast.QueryExpr right = parseIntersectLevel(false);
+            left = new Ast.SetExpr(left, op, all, right, List.of(), null, null);
+        }
+    }
+
+    private Ast.QueryExpr parseIntersectLevel(boolean firstConsumed) {
+        Ast.QueryExpr left = parseSetBranch(firstConsumed);
+        while (peekKeyword("INTERSECT")) {
+            boolean all = consumeIntersect();
+            Ast.QueryExpr right = parseSetBranch(false);
+            left = new Ast.SetExpr(left, Ast.SetOpType.INTERSECT, all, right,
+                    List.of(), null, null);
+        }
+        return left;
+    }
+
+    /** 一支:括号分支可以自带 ORDER BY / LIMIT;未加括号的分支不允许(边界 75 → 1064)。 */
+    private Ast.QueryExpr parseSetBranch(boolean selectConsumed) {
+        if (!selectConsumed && match(TokenType.LPAREN)) {
+            Ast.QueryExpr inner = parseUnionLevel(false);
+            Tail innerTail = parseTail(); // 括号内的 ORDER BY / LIMIT(先算完)
+            expect(TokenType.RPAREN, "括号分支的 ')'");
+            if (!innerTail.isEmpty()) {
+                inner = inner instanceof Ast.BodyExpr bodyExpr
+                        ? new Ast.BodyExpr(withTail(bodyExpr.body(), innerTail))
+                        : new Ast.OrderedExpr(inner, innerTail.orderBy(), innerTail.limit(),
+                        innerTail.offset());
+            }
+            Tail tail = parseTail();
+            return tail.isEmpty() ? inner
+                    : new Ast.OrderedExpr(inner, tail.orderBy(), tail.limit(), tail.offset());
+        }
+        if (!selectConsumed) {
+            if (!peekKeyword("SELECT")) {
+                throw error("集合运算的每一支都必须是 SELECT(或括号包起来的查询)");
+            }
+            advance(); // SELECT
+        }
+        return new Ast.BodyExpr(parseQueryBodyBody());
+    }
+
+    private Ast.SetOpType peekSetOpType() {
+        if (peekKeyword("UNION")) {
+            return Ast.SetOpType.UNION;
+        }
+        if (peekKeyword("EXCEPT") || peekKeyword("MINUS")) {
+            return Ast.SetOpType.EXCEPT;
+        }
+        return null;
+    }
+
+    /** 消费集合运算关键字与可选的 ALL;返回是否 ALL。 */
+    private boolean consumeSetOp(Ast.SetOpType type) {
+        if (type == Ast.SetOpType.UNION) {
+            expectKeyword("UNION");
+        } else if (!matchKeyword("EXCEPT")) {
+            expectKeyword("MINUS");
+        }
+        if (matchKeyword("ALL")) {
+            return true;
+        }
+        matchKeyword("DISTINCT");
+        return false;
+    }
+
+    private boolean consumeIntersect() {
+        expectKeyword("INTERSECT");
+        if (matchKeyword("ALL")) {
+            return true;
+        }
+        matchKeyword("DISTINCT");
+        return false;
+    }
+
+    /** 可选尾部:ORDER BY + LIMIT/OFFSET。 */
+    private Tail parseTail() {
+        List<Ast.OrderItem> orderBy = new ArrayList<>();
+        if (matchKeyword("ORDER")) {
+            expectKeyword("BY");
+            do {
+                Ast.Expr expr = parseExpr();
+                boolean descending = false;
+                if (matchKeyword("DESC")) {
+                    descending = true;
+                } else {
+                    matchKeyword("ASC");
+                }
+                orderBy.add(new Ast.OrderItem(expr, descending));
+            } while (match(TokenType.COMMA));
+        }
+        Integer limit = null;
+        Integer offset = null;
+        if (peekKeyword("LIMIT")) {
+            Limit parsed = parseLimitClause();
+            limit = parsed.count();
+            offset = parsed.offset();
+        }
+        return new Tail(orderBy, limit, offset);
+    }
+
+    private static Ast.QueryBody withTail(Ast.QueryBody body, Tail tail) {
+        if (tail.isEmpty()) {
+            return body;
+        }
+        return new Ast.QueryBody(body.items(), body.from(), body.where(), body.groupBy(),
+                body.having(), tail.orderBy(), tail.limit(), tail.offset(), body.distinct());
+    }
+
+    /** 尾部子句。 */
+    private record Tail(List<Ast.OrderItem> orderBy, Integer limit, Integer offset) {
+        boolean isEmpty() {
+            return orderBy.isEmpty() && limit == null;
+        }
+    }
+
+    /**
+     * 解析一个子查询的查询体(供 IN / 标量 / EXISTS / 派生表)。
+     * 子查询里的集合运算不在本期内做,给准确码 1235(FR-670)。
+     */
+    private Ast.QueryBody parseSubqueryBody() {
         Ast.QueryBody body = parseQueryBody();
-        if (isLiteralOnly(body.items())) {
-            throw new ParseException("语法错误: 带 FROM 的常量投影不支持(边界 39);"
-                    + "请显式给出列或表达式", 0, 0);
+        if (peekSetOpType() != null || peekKeyword("INTERSECT")) {
+            throw new ParseException("语法错误: 子查询 / 派生表里的集合运算暂不支持"
+                    + "(本期只支持顶层 UNION / INTERSECT / EXCEPT)", current().line(),
+                    current().column(), 1235);
         }
-        boolean infoSchema = body.from() != null && body.from().first().database() != null
-                && body.from().first().database().equalsIgnoreCase("information_schema");
-        if (infoSchema && !canLegacy(body)) {
-            throw new ParseException(
-                    "语法错误: information_schema 上不支持该查询形态(只支持单表投影 / WHERE"
-                            + " / LIMIT / 多列 ORDER BY / COUNT(*))", 0, 0);
-        }
-        if (canLegacy(body)) {
-            return toLegacy(body);
-        }
-        return new Ast.SelectQuery(body);
+        return body;
     }
 
     private static boolean isLiteralOnly(List<Ast.SelectItem> items) {
@@ -720,10 +914,20 @@ public final class Parser {
         return true;
     }
 
-    /** SELECT ... 之后的完整查询体(SPEC-P5 E 组 / F 组)。 */
+    /** SELECT ... 之后的完整查询体(含尾部子句;供子查询使用)。 */
     private Ast.QueryBody parseQueryBody() {
-        if (peekKeyword("DISTINCT") || peekKeyword("ALL")) {
-            throw error("本期不支持 SELECT DISTINCT(归 P6;COUNT(DISTINCT x) 可用)");
+        Ast.QueryBody body = parseQueryBodyBody();
+        Tail tail = parseTail();
+        return withTail(body, tail);
+    }
+
+    /** 查询体(不含尾部 ORDER BY / LIMIT)。 */
+    private Ast.QueryBody parseQueryBodyBody() {
+        boolean distinct = false;
+        if (matchKeyword("DISTINCT")) {
+            distinct = true; // SPEC-P6 FR-662
+        } else {
+            matchKeyword("ALL"); // SELECT ALL 是默认行为,接受但不改变语义
         }
         List<Ast.SelectItem> items = new ArrayList<>();
         do {
@@ -753,8 +957,6 @@ public final class Parser {
                 type = Ast.JoinType.CROSS;
             } else if (peekKeyword("RIGHT") || peekKeyword("FULL")) {
                 throw error("本期只支持 INNER / LEFT / CROSS JOIN(RIGHT/FULL 未实现)");
-            } else if (peekKeyword("UNION") || peekKeyword("INTERSECT") || peekKeyword("EXCEPT")) {
-                throw error("集合运算(UNION / INTERSECT / EXCEPT)归 P6");
             }
             if (type == null) {
                 break;
@@ -778,6 +980,11 @@ public final class Parser {
         List<Ast.Expr> groupBy = new ArrayList<>();
         if (matchKeyword("GROUP")) {
             expectKeyword("BY");
+            if (peekKeyword("ROLLUP") || peekKeyword("CUBE") || peekKeyword("GROUPING")) {
+                throw new ParseException(
+                        "语法错误: GROUPING SETS / ROLLUP / CUBE 不支持(归 P14 之后)",
+                        current().line(), current().column(), 1235);
+            }
             do {
                 groupBy.add(parseExpr());
             } while (match(TokenType.COMMA));
@@ -786,31 +993,8 @@ public final class Parser {
         if (matchKeyword("HAVING")) {
             having = parseExpr();
         }
-        List<Ast.OrderItem> orderBy = new ArrayList<>();
-        if (matchKeyword("ORDER")) {
-            expectKeyword("BY");
-            do {
-                Ast.Expr expr = parseExpr();
-                boolean descending = false;
-                if (matchKeyword("DESC")) {
-                    descending = true;
-                } else {
-                    matchKeyword("ASC");
-                }
-                orderBy.add(new Ast.OrderItem(expr, descending));
-            } while (match(TokenType.COMMA));
-        }
-        Integer limit = null;
-        Integer offset = null;
-        if (peekKeyword("LIMIT")) {
-            Limit parsed = parseLimitClause();
-            limit = parsed.count();
-            offset = parsed.offset();
-        }
-        if (peekKeyword("UNION") || peekKeyword("INTERSECT") || peekKeyword("EXCEPT")) {
-            throw error("集合运算(UNION / INTERSECT / EXCEPT)归 P6");
-        }
-        return new Ast.QueryBody(items, from, where, groupBy, having, orderBy, limit, offset);
+        return new Ast.QueryBody(items, from, where, groupBy, having, List.of(), null, null,
+                distinct);
     }
 
     private Ast.SelectItem parseSelectItem() {
@@ -835,11 +1019,23 @@ public final class Parser {
 
     private Ast.FromItem parseFromItem() {
         if (match(TokenType.LPAREN)) {
-            Ast.QueryBody subquery = parseQueryBody();
+            if (derivedDepth >= MAX_DERIVED_DEPTH) {
+                throw new ParseException("语法错误: 派生表嵌套超过上限 " + MAX_DERIVED_DEPTH
+                        + " 层(SPEC-P6 FR-665)", current().line(), current().column(), 1235);
+            }
+            derivedDepth++;
+            expectKeyword("SELECT");
+            Ast.QueryBody subquery;
+            try {
+                subquery = parseSubqueryBody();
+            } finally {
+                derivedDepth--;
+            }
             expect(TokenType.RPAREN, "子查询的 ')'");
             String alias = parseOptionalTableAlias();
             if (alias == null) {
-                throw error("FROM 里的子查询必须有别名");
+                throw new ParseException("语法错误: FROM 里的子查询必须有别名(1248)",
+                        current().line(), current().column(), 1248);
             }
             return new Ast.FromItem(null, null, alias, subquery);
         }
@@ -853,7 +1049,7 @@ public final class Parser {
         java.util.Set<String> stop = java.util.Set.of(
                 "WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "OFFSET", "JOIN", "INNER",
                 "LEFT", "RIGHT", "FULL", "CROSS", "ON", "USING", "UNION", "INTERSECT", "EXCEPT",
-                "SET", "VALUES", "AS");
+                "MINUS", "SET", "VALUES", "AS");
         if (matchKeyword("AS")) {
             return expectIdentifier("表别名");
         }
@@ -936,7 +1132,7 @@ public final class Parser {
             expect(TokenType.LPAREN, "IN 列表的 '('");
             if (peekKeyword("SELECT")) {
                 advance(); // SELECT
-                Ast.QueryBody subquery = parseQueryBody();
+                Ast.QueryBody subquery = parseSubqueryBody();
                 expect(TokenType.RPAREN, "IN 子查询的 ')'");
                 return new Ast.InSubquery(left, subquery, negated);
             }
@@ -952,6 +1148,16 @@ public final class Parser {
         Ast.Op op = peekOp();
         if (op != null) {
             advance();
+            if (peekKeyword("ANY") || peekKeyword("SOME") || peekKeyword("ALL")) {
+                boolean all = peekKeyword("ALL");
+                advance(); // ANY / SOME / ALL
+                expect(TokenType.LPAREN, "量词子查询的 '('");
+                expectKeyword("SELECT");
+                Ast.QueryBody quantifierBody = parseSubqueryBody();
+                expect(TokenType.RPAREN, "量词子查询的 ')'");
+                return new Ast.Quantified(op, left, quantifierBody,
+                        all ? Ast.Quantifier.ALL : Ast.Quantifier.ANY);
+            }
             Ast.Expr right = parseAdditive();
             return new Ast.Cmp(op, left, right);
         }
@@ -1018,7 +1224,7 @@ public final class Parser {
             advance();
             if (peekKeyword("SELECT")) {
                 advance(); // SELECT
-                Ast.QueryBody subquery = parseQueryBody();
+                Ast.QueryBody subquery = parseSubqueryBody();
                 expect(TokenType.RPAREN, "标量子查询的 ')'");
                 return new Ast.ScalarSubquery(subquery);
             }
@@ -1041,7 +1247,12 @@ public final class Parser {
                 return new Ast.Cast(operand, type);
             }
             if (upper.equals("EXISTS")) {
-                throw error("EXISTS 归 P6(本期不做相关子查询与 EXISTS)");
+                advance(); // EXISTS
+                expect(TokenType.LPAREN, "EXISTS 的 '('");
+                expectKeyword("SELECT");
+                Ast.QueryBody existsBody = parseSubqueryBody();
+                expect(TokenType.RPAREN, "EXISTS 子查询的 ')'");
+                return new Ast.Exists(existsBody);
             }
             if (upper.equals("NULL")) {
                 advance();
@@ -1056,7 +1267,12 @@ public final class Parser {
                 String name = t.text();
                 advance(); // 函数名
                 advance(); // (
-                return parseFunctionCall(name);
+                Ast.Expr call = parseFunctionCall(name);
+                if (peekKeyword("OVER")) {
+                    throw new ParseException("语法错误: 窗口函数不支持(归 P14 之后)",
+                            current().line(), current().column(), 1235);
+                }
+                return call;
             }
             String first = expectIdentifier("列名");
             if (match(TokenType.DOT)) {
@@ -1131,6 +1347,9 @@ public final class Parser {
      * 的列排序)。能转就转,旧执行路径(P2~P4 的索引选择 / EXPLAIN)完全不变。
      */
     private boolean canLegacy(Ast.QueryBody body) {
+        if (body.distinct()) {
+            return false; // DISTINCT 走统一计划器(FR-662)
+        }
         if (body.from() == null || body.from().first() == null
                 || body.from().first().subquery() != null
                 || !body.from().joins().isEmpty()) {

@@ -11,6 +11,8 @@
 | SPEC-P3.5 | P3.5(提前项) | 常驻 FE(`fed` + 瘦客户端 CLI)+ 多库命名空间 + MySQL 协议 | **Approved** | 0.1d | 2026-10-26 |
 | SPEC-P4 | P4 | 索引(二级/唯一/索引选择/`EXPLAIN`)+ 图形客户端元数据自省兼容(含分页 `LIMIT m,n`、虚拟表多列排序、`COUNT(*)` 别名、单包多语句、`SHOW PROCEDURE/FUNCTION STATUS`、`SELECT 1` 探针、SHOW 的 `WHERE`) | **Approved** | 0.1i | 2026-10-27 |
 | SPEC-P5 | P5 | 分析引擎:列式 + 压缩 + 向量化 + 排序/聚合/JOIN/子查询 + compaction 与性能门限 + CSV 导入 + `JSON` 半结构化 | **Approved** | 0.1b | 2026-10-27 |
+| SPEC-P6 | P6 | 优化器:统计信息 + CBO 代价模型 + 连接顺序/算子选择 + 集合运算 + 相关子查询/`EXISTS` + `DISTINCT`/派生表 + P5 欠账回填(`information_schema`) | **Approved** | 0.1a | 2026-10-28 |
+| SPEC-P6.1 | P6.1(补丁) | **执行层全链路性能**:BE 写路径(单次区间冲突检测 / 惰性游标 / group commit)+ BE 读路径(列投影 / 谓词字节码下推 / 分片 / 列式块)+ FE 并行算子与流式结果 + proto 增量与期限三档;不改磁盘格式与语义,开关可回退 | **Approved** | 0.2a | 2026-10-28 |
 
 ## 状态说明
 

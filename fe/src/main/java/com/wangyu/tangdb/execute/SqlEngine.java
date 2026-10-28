@@ -47,6 +47,8 @@ public final class SqlEngine {
     private final int queryBatchRows;
     private final long sortSpillBytes;
     private final String sortTmpDir;
+    private final com.wangyu.tangdb.planner.OptimizerConfig optimizer;
+    private final com.wangyu.tangdb.stats.StatsService stats;
 
     public SqlEngine(KvStore kv, Catalog catalog, SessionManager sessions,
                      BackendRegistry backends, boolean heartbeatEnabled, String user) {
@@ -66,6 +68,8 @@ public final class SqlEngine {
         this.queryBatchRows = 1024;
         this.sortSpillBytes = 64L * 1024 * 1024;
         this.sortTmpDir = "tmp/fe-sort";
+        this.optimizer = com.wangyu.tangdb.planner.OptimizerConfig.defaults();
+        this.stats = new com.wangyu.tangdb.stats.StatsService(kv, catalog, optimizer);
     }
 
     /** SPEC-P5 §5.4:查询引擎参数(query_batch_rows / sort_spill_bytes / sort_tmp_dir)。 */
@@ -73,6 +77,16 @@ public final class SqlEngine {
                      BackendRegistry backends, boolean heartbeatEnabled, String user,
                      int indexBackfillBatch, int queryBatchRows, long sortSpillBytes,
                      String sortTmpDir) {
+        this(kv, catalog, sessions, backends, heartbeatEnabled, user, indexBackfillBatch,
+                queryBatchRows, sortSpillBytes, sortTmpDir,
+                com.wangyu.tangdb.planner.OptimizerConfig.defaults());
+    }
+
+    /** SPEC-P6 §5.3:在 P5 参数基础上再注入 11 项优化器配置。 */
+    public SqlEngine(KvStore kv, Catalog catalog, SessionManager sessions,
+                     BackendRegistry backends, boolean heartbeatEnabled, String user,
+                     int indexBackfillBatch, int queryBatchRows, long sortSpillBytes,
+                     String sortTmpDir, com.wangyu.tangdb.planner.OptimizerConfig optimizer) {
         this.kv = kv;
         this.catalog = catalog;
         this.sessions = sessions;
@@ -84,6 +98,16 @@ public final class SqlEngine {
         this.sortSpillBytes = sortSpillBytes > 0 ? sortSpillBytes : 64L * 1024 * 1024;
         this.sortTmpDir = sortTmpDir == null || sortTmpDir.isBlank()
                 ? "tmp/fe-sort" : sortTmpDir;
+        this.optimizer = optimizer == null
+                ? com.wangyu.tangdb.planner.OptimizerConfig.defaults() : optimizer;
+        // 统计服务跨会话共享:行数变化记账(FR-623)必须在同一份账本上,否则多会话下 stale
+        // 永远判不出来。它只持有内存缓存 + KvStore,与 Catalog 的生命周期一致。
+        this.stats = new com.wangyu.tangdb.stats.StatsService(kv, catalog, this.optimizer);
+    }
+
+    /** 供测试 / 诊断:当前共享的统计服务。 */
+    public com.wangyu.tangdb.stats.StatsService stats() {
+        return stats;
     }
 
     /**
@@ -139,6 +163,10 @@ public final class SqlEngine {
         try {
             return executor.execute(Parser.parse(statement));
         } catch (ParseException e) {
+            if (e.code() != 0) {
+                // P6:语法合法但本期明确不支持的形态(1248 / 1235)在解析期就给准确码(FR-670)
+                throw new SqlError(e.code(), "42000", e.getMessage());
+            }
             String parseMessage = e.getMessage() == null ? "" : e.getMessage();
             if (parseMessage.contains("归 P6") || parseMessage.contains("归 P12")
                     || parseMessage.contains("相关子查询")) {
@@ -257,10 +285,14 @@ public final class SqlEngine {
         if (session == null) {
             return new Executor(kv, catalog)
                     .withQueryOptions(queryBatchRows, sortSpillBytes, sortTmpDir)
+                    .withOptimizer(optimizer)
+                    .withStats(stats)
                     .attachServer(sessions, user, 0, indexBackfillBatch);
         }
         return session.executor()
                 .withQueryOptions(queryBatchRows, sortSpillBytes, sortTmpDir)
+                .withOptimizer(optimizer)
+                .withStats(stats)
                 .attachServer(sessions, user, session.id(), indexBackfillBatch);
     }
 
@@ -454,34 +486,34 @@ public final class SqlEngine {
 
     // ------------------------------------------------------------ information_schema
 
-    /** information_schema 虚拟表查询(FR-537 ~ FR-540 / K98)。 */
+    /**
+     * information_schema 虚拟表查询(FR-537 ~ FR-540 / K98;SPEC-P6 FR-667)。
+     *
+     * <p>P6 起**没有语句文本门禁**:能落成旧 {@link Ast.Select} 的简单形态继续走
+     * {@link MetaCommands}(P4 的输出列名/排序断言不变);JOIN / 子查询 / 聚合 / DISTINCT /
+     * 集合运算等形态返回 {@code null},交给统一计划器(虚拟表在 QueryEngine 里就是普通来源)。</p>
+     */
     private Result informationSchema(Session session, String statement, String upper) {
-        String compact = upper.replaceAll("\s+", " ");
-        if (compact.contains(" JOIN ") || compact.contains(" UNION ")
-                || compact.contains(" GROUP BY ") || compact.contains(" DISTINCT ")
-                || compact.contains(" HAVING ")) {
-            throw MetaCommands.notSupported(
-                    "information_schema 上不支持 JOIN / 子查询 / 多列聚合(归 P5)");
-        }
         Ast.Statement ast;
         try {
             ast = Parser.parse(statement);
         } catch (ParseException e) {
+            if (e.code() != 0) {
+                throw new SqlError(e.code(), "42000", e.getMessage());
+            }
             // LIMIT 取值 / 语法错统一报 1064(FR-549 / 边界 31),不能被误映射成 1235。
             if (e.getMessage() != null && e.getMessage().contains("LIMIT")) {
                 throw e;
             }
-            throw MetaCommands.notSupported(
-                    "information_schema 上不支持该查询形态(只支持单表投影 / WHERE / LIMIT"
-                            + " / 多列 ORDER BY / COUNT(*) )");
+            throw e;
         }
         if (ast instanceof Ast.Select select && select.database() != null
                 && select.database().equalsIgnoreCase("information_schema")) {
             return new MetaCommands(catalog, executor(session), sessions, user)
                     .informationSchema(select);
         }
-        throw MetaCommands.notSupported(
-                "information_schema 上只支持单表投影 / WHERE / LIMIT / 多列 ORDER BY / COUNT(*)");
+        // 统一计划器(虚拟表作为普通 FROM 来源,SC-381 / SC-383)
+        return null;
     }
 
     // ------------------------------------------------------------ 工具

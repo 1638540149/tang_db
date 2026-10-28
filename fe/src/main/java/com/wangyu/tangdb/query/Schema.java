@@ -111,7 +111,7 @@ public final class Schema {
      */
     public int resolve(String qualifier, String name) {
         if (name == null) {
-            throw new SqlError(SqlError.ER_BAD_FIELD_ERROR, "42S22", "列名不能为空");
+            throw new SqlError.BadField(qualifier, null, "列名不能为空");
         }
         int found = -1;
         for (int i = 0; i < names.size(); i++) {
@@ -129,8 +129,7 @@ public final class Schema {
         }
         if (found < 0) {
             String label = qualifier == null ? name : qualifier + "." + name;
-            throw new SqlError(SqlError.ER_BAD_FIELD_ERROR, "42S22",
-                    "列 " + label + " 不存在");
+            throw new SqlError.BadField(qualifier, name, "列 " + label + " 不存在");
         }
         return found;
     }

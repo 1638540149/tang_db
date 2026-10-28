@@ -47,6 +47,19 @@ public final class FeConfig {
     /** FE 自己的排序临时目录(放在 BE 数据目录下会穿透 FE/BE 边界,故放在 FE 侧)。 */
     public static final String DEFAULT_SORT_TMP_DIR = "tmp/fe-sort";
 
+    // ---- SPEC-P6 §5.3(11 项优化器配置) ----
+    public static final boolean DEFAULT_OPTIMIZER_ENABLED = true;
+    public static final int DEFAULT_ANALYZE_FULL_SCAN_MAX_ROWS = 200_000;
+    public static final int DEFAULT_ANALYZE_SAMPLE_STRIDE = 20;
+    public static final int DEFAULT_ANALYZE_HISTOGRAM_BUCKETS = 64;
+    public static final int DEFAULT_ANALYZE_EXACT_DISTINCT_MAX_ROWS = 100_000;
+    public static final int DEFAULT_ANALYZE_HLL_PRECISION = 14;
+    public static final int DEFAULT_CBO_JOIN_ENUM_MAX_TABLES = 4;
+    public static final int DEFAULT_CBO_HASH_AGGREGATE_DISTINCT_MAX = 10_000;
+    public static final int DEFAULT_CBO_TOPN_LIMIT_RATIO_PERCENT = 30;
+    public static final int DEFAULT_SUBQUERY_CACHE_MAX_ENTRIES = 4096;
+    public static final int DEFAULT_STATS_STALE_ROW_CHANGE_PERCENT = 20;
+
     private final String beHost;
     private final int bePort;
     private final int heartbeatListenPort;
@@ -64,12 +77,14 @@ public final class FeConfig {
     private final long sortSpillBytes;
     private final String sortTmpDir;
     private final int csvImportBatchRows;
+    private final com.wangyu.tangdb.planner.OptimizerConfig optimizer;
 
     private FeConfig(String beHost, int bePort, int heartbeatListenPort, int beOfflineCycles,
                      boolean heartbeatEnabled, String mode, int mysqlPort, int sessionMax,
                      int sessionIdleTimeout, int shutdownGraceSeconds, String user, String password,
                      int indexBackfillBatch, int queryBatchRows, long sortSpillBytes,
-                     String sortTmpDir, int csvImportBatchRows) {
+                     String sortTmpDir, int csvImportBatchRows,
+                     com.wangyu.tangdb.planner.OptimizerConfig optimizer) {
         this.beHost = beHost;
         this.bePort = bePort;
         this.heartbeatListenPort = heartbeatListenPort;
@@ -87,6 +102,8 @@ public final class FeConfig {
         this.sortSpillBytes = sortSpillBytes;
         this.sortTmpDir = sortTmpDir;
         this.csvImportBatchRows = csvImportBatchRows;
+        this.optimizer = optimizer == null
+                ? com.wangyu.tangdb.planner.OptimizerConfig.defaults() : optimizer;
     }
 
     /** 内置默认配置。 */
@@ -96,7 +113,8 @@ public final class FeConfig {
                 "fed", DEFAULT_MYSQL_PORT, DEFAULT_SESSION_MAX, DEFAULT_SESSION_IDLE_TIMEOUT,
                 DEFAULT_SHUTDOWN_GRACE_SECONDS, DEFAULT_USER, DEFAULT_PASSWORD,
                 DEFAULT_INDEX_BACKFILL_BATCH, DEFAULT_QUERY_BATCH_ROWS, DEFAULT_SORT_SPILL_BYTES,
-                DEFAULT_SORT_TMP_DIR, DEFAULT_CSV_IMPORT_BATCH_ROWS);
+                DEFAULT_SORT_TMP_DIR, DEFAULT_CSV_IMPORT_BATCH_ROWS,
+                com.wangyu.tangdb.planner.OptimizerConfig.defaults());
     }
 
     /** 直接用给定取值构造配置(供程序化使用与测试)。 */
@@ -118,7 +136,7 @@ public final class FeConfig {
                 Math.max(1, beOfflineCycles), heartbeatEnabled,
                 d.mode, d.mysqlPort, d.sessionMax, d.sessionIdleTimeout, d.shutdownGraceSeconds,
                 d.user, d.password, d.indexBackfillBatch, d.queryBatchRows, d.sortSpillBytes,
-                d.sortTmpDir, d.csvImportBatchRows);
+                d.sortTmpDir, d.csvImportBatchRows, d.optimizer);
     }
 
     public String beHost() {
@@ -204,6 +222,11 @@ public final class FeConfig {
         return csvImportBatchRows;
     }
 
+    /** 优化器配置(SPEC-P6 §5.3 的 11 项)。 */
+    public com.wangyu.tangdb.planner.OptimizerConfig optimizer() {
+        return optimizer;
+    }
+
     /**
      * 加载配置文件。
      *
@@ -250,6 +273,17 @@ public final class FeConfig {
         long sortSpillBytes = d.sortSpillBytes;
         String sortTmpDir = d.sortTmpDir;
         int csvImportBatchRows = d.csvImportBatchRows;
+        boolean optimizerEnabled = d.optimizer.enabled();
+        int analyzeFullScanMaxRows = d.optimizer.analyzeFullScanMaxRows();
+        int analyzeSampleStride = d.optimizer.analyzeSampleStride();
+        int analyzeHistogramBuckets = d.optimizer.analyzeHistogramBuckets();
+        int analyzeExactDistinctMaxRows = d.optimizer.analyzeExactDistinctMaxRows();
+        int analyzeHllPrecision = d.optimizer.analyzeHllPrecision();
+        int cboJoinEnumMaxTables = d.optimizer.joinEnumMaxTables();
+        int cboHashAggregateDistinctMax = d.optimizer.hashAggregateDistinctMax();
+        int cboTopnLimitRatioPercent = d.optimizer.topnLimitRatioPercent();
+        int subqueryCacheMaxEntries = d.optimizer.subqueryCacheMaxEntries();
+        int statsStaleRowChangePercent = d.optimizer.statsStaleRowChangePercent();
 
         for (int i = 0; i < lines.size(); i++) {
             String line = lines.get(i);
@@ -297,6 +331,28 @@ public final class FeConfig {
                 case "sort_tmp_dir" -> sortTmpDir = requireNonBlank(value, path, i + 1);
                 case "csv_import_batch_rows" ->
                         csvImportBatchRows = parseInt(key, value, path, i + 1, 1, 10_000_000);
+                // ---- SPEC-P6 §5.3 ----
+                case "optimizer_enabled" -> optimizerEnabled = parseBoolean(key, value, path, i + 1);
+                case "analyze_full_scan_max_rows" ->
+                        analyzeFullScanMaxRows = parseInt(key, value, path, i + 1, 1, Integer.MAX_VALUE);
+                case "analyze_sample_stride" ->
+                        analyzeSampleStride = parseInt(key, value, path, i + 1, 1, 1_000_000);
+                case "analyze_histogram_buckets" ->
+                        analyzeHistogramBuckets = parseInt(key, value, path, i + 1, 1, 10_000);
+                case "analyze_exact_distinct_max_rows" ->
+                        analyzeExactDistinctMaxRows = parseInt(key, value, path, i + 1, 1, Integer.MAX_VALUE);
+                case "analyze_hll_precision" ->
+                        analyzeHllPrecision = parseInt(key, value, path, i + 1, 4, 18);
+                case "cbo_join_enum_max_tables" ->
+                        cboJoinEnumMaxTables = parseInt(key, value, path, i + 1, 1, 64);
+                case "cbo_hash_aggregate_distinct_max" ->
+                        cboHashAggregateDistinctMax = parseInt(key, value, path, i + 1, 1, Integer.MAX_VALUE);
+                case "cbo_topn_limit_ratio_percent" ->
+                        cboTopnLimitRatioPercent = parseInt(key, value, path, i + 1, 1, 100);
+                case "subquery_cache_max_entries" ->
+                        subqueryCacheMaxEntries = parseInt(key, value, path, i + 1, 1, 10_000_000);
+                case "stats_stale_row_change_percent" ->
+                        statsStaleRowChangePercent = parseInt(key, value, path, i + 1, 1, 1000);
                 default -> throw new IllegalArgumentException(
                         path + " 第 " + (i + 1) + " 行未知配置项: " + key);
             }
@@ -304,7 +360,11 @@ public final class FeConfig {
 
         return new FeConfig(host, port, heartbeatPort, offlineCycles, heartbeatEnabled,
                 mode, mysqlPort, sessionMax, sessionIdleTimeout, shutdownGraceSeconds, user, password,
-                indexBackfillBatch, queryBatchRows, sortSpillBytes, sortTmpDir, csvImportBatchRows);
+                indexBackfillBatch, queryBatchRows, sortSpillBytes, sortTmpDir, csvImportBatchRows,
+                new com.wangyu.tangdb.planner.OptimizerConfig(optimizerEnabled, cboJoinEnumMaxTables,
+                        cboHashAggregateDistinctMax, cboTopnLimitRatioPercent, subqueryCacheMaxEntries,
+                        statsStaleRowChangePercent, analyzeFullScanMaxRows, analyzeSampleStride,
+                        analyzeHistogramBuckets, analyzeExactDistinctMaxRows, analyzeHllPrecision));
     }
 
     private static String parseMode(String raw, String path, int lineNo) {

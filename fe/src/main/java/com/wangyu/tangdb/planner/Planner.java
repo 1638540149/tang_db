@@ -2,6 +2,7 @@ package com.wangyu.tangdb.planner;
 
 import com.wangyu.tangdb.catalog.CatalogException;
 import com.wangyu.tangdb.parser.Ast;
+import com.wangyu.tangdb.stats.StatsService;
 import com.wangyu.tangdb.storage.Column;
 import com.wangyu.tangdb.storage.DataType;
 import com.wangyu.tangdb.storage.IndexCodec;
@@ -18,16 +19,41 @@ import java.util.List;
 import java.util.Set;
 
 /**
- * 计划器:选择访问路径(主键点查 / 主键范围 / 全表扫描)并绑定投影。
+ * 计划器:选择访问路径(主键点查 / 主键范围 / 索引点查 / 索引范围 / 全表扫描)并绑定投影。
  *
- * <p>规则来自规约 FR-142 ~ FR-144:
- * 主键等值必须走 Get;主键范围必须用 Scan 限定范围;其余条件全表 Scan + FE 过滤。
- * OR 不拆解(除非整棵条件树都是 AND 合取项),避免把范围条件错误地"并集化"。</p>
+ * <p>P4 的固定优先级(RBO)仍然保留,但 P6 起默认换成**代价比较**(SPEC-P6 FR-630 / FR-635):</p>
+ * <pre>
+ * 候选按固定优先级排序:① 主键等值 ② 主键 IN ③ 主键范围 ④ 索引等值 ⑤ 索引范围 ⑥ 全表扫描
+ * optimizer_enabled=true   → 选择估算代价最低者;代价相等按固定优先级(边界 87)
+ * optimizer_enabled=false  → 直接取第一个候选(= P5 的"有索引就用",结果与 P5 一致)
+ * </pre>
+ *
+ * <p>{@code OR} 不合并:候选项只来自顶层 AND 合取项里的简单比较,纯 OR 退化为全表扫,
+ * 结果由残余谓词保证正确(FR-506)。</p>
  */
 public final class Planner {
 
     /** 投影:列序号 + 输出列名(别名已生效)。 */
     public record Projection(int[] indexes, List<String> names) {
+    }
+
+    /** 一条候选访问路径(EXPLAIN 需要把每条候选的估算都显示出来,FR-630 / FR-631)。 */
+    public record Candidate(String label, Plan plan, long rows, double cost) {
+    }
+
+    /** 访问路径选择结果:选中的计划 + 全部候选 + 估算依据。 */
+    public record Choice(Plan plan, List<Candidate> candidates, Estimator.Evidence evidence,
+                         String analyzedAt) {
+
+        /** 选中的那条候选(按计划对象身份定位)。 */
+        public Candidate chosen() {
+            for (Candidate candidate : candidates) {
+                if (candidate.plan() == plan) {
+                    return candidate;
+                }
+            }
+            return candidates.get(0);
+        }
     }
 
     private Planner() {
@@ -56,53 +82,173 @@ public final class Planner {
         return new Projection(indexes, List.copyOf(names));
     }
 
-    /** 为一个表与 WHERE 条件选择访问路径(没有索引参与,兼容旧调用)。 */
+    /** 为一个表与 WHERE 条件选择访问路径(没有索引参与,兼容旧调用;P5 固定规则)。 */
     public static Plan access(TableMeta table, Ast.Condition where) {
         return access(table, where, List.of());
     }
 
     /**
-     * 为一个表与 WHERE 条件选择访问路径(SPEC-P4 FR-504 / K82 的固定 RBO):
-     *
-     * <pre>
-     * ① 主键等值 > ② 主键范围(含 IN)> ③ 索引等值 > ④ 索引范围 > ⑤ 全表扫
-     * 同类多个索引取索引 ID 最小者(FR-505);OR 不合并(FR-506)。
-     * </pre>
-     *
-     * @param indexes 可参与选择的索引(调用方只传 ACTIVE 的,按索引 ID 升序)
+     * P5 的固定 RBO 入口(测试与旧调用方使用)。
+     * 行为与 P4 完全一致:主键等值 > 主键范围(含 IN)> 索引等值 > 索引范围 > 全表扫。
      */
     public static Plan access(TableMeta table, Ast.Condition where, List<IndexMeta> indexes) {
+        return choose(table, where, indexes, null, false).plan();
+    }
+
+    /** SPEC-P6:代价比较入口(FR-630 / FR-635)。 */
+    public static Choice choose(TableMeta table, Ast.Condition where, List<IndexMeta> indexes,
+                                StatsService stats, boolean cboEnabled) {
         Predicate predicate = Predicate.bind(where, table);
-        Column pk = table.primaryKey();
-        if (pk == null) {
+        if (table.primaryKey() == null) {
             throw new CatalogException("表 " + table.name() + " 没有主键");
         }
-
         List<Ast.Condition> conjuncts = new ArrayList<>();
         flattenAnd(where, conjuncts);
 
-        Object eqValue = null;
-        boolean hasEq = false;
-        boolean eqIsNull = false;
-        List<Object> inValues = new ArrayList<>();
+        Estimator estimator = new Estimator(stats, null);
+        List<Candidate> candidates = candidates(table, conjuncts, predicate, indexes, estimator);
 
-        Object lower = null;
+        Candidate chosen = candidates.get(0);
+        if (cboEnabled) {
+            for (Candidate candidate : candidates) {
+                if (candidate.cost() < chosen.cost()) {
+                    chosen = candidate;
+                }
+            }
+        }
+        return new Choice(chosen.plan(), List.copyOf(candidates),
+                estimator.evidence(table), estimator.analyzedAt(table));
+    }
+
+    // ------------------------------------------------------------ 候选生成
+
+    /** 主键条件归一后的结果。 */
+    private static final class PkConditions {
+        boolean hasEq;
+        Object eqValue;
+        boolean eqIsNull;
+        final List<Object> inValues = new ArrayList<>();
+        boolean hasLower;
+        Object lower;
         boolean lowerInclusive = true;
-        boolean hasLower = false;
-        Object upper = null;
+        boolean hasUpper;
+        Object upper;
         boolean upperInclusive = true;
-        boolean hasUpper = false;
+    }
 
+    private static List<Candidate> candidates(TableMeta table, List<Ast.Condition> conjuncts,
+                                              Predicate predicate, List<IndexMeta> indexes,
+                                              Estimator estimator) {
+        List<Candidate> out = new ArrayList<>();
+        Column pk = table.primaryKey();
+        PkConditions pkConditions = analyzePrimaryKey(table, pk, conjuncts);
+        long rowCount = estimator.rowCount(table);
+        long filteredRows = estimator.estimateRows(table, predicateSource(conjuncts));
+
+        if (pkConditions.eqIsNull) {
+            // pk = NULL 不可能命中,但仍要给出正确结果:全表扫描 + 谓词过滤(结果为 0 行)。
+            out.add(new Candidate("TABLE SCAN",
+                    Plan.range(table, KeyCodec.tableRangeStart(table.id()),
+                            KeyCodec.tableRangeEnd(table.id()), predicate, true),
+                    0, CostModel.fullScan(rowCount)));
+            return out;
+        }
+        if (pkConditions.hasEq) {
+            out.add(new Candidate("PRIMARY POINT",
+                    Plan.point(table, KeyCodec.rowKey(table.id(), pk.type(), pkConditions.eqValue),
+                            predicate),
+                    1, CostModel.primaryPoint(1)));
+        }
+        if (!pkConditions.inValues.isEmpty()) {
+            Set<byte[]> keys = new LinkedHashSet<>();
+            for (Object value : pkConditions.inValues) {
+                keys.add(KeyCodec.rowKey(table.id(), pk.type(), value));
+            }
+            out.add(new Candidate("PRIMARY POINT(IN " + keys.size() + ")",
+                    Plan.points(table, new ArrayList<>(keys), predicate),
+                    keys.size(), CostModel.primaryPoint(keys.size())));
+        }
+        if (pkConditions.hasLower || pkConditions.hasUpper) {
+            byte[] start = pkConditions.hasLower
+                    ? KeyCodec.lowerBound(table.id(), pk.type(), pkConditions.lower,
+                    pkConditions.lowerInclusive)
+                    : KeyCodec.tableRangeStart(table.id());
+            byte[] end = pkConditions.hasUpper
+                    ? KeyCodec.upperBound(table.id(), pk.type(), pkConditions.upper,
+                    pkConditions.upperInclusive)
+                    : KeyCodec.tableRangeEnd(table.id());
+            long rows = estimator.estimateRangeRows(table, pk, pkConditions.lower,
+                    pkConditions.hasLower, pkConditions.upper, pkConditions.hasUpper);
+            out.add(new Candidate("PRIMARY RANGE",
+                    Plan.range(table, start, end, predicate, false),
+                    rows, CostModel.primaryRange(rows)));
+        }
+
+        // 索引候选(同类取索引 ID 最小者,FR-505)
+        IndexConditions indexConditions = analyzeIndexes(table, conjuncts, indexes);
+        if (indexConditions.eqIndex != null) {
+            Column column = table.column(indexConditions.eqIndex.columnName());
+            long rows = estimator.estimateEqualRows(table,
+                    new Estimator.StatColumn(column.name(), column.type()));
+            out.add(new Candidate("INDEX POINT(" + indexConditions.eqIndex.name() + ")",
+                    Plan.indexPoint(table, indexConditions.eqIndex,
+                            IndexCodec.equalityStart(table, indexConditions.eqIndex,
+                                    indexConditions.eqValue),
+                            IndexCodec.equalityEnd(table, indexConditions.eqIndex,
+                                    indexConditions.eqValue), predicate),
+                    rows, CostModel.indexPath(rows, rows)));
+        }
+        if (indexConditions.rangeIndex != null) {
+            Column column = table.column(indexConditions.rangeIndex.columnName());
+            byte[] start = indexConditions.hasRangeLower
+                    ? IndexCodec.lowerBound(table, indexConditions.rangeIndex,
+                    indexConditions.rangeLower, indexConditions.rangeLowerInclusive)
+                    : IndexCodec.indexStart(table.id(), indexConditions.rangeIndex.indexId());
+            byte[] end = indexConditions.hasRangeUpper
+                    ? IndexCodec.upperBound(table, indexConditions.rangeIndex,
+                    indexConditions.rangeUpper, indexConditions.rangeUpperInclusive)
+                    : IndexCodec.indexEnd(table.id(), indexConditions.rangeIndex.indexId());
+            long rows = estimator.estimateRangeRows(table, column, indexConditions.rangeLower,
+                    indexConditions.hasRangeLower, indexConditions.rangeUpper,
+                    indexConditions.hasRangeUpper);
+            out.add(new Candidate("INDEX RANGE(" + indexConditions.rangeIndex.name() + ")",
+                    Plan.indexRange(table, indexConditions.rangeIndex, start, end, predicate),
+                    rows, CostModel.indexPath(rows, rows)));
+        }
+
+        // 全表扫描永远是最后一个候选(边界 87:代价相等时优先级兜底)
+        out.add(new Candidate("TABLE SCAN",
+                Plan.range(table, KeyCodec.tableRangeStart(table.id()),
+                        KeyCodec.tableRangeEnd(table.id()), predicate, true),
+                filteredRows, CostModel.fullScan(rowCount)));
+        return out;
+    }
+
+    /** 把合取项重新拼成一棵条件树,给"全表扫描输出行数"估算用。 */
+    private static Ast.Condition predicateSource(List<Ast.Condition> conjuncts) {
+        if (conjuncts.isEmpty()) {
+            return null;
+        }
+        Ast.Condition result = conjuncts.get(0);
+        for (int i = 1; i < conjuncts.size(); i++) {
+            result = new Ast.And(result, conjuncts.get(i));
+        }
+        return result;
+    }
+
+    private static PkConditions analyzePrimaryKey(TableMeta table, Column pk,
+                                                  List<Ast.Condition> conjuncts) {
+        PkConditions out = new PkConditions();
         for (Ast.Condition conjunct : conjuncts) {
             if (conjunct instanceof Ast.Compare cmp && isColumn(cmp.column(), pk)) {
                 Object value = cmp.value();
                 switch (cmp.op()) {
                     case EQ -> {
                         if (value == null) {
-                            eqIsNull = true;
-                        } else if (!hasEq) {
-                            eqValue = Values.coerce(value, pk);
-                            hasEq = true;
+                            out.eqIsNull = true;
+                        } else if (!out.hasEq) {
+                            out.eqValue = Values.coerce(value, pk);
+                            out.hasEq = true;
                         }
                     }
                     case GT, GE, LT, LE -> {
@@ -113,31 +259,31 @@ public final class Planner {
                         Object v = Values.coerce(value, pk);
                         boolean inclusive = cmp.op() == Ast.Op.GE || cmp.op() == Ast.Op.LE;
                         if (cmp.op() == Ast.Op.GT || cmp.op() == Ast.Op.GE) {
-                            if (!hasLower) {
-                                lower = v;
-                                lowerInclusive = inclusive;
-                                hasLower = true;
+                            if (!out.hasLower) {
+                                out.lower = v;
+                                out.lowerInclusive = inclusive;
+                                out.hasLower = true;
                             } else {
-                                int c = compareTyped(pk.type(), v, lower);
+                                int c = compareTyped(pk.type(), v, out.lower);
                                 if (c > 0) {
-                                    lower = v;
-                                    lowerInclusive = inclusive;
+                                    out.lower = v;
+                                    out.lowerInclusive = inclusive;
                                 } else if (c == 0) {
-                                    lowerInclusive = lowerInclusive && inclusive;
+                                    out.lowerInclusive = out.lowerInclusive && inclusive;
                                 }
                             }
                         } else {
-                            if (!hasUpper) {
-                                upper = v;
-                                upperInclusive = inclusive;
-                                hasUpper = true;
+                            if (!out.hasUpper) {
+                                out.upper = v;
+                                out.upperInclusive = inclusive;
+                                out.hasUpper = true;
                             } else {
-                                int c = compareTyped(pk.type(), v, upper);
+                                int c = compareTyped(pk.type(), v, out.upper);
                                 if (c < 0) {
-                                    upper = v;
-                                    upperInclusive = inclusive;
+                                    out.upper = v;
+                                    out.upperInclusive = inclusive;
                                 } else if (c == 0) {
-                                    upperInclusive = upperInclusive && inclusive;
+                                    out.upperInclusive = out.upperInclusive && inclusive;
                                 }
                             }
                         }
@@ -150,65 +296,32 @@ public final class Planner {
                     if (literal == null) {
                         continue; // NULL 永远不会命中,忽略即可
                     }
-                    inValues.add(Values.coerce(literal, pk));
+                    out.inValues.add(Values.coerce(literal, pk));
                 }
             }
         }
-
-        if (eqIsNull) {
-            // pk = NULL 不可能命中,但仍要给出正确结果:全表扫描 + 谓词过滤(结果为 0 行)。
-            return Plan.range(table, KeyCodec.tableRangeStart(table.id()),
-                    KeyCodec.tableRangeEnd(table.id()), predicate, true);
-        }
-        if (hasEq) {
-            return Plan.point(table, KeyCodec.rowKey(table.id(), pk.type(), eqValue), predicate);
-        }
-        if (!inValues.isEmpty()) {
-            Set<byte[]> keys = new LinkedHashSet<>();
-            for (Object v : inValues) {
-                keys.add(KeyCodec.rowKey(table.id(), pk.type(), v));
-            }
-            return Plan.points(table, new ArrayList<>(keys), predicate);
-        }
-        if (hasLower || hasUpper) {
-            byte[] start = hasLower
-                    ? KeyCodec.lowerBound(table.id(), pk.type(), lower, lowerInclusive)
-                    : KeyCodec.tableRangeStart(table.id());
-            byte[] end = hasUpper
-                    ? KeyCodec.upperBound(table.id(), pk.type(), upper, upperInclusive)
-                    : KeyCodec.tableRangeEnd(table.id());
-            return Plan.range(table, start, end, predicate, false);
-        }
-
-        Plan indexPlan = chooseIndexPath(table, conjuncts, predicate, indexes);
-        if (indexPlan != null) {
-            return indexPlan;
-        }
-        return Plan.range(table, KeyCodec.tableRangeStart(table.id()),
-                KeyCodec.tableRangeEnd(table.id()), predicate, true);
+        return out;
     }
 
-    /**
-     * RBO 的 ③ / ④ 两步:先找等值命中,再找范围命中;同类取索引 ID 最小者(FR-505)。
-     *
-     * <p>OR 不合并:候选项只来自顶层 AND 合取项里的简单比较;纯 OR 会退化为全表扫,
-     * 结果由残余谓词保证正确(FR-506)。</p>
-     */
-    private static Plan chooseIndexPath(TableMeta table, List<Ast.Condition> conjuncts,
-                                        Predicate predicate, List<IndexMeta> indexes) {
-        if (indexes == null || indexes.isEmpty()) {
-            return null;
-        }
-        IndexMeta eqIndex = null;
-        Object eqValue = null;
-        IndexMeta rangeIndex = null;
-        Object rangeLower = null;
+    private static final class IndexConditions {
+        IndexMeta eqIndex;
+        Object eqValue;
+        IndexMeta rangeIndex;
+        Object rangeLower;
         boolean rangeLowerInclusive = true;
-        boolean hasRangeLower = false;
-        Object rangeUpper = null;
+        boolean hasRangeLower;
+        Object rangeUpper;
         boolean rangeUpperInclusive = true;
-        boolean hasRangeUpper = false;
+        boolean hasRangeUpper;
+    }
 
+    /** RBO 的 ③ / ④ 两步:先找等值命中,再找范围命中;同类取索引 ID 最小者(FR-505)。 */
+    private static IndexConditions analyzeIndexes(TableMeta table, List<Ast.Condition> conjuncts,
+                                                  List<IndexMeta> indexes) {
+        IndexConditions out = new IndexConditions();
+        if (indexes == null || indexes.isEmpty()) {
+            return out;
+        }
         for (IndexMeta index : indexes) {
             if (!index.queryable()) {
                 continue;
@@ -283,37 +396,24 @@ public final class Planner {
                     }
                 }
             }
-            if (hasEq && eqIndex == null) {
-                eqIndex = index;
-                eqValue = eq;
+            if (hasEq && out.eqIndex == null) {
+                out.eqIndex = index;
+                out.eqValue = eq;
             }
-            if (!hasEq && (hasLo || hasHi) && rangeIndex == null) {
-                rangeIndex = index;
-                rangeLower = lo;
-                rangeLowerInclusive = loInc;
-                hasRangeLower = hasLo;
-                rangeUpper = hi;
-                rangeUpperInclusive = hiInc;
-                hasRangeUpper = hasHi;
+            if (!hasEq && (hasLo || hasHi) && out.rangeIndex == null) {
+                out.rangeIndex = index;
+                out.rangeLower = lo;
+                out.rangeLowerInclusive = loInc;
+                out.hasRangeLower = hasLo;
+                out.rangeUpper = hi;
+                out.rangeUpperInclusive = hiInc;
+                out.hasRangeUpper = hasHi;
             }
         }
-
-        if (eqIndex != null) {
-            return Plan.indexPoint(table, eqIndex,
-                    IndexCodec.equalityStart(table, eqIndex, eqValue),
-                    IndexCodec.equalityEnd(table, eqIndex, eqValue), predicate);
-        }
-        if (rangeIndex != null) {
-            byte[] start = hasRangeLower
-                    ? IndexCodec.lowerBound(table, rangeIndex, rangeLower, rangeLowerInclusive)
-                    : IndexCodec.indexStart(table.id(), rangeIndex.indexId());
-            byte[] end = hasRangeUpper
-                    ? IndexCodec.upperBound(table, rangeIndex, rangeUpper, rangeUpperInclusive)
-                    : IndexCodec.indexEnd(table.id(), rangeIndex.indexId());
-            return Plan.indexRange(table, rangeIndex, start, end, predicate);
-        }
-        return null;
+        return out;
     }
+
+    // ------------------------------------------------------------ 工具
 
     private static void flattenAnd(Ast.Condition condition, List<Ast.Condition> out) {
         if (condition == null) {

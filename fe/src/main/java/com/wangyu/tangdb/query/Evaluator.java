@@ -22,6 +22,20 @@ public final class Evaluator {
     /** 分组查询里"聚合节点 → 结果列序号"(按行取值,避免跨组串值)。 */
     private Map<Ast.Expr, Integer> aggregateColumns = Map.of();
     private final Warnings warnings;
+    /** 子查询取值回调(SPEC-P6 FR-656:相关子查询需要"当前外层行"才能求值)。 */
+    private SubqueryResolver subqueryResolver;
+
+    /** 子查询求值:不相关的用预求值结果,相关的按当前行驱动。 */
+    public interface SubqueryResolver {
+        Object resolve(Ast.Expr subquery, Object[] row, Schema schema);
+    }
+
+    public Evaluator withSubqueryResolver(SubqueryResolver resolver) {
+        if (resolver != null) {
+            this.subqueryResolver = resolver;
+        }
+        return this;
+    }
 
     public Evaluator() {
         this(new IdentityHashMap<>(), new IdentityHashMap<>(), Warnings.NONE);
@@ -32,6 +46,7 @@ public final class Evaluator {
         this.aggregateValues = aggregateValues;
         this.subqueryValues = subqueryValues;
         this.warnings = warnings;
+        this.subqueryResolver = (sub, row, schema) -> subqueryValues.get(sub);
     }
 
     /** 设置"聚合节点 → 结果列序号";聚合结果从当前行里取。 */
@@ -161,7 +176,7 @@ public final class Evaluator {
             if (value == null) {
                 return null;
             }
-            Object cached = subqueryValues.get(expr);
+            Object cached = subqueryResolver.resolve(expr, row, schema);
             if (!(cached instanceof InSet set)) {
                 throw new SqlError(SqlError.ER_UNKNOWN_ERROR, "HY000", "IN 子查询结果缺失");
             }
@@ -174,7 +189,14 @@ public final class Evaluator {
             return in.negated();
         }
         if (expr instanceof Ast.ScalarSubquery) {
-            return subqueryValues.get(expr);
+            return subqueryResolver.resolve(expr, row, schema);
+        }
+        if (expr instanceof Ast.Exists exists) {
+            Object value = subqueryResolver.resolve(exists, row, schema);
+            return Boolean.TRUE.equals(value);
+        }
+        if (expr instanceof Ast.Quantified quantified) {
+            return quantified(quantified, row, schema);
         }
         if (expr instanceof Ast.Func func) {
             if (Functions.isAggregate(func.name())) {
@@ -219,6 +241,49 @@ public final class Evaluator {
                 "不支持的表达式: " + ExprPrinter.print(expr));
     }
 
+    /**
+     * 比较量词的三值语义(SPEC-P6 FR-658):
+     *
+     * <pre>
+     * x op ANY(S): S 空 → FALSE;任一 TRUE → TRUE;有 NULL 无匹配 → NULL;否则 FALSE
+     * x op ALL(S): S 空 → TRUE;任一 FALSE → FALSE;有 NULL 无 FALSE → NULL;否则 TRUE
+     * </pre>
+     */
+    private Object quantified(Ast.Quantified quantified, Object[] row, Schema schema) {
+        Object left = eval(quantified.operand(), row, schema);
+        Object resolved = subqueryResolver.resolve(quantified, row, schema);
+        if (!(resolved instanceof List<?> values)) {
+            throw new SqlError(SqlError.ER_UNKNOWN_ERROR, "HY000", "量词子查询结果缺失");
+        }
+        boolean any = quantified.quantifier() == Ast.Quantifier.ANY;
+        if (values.isEmpty()) {
+            return !any; // ANY 空集 FALSE;ALL 空集 TRUE
+        }
+        boolean sawNull = false;
+        for (Object value : values) {
+            if (left == null || value == null) {
+                sawNull = true;
+                continue;
+            }
+            int c = ValueOps.compare(left, value);
+            boolean matched = switch (quantified.op()) {
+                case EQ -> c == 0;
+                case NE -> c != 0;
+                case LT -> c < 0;
+                case LE -> c <= 0;
+                case GT -> c > 0;
+                case GE -> c >= 0;
+            };
+            if (any && matched) {
+                return true;
+            }
+            if (!any && !matched) {
+                return false;
+            }
+        }
+        return sawNull ? null : !any;
+    }
+
     /** 解析表达式的列引用,提前校验(不存在 / 歧义在绑定阶段报错)。 */
     public static void validate(Ast.Expr expr, Schema schema) {
         if (expr == null) {
@@ -232,7 +297,8 @@ public final class Evaluator {
         if (expr instanceof Ast.Func func && Functions.isAggregate(func.name())) {
             return;
         }
-        if (expr instanceof Ast.InSubquery || expr instanceof Ast.ScalarSubquery) {
+        if (expr instanceof Ast.InSubquery || expr instanceof Ast.ScalarSubquery
+                || expr instanceof Ast.Exists || expr instanceof Ast.Quantified) {
             return;
         }
         for (Ast.Expr child : children(expr)) {
@@ -277,6 +343,12 @@ public final class Evaluator {
         if (expr instanceof Ast.InSubquery e) {
             return List.of(e.operand());
         }
+        if (expr instanceof Ast.Exists) {
+            return List.of();
+        }
+        if (expr instanceof Ast.Quantified e) {
+            return List.of(e.operand());
+        }
         if (expr instanceof Ast.Func e) {
             return e.args();
         }
@@ -319,7 +391,8 @@ public final class Evaluator {
         if (expr == null) {
             return;
         }
-        if (expr instanceof Ast.InSubquery || expr instanceof Ast.ScalarSubquery) {
+        if (expr instanceof Ast.InSubquery || expr instanceof Ast.ScalarSubquery
+                || expr instanceof Ast.Exists || expr instanceof Ast.Quantified) {
             out.add(expr);
             return;
         }

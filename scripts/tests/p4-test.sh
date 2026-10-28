@@ -18,7 +18,7 @@
 #   SC-332 既有回归(p2 + p3 + p35)
 #   SC-333 性能口径(全表扫 vs 索引;INSERT 0/1/3 索引)
 #   SC-334 本脚本 + 报告
-#   SC-335 ~ SC-338 SHOW 家族 / 虚拟表 / 17 张表 / SHOW CREATE TABLE round-trip
+#   SC-335 ~ SC-338 SHOW 家族 / 虚拟表 / 18 张表(P6 增 PARAMETERS)/ SHOW CREATE TABLE round-trip
 #   SC-339 / SC-340 图形客户端(仅人工项,脚本只做环境探测,不伪造回显)
 #   SC-341 未支持语句降级(1235 / 1146 且连接不断)
 #   SC-342 分页三种写法一致(LIMIT n / off,n / n OFFSET off;越界空集;DML LIMIT 1235)
@@ -823,18 +823,18 @@ expect "$(run_sql_text "SHOW TABLE STATUS LIKE 'demo'; exit")" "InnoDB" "SHOW TA
 expect "$(run_sql_text "SHOW FULL TABLES WHERE Table_type != 'VIEW'; exit")" "BASE TABLE" "SHOW FULL TABLES WHERE 生效(F 组起因语句)"
 expect_absent "$(run_sql_text "SHOW GRANTS; exit")" "${DB_PASS}" "SHOW 输出不泄露口令"
 
-# 虚拟表 17 张
+# 虚拟表 18 张(SPEC-P6 FR-669 增加 PARAMETERS)
 VT_BAD=0
 for vt in SCHEMATA TABLES COLUMNS STATISTICS KEY_COLUMN_USAGE TABLE_CONSTRAINTS \
           REFERENTIAL_CONSTRAINTS VIEWS ROUTINES TRIGGERS EVENTS PROCESSLIST \
-          CHARACTER_SETS COLLATIONS ENGINES PARTITIONS USER_PRIVILEGES; do
+          CHARACTER_SETS COLLATIONS ENGINES PARTITIONS USER_PRIVILEGES PARAMETERS; do
     OUT="$(run_sql_text "SELECT * FROM information_schema.${vt}; exit")"
     if printf '%s' "${OUT}" | grep -q "错误"; then
         VT_BAD=$((VT_BAD + 1)); log "    [BROKEN] information_schema.${vt}"
         printf '%s\n' "${OUT}" | tail -5 | tee -a "${REPORT}"
     fi
 done
-if [ "${VT_BAD}" = "0" ]; then ok "information_schema 17 张虚拟表全部可查(无数据的返回列正确的空集)"; else bad "有 ${VT_BAD} 张虚拟表查询失败"; fi
+if [ "${VT_BAD}" = "0" ]; then ok "information_schema 18 张虚拟表全部可查(无数据的返回列正确的空集)"; else bad "有 ${VT_BAD} 张虚拟表查询失败"; fi
 expect "$(run_sql_text "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = 'default' AND TABLE_NAME = 'demo'; exit")" "| demo" "虚拟表投影裁剪 + WHERE 生效"
 expect "$(run_sql_text "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_NAME = 'demo'; exit")" "| 3" "虚拟表 COUNT(*) 生效(K98)"
 expect "$(run_sql_text "SELECT INDEX_NAME FROM information_schema.STATISTICS WHERE TABLE_NAME = 'demo' ORDER BY INDEX_NAME DESC LIMIT 1; exit")" "| uk_demo_code" "虚拟表单列 ORDER BY + LIMIT 生效"
@@ -857,8 +857,9 @@ ALIVE="$(run_sql_text "SHOW SLAVE STATUS; SHOW DATABASES; exit")"
 expect "${ALIVE}" "default" "未知 SHOW 之后连接仍可用"
 OUT="$(mysql_code "SELECT * FROM information_schema.no_such_table")"
 expect "${OUT}" "CODE=1146" "未知虚拟表 → 1146"
+# SPEC-P6 FR-667:门禁移除后虚拟表 JOIN 真支持(不再是 1235)
 OUT="$(mysql_code "SELECT * FROM information_schema.TABLES JOIN information_schema.COLUMNS")"
-expect "${OUT}" "CODE=1235" "虚拟表 JOIN → 1235(不给半对结果)"
+expect "${OUT}" "CODE=0" "虚拟表 JOIN 已支持(P6 兑现)"
 # SPEC-P5 起用户表 COUNT(*) / ORDER BY 真支持,这里改为断言行为正确(不再 1235)。
 OUT="$(mysql_code "SELECT COUNT(*) FROM demo")"
 expect "${OUT}" "CODE=0" "用户表 COUNT(*) 已支持(P5 兑现)"
