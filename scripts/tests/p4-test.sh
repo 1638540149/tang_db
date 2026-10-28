@@ -858,7 +858,7 @@ expect "${ALIVE}" "default" "未知 SHOW 之后连接仍可用"
 OUT="$(mysql_code "SELECT * FROM information_schema.no_such_table")"
 expect "${OUT}" "CODE=1146" "未知虚拟表 → 1146"
 # SPEC-P6 FR-667:门禁移除后虚拟表 JOIN 真支持(不再是 1235)
-OUT="$(mysql_code "SELECT * FROM information_schema.TABLES JOIN information_schema.COLUMNS")"
+OUT="$(mysql_code "SELECT COUNT(*) FROM information_schema.TABLES t JOIN information_schema.COLUMNS c ON t.TABLE_NAME = c.TABLE_NAME")"
 expect "${OUT}" "CODE=0" "虚拟表 JOIN 已支持(P6 兑现)"
 # SPEC-P5 起用户表 COUNT(*) / ORDER BY 真支持,这里改为断言行为正确(不再 1235)。
 OUT="$(mysql_code "SELECT COUNT(*) FROM demo")"
