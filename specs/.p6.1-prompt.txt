@@ -1,0 +1,111 @@
+实现 tang_db P6.1 · 补丁:执行层全链路性能(FE + BE 一起压榨,不改语义)。工作目录:D:/projects/tang_db
+
+## 读什么(按这个顺序,别跳)
+
+1. `specs/P6.1-write-path-perf.md` —— **唯一施工依据**(v0.2a Approved)。全部读完再动手,尤其 §1(五处根因,带文件行号)、§2.1 四组 A/B/C/D、§2.2 不做清单、§2.3 兼容性边界、§3 八条 BDD(两条 ★)、§4 FR-693~730、§5 proto 增量与 9 项配置、§6 K144~156、§7 SC-400~418、§8 边界 105~124、§10 结论列(四项已定稿)。
+2. `specs/P6-optimizer.md`(上一期,已实现):`optimizer_enabled` 开关、`planner/CostModel`、`planner/Estimator`、`query/ExprOptimizer` 是你这一期要接的基座。
+3. `AGENTS.md` + `.specify/memory/constitution.md`:依赖红线、先日志后数据、FE/BE 边界、segment 不可变。
+4. 既有实现(先读再改):
+   - BE:`internal/store/engine.go`(Commit 在 380~440 行、`commitMu` 387)、`internal/store/mvcc.go:98 latestVersionTS`、`internal/memtable/memtable.go:118 Iterator`、`internal/wal/wal.go`(AppendBatch / Sync)、`internal/exec/exec.go`(Scanner / Cursor)、`internal/segment`(chunk 解码、ZoneMap、布隆)、`internal/server/server.go`;
+   - FE:`client/TangDbClient.java`(RPC_DEADLINE_SECONDS=53 行附近、scan)、`client/FeConfig.java`(配置解析)、`query/QueryEngine.java`(算子执行、`chooseJoinOrder`)、`query/Sorter.java`(溢写,复用)、`storage/RowCodec.java`(行格式)、`storage/KeyCodec.java`;
+   - `proto/tangdb.proto` + `scripts/gen-proto.sh`。
+
+## 工作方式
+
+- **全程自己顺序完成,禁止派子代理**。
+- **每完成一步都要能独立验证**:`cd be && go build ./... && go vet ./... && go test ./...`(BE 改动)、`cd fe && mvn.cmd test-compile && mvn.cmd test`(FE 改动),绿了再进下一步。
+- **新路径一律先加开关、默认关;该步测完再把默认打开**,保证任何一步出问题都能一键回退。
+- 卡住超过 20 分钟没进展,在最后报告里**明说卡在哪、试过什么**,不要伪造"已完成"。
+
+## 顺序可行性核对(先看这段,别按组号硬排)
+
+硬依赖:①`proto` 增量字段必须先改并 `scripts/gen-proto.sh` 重生成,否则下推无处落地;②BE 侧原语(列投影/谓词字节码)必须先于 FE 侧并行,否则并行只是把慢的东西并发;③写路径 group commit 必须建立在"fsync 世代"上,再去做缓冲池;④FE 的流式结果集只有在扫描侧支持列式块之后才有意义。
+
+## 分步实现顺序
+
+**第 1 步 · 开关与配置骨架(FR-718 / FR-723)**
+- `fe.conf` 增 `query_parallelism`、`pushdown_enabled`、`scan_batch_rows`、三档 `rpc_*_deadline_seconds`;`be.conf` 增 `wal_buffer_bytes`、`group_commit_max_batch`、`group_commit_max_wait_ms`。非法值启动失败并指出行号。
+- 默认值按 §5.2;**此步不改变任何行为**(开关默认关或等价于现状),`mvn.cmd test` + 既有脚本回归必须绿。
+
+**第 2 步 · proto 增量(FR-720 / FR-721 / FR-725)**
+- `ScanRequest` 加 `column_mask=6` / `column_slots=7` / `row_frame=8` / `predicate=9` / `columnar_result=10`;`RowBatch` 加 `columnar_block=4`。只加字段,不改既有字段语义。
+- `scripts/gen-proto.sh` 重生成,两侧桩代码一并纳入工作区。BE 先做**透传**(收到字段但按旧路径返回),断言"行为与 P6 完全一致"。
+
+**第 3 步 · 写路径 A:批量冲突检测(FR-693 ~ FR-695)**
+- 写集按用户键排序去重(同 key 保留最后一次写)→ 单次区间扫描归并 → 语义不变(`latest > snapshot` 即冲突,返回首个冲突 key)。
+- `go test -bench` 固化:1,000 行批 + 2MB memtable ≤ 5ms;单测覆盖"同批同 key 三条 → 最后写赢"。
+
+**第 4 步 · 写路径 B:惰性 memtable 游标(FR-696 / FR-697)**
+- 跳表下降实现 `Seek`,不拷贝整表;创建时记写计数水位,越水位后 Next/Seek 返回 `unsafe` 错误;保留 `IteratorSnapshot()`(拷贝语义)给长生命周期调用方。
+- `go test -race` 跑"遍历中并发写"用例,并断言 `unsafe` 被真实触发一次。
+
+**第 5 步 · 写路径 C:group commit + 缓冲池(FR-698 ~ FR-700)**
+- fsync 世代计数:事务返回 OK 前必须等到"覆盖它的世代"完成 fsync;`group_commit_max_batch` / `group_commit_max_wait_ms` 生效。
+- WAL 追加复用缓冲;`commitMu` 只包住"排序 → 取号 → 追加"。
+- 崩溃注入补两点:`fsync 分组中间`、`fsync 完成后未回包`,由 `tmp/p6.1-test` 的强杀用例断言"已回 OK 的一条不丢,未回 OK 的不可见"。
+
+**第 6 步 · 读路径 D:列投影 + 列式块(FR-701 / FR-702 / FR-707 / FR-710)**
+- FE 计算列槽表与行框架参数(`[nullmap][len][bytes]×n`),BE 按字节偏移切片,只回选中列;`columnar_block` 走"原始字节 + 偏移数组"。
+- `pushdown_enabled=false` 时必须走原全行路径且结果逐行一致(先做这条回退,再做收益)。
+
+**第 7 步 · 读路径 E:谓词字节码 + 分片(FR-703 ~ FR-705)**
+- 栈式字节码:操作码 `EQ/NE/LT/LE/GT/GE/IS_NULL/IS_NOT_NULL/BETWEEN/IN/AND/OR/NOT`,参数 = 列槽号 + 保序编码后的字面量字节;BE 只做字节比较,不感知类型。
+- `JSON` 列不下推(留给 FE 残余过滤)。分片用现有 `start_key/end_key`,不新增字段。
+- 等价性单测:同一谓词 FE 求值 vs BE 下推求值逐行一致(覆盖 NULL 三值/边界/空串/超长串/类型混合)。
+
+**第 8 步 · 读路径 F:剪枝与预读(FR-706 / FR-708 / FR-709)**
+- ZoneMap/布隆按列判定;`SHOW SEGMENTS` 增"剪枝命中 / 跳过 chunk 数";`scan_batch_rows` 自适应(1,024~8,192);segment 预读(只读)。
+
+**第 9 步 · FE 并行扫描(FR-711)**
+- 按 key 范围切 N 片并发拉取(`query_parallelism`,默认 `min(8, CPU)`),按片序归并;`query_parallelism=1` 时执行路径必须与 P6 完全一致。
+
+**第 10 步 · FE 算子并行 + 流式结果(FR-712 ~ FR-717)**
+- Hash Join build/probe 并行;聚合按分组键分桶并行后二次合并(`COUNT/SUM/AVG/MIN/MAX/STDDEV/VARIANCE/GROUP_CONCAT` 全覆盖);排序分片内并行 + 归并;结果集流式写 socket,`LIMIT` 命中即向上游取消;解码复用缓冲与基本类型数组;`EXPLAIN` 增"并行/批/下推"行。
+
+**第 11 步 · 验收脚本与门限(FR-726 ~ FR-730)**
+- 新增 `scripts/tests/p6.1-test.sh`,覆盖 SC-400~SC-418,**端口固定 BE 9940 / MySQL 9946 / 心跳 9951**,数据目录 `tmp/p6.1-test/data`,报告 `tmp/p6.1-test/report.txt`。
+- 门限按 §7:导入 2MB ≥ 8,000 行/秒、64MB ≥ 5,000;扫描+聚合 ≥ 27 万行/秒;三表 JOIN(128k ⋈ 50k ⋈ 20k)≤ 3 秒;单行 INSERT P99 ≤ 12ms;宽表列投影网络字节 ≤ 1/5;`LIMIT 10` 读取行数 < 全表 1/10。数值必须真测,不达标写原因,**不许改门限**。
+- 新增 `scripts/bench-exec.sh`(吞吐与并行度扫参,可选)。
+
+**第 12 步 · 文档与收尾**
+- `README.md` 补 9 项配置、`pushdown_enabled` / `query_parallelism` 的含义与实测数字。
+- 不要写验收报告与读代码地图(核验方写)。
+
+## 硬约束(违反即返工)
+
+- **依赖红线**:BE 只允许 `grpc` / `protobuf`;FE 不得引第三方 SQL 解析/统计/压缩/并发库(线程池用 JDK 自带)。
+- **先日志后数据**:group commit 也必须"返回 OK ⇒ 已 fsync";不许用异步刷盘换吞吐。
+- **磁盘格式不变**:WAL 记录布局、segment/chunk、MANIFEST、系统表都不动,不需要迁移。
+- **`proto` 只加字段**:不得出现表名/列名/类型名/SQL;BE 只认"列序号 / 偏移 / 操作码 / 字节"。
+- **结果不变**:`pushdown_enabled=false` + `query_parallelism=1` 时与 P6 逐行一致;任何"会被估算或并行改变结果集内容与行序"的写法一律禁止。
+- **`optimizer_enabled` 与本期两个开关互不影响**,四种组合都要能跑。
+
+## 不要做(超范围即返工)
+
+分布式 / 多节点;`VECTOR`/HNSW/推理下推(P7);自适应优化与智能索引(P14);表达式/函数/路径索引(P11 之后);窗口函数与 `ROLLING`/`CUBE`;`EXPLAIN ANALYZE`、慢查询、监控、备份、Web 控制台(P8 功能项);物化视图/查询缓存;跨段压缩编码改造;表达式级下推(`a+b > c`,只做单列比较);自动 `ANALYZE`。
+
+## 验证要求(全部真跑,贴真实输出)
+
+1. `cd be && go build ./... && go vet ./... && go test ./... && go test -race ./internal/memtable/... ./internal/store/...`
+2. `cd fe && mvn.cmd test`(既有 **353 用例一条不许坏**)
+3. `bash scripts/tests/p6.1-test.sh`(新),报告 PASS/FAIL 真数;★ 两条崩溃/并发用例必须真跑
+4. 既有回归逐个单跑:`p2` / `p3` / `p35` / `p4` / `p5`(如可跑)/ `p6` / `crash-test`
+5. 性能:按 §7 门限逐项记录(同机同数据,三次中位数),附机器条件模板
+6. 真客户端探针:`com.wangyu.tangdb.index.MysqlErrorCheck` 跑本期受影响语句(宽表投影查询、带谓词查询、`LIMIT`),贴 `CODE=0` 与行数
+
+## 本机口径(踩过的坑,别重踩)
+
+- `mvn` 一律 `mvn.cmd`;Java 中文输出要 `-Dfile.encoding=UTF-8 -Dsun.stdout.encoding=UTF-8 -Dsun.stderr.encoding=UTF-8`。
+- **禁止 `nohup xxx &` 这种不带重定向的后台启动**:后台子进程会继承调用方的 stdout,导致命令永不返回(上一期就是这么挂死两次的)。要起服务只能:
+  `"$BIN" --config=... >"$LOG" 2>&1 </dev/null &`,或直接复用 `scripts/start-be.sh --daemon` / `scripts/start-fe.sh --daemon`。
+- **不要动 9100 上的 BE 与 3406 上的 fed**(所有者日常环境);测试只用自己的端口与 `tmp/<脚本名>/data`。
+- 已知端口占用:9110(crash)、9200/9291/9406(p2)、9600/9691/9706(p3)、9700/9716/9791(p5)、9800/9806/9891(p35)、9900/9906/9991(p4)、9950/9956/9961(p6)。**本期用 9940/9946/9951**。
+- 同一时刻只跑一套测试脚本;嵌套调用别的脚本前先停自己起的 BE/fed 并 `kill_stale_tests`(只匹配 `tmp/` 下的进程)。
+- 强杀后重启前必须 `wait_port_free <port>` 轮询到空闲,否则周期性假红。
+- `ps -W` 第 4 列才是 WINPID(netstat 第 5 列);kill 前核对 `ExecutablePath`,别按进程名一把杀 `java.exe`(本机有 IDEA 子进程)。
+
+## 交付纪律
+
+- 只交代码 / 测试 / 脚本 / `README.md` 相应段落。**不要写 `docs/验收报告/*`、`docs/读代码地图/*`**,也不要改 `specs/*`(规约由所有者与核验方维护)。
+- **不要 `git commit` / `git push`**。
+- 不做伪造成绩:没跑的检查写"未验证"并说明原因;性能数字必须来自真跑,不许估算或照抄规约里的目标值。
