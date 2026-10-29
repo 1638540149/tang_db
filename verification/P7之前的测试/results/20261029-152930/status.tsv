@@ -1,0 +1,6 @@
+be-build	0
+be-vet	0
+be-unit	0
+fe-build	0
+fe-unit	1
+jdbc-client-build	0

@@ -1,0 +1,6 @@
+tang_db 命令行客户端（fed 127.0.0.1:12212）
+输入 SQL 以 ; 结束;可用: BEGIN / COMMIT / ROLLBACK | SHOW TABLES | SHOW DATABASES | SHOW SESSIONS | DESC <表> | SHOW BACKENDS | exit
+tangdb> OK, 事务已开始(snapshot = 72)
+tangdb(txn)> OK, 1 row affected
+tangdb(txn)> OK, 事务已提交(commit_ts = 73)
+tangdb> 再见

@@ -1,0 +1,11 @@
+go-build	0
+go-vet	0
+go-unit	0
+fe-maven-test	0
+p2-functional	1
+p3-transactions	1
+p35-mysql-multidb	127
+p4-indexes-introspection	127
+p5-analytics-import	127
+p6-optimizer	127
+p61-execution-performance	127

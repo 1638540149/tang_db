@@ -1,0 +1,3 @@
+tang_db 命令行客户端（fed 127.0.0.1:12212）
+输入 SQL 以 ; 结束;可用: BEGIN / COMMIT / ROLLBACK | SHOW TABLES | SHOW DATABASES | SHOW SESSIONS | DESC <表> | SHOW BACKENDS | exit
+错误：连不上 fed 127.0.0.1:12212（Connection refused: connect）

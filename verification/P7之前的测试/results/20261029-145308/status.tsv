@@ -1,0 +1,12 @@
+be-build	0
+be-vet	0
+be-unit	0
+fe-build	0
+fe-unit	0
+jdbc-client-build	0
+jdbc-functional	1
+jdbc-concurrency	127
+jdbc-crash-seed	1
+jdbc-crash-recovery	1
+jdbc-after-fsync-write	1
+jdbc-fsync-replay	1

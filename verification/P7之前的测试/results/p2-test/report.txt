@@ -1,0 +1,78 @@
+==================================================
+ tang_db P2 端到端功能测试  2026-10-29 14:35:47
+==================================================
+[构建] BE
+[构建] FE
+[配置] BE 端口 12200 / fed 心跳端口 12201 / MySQL 端口 12202 / 数据目录 /d/projects/tang_db/verification/full/results/p2-test/data / memtable 1KB
+[就绪] BE 已启动
+[就绪] fed 已启动
+
+---------- 场景 1 建表并查看 ----------
+  [PASS] SHOW TABLES 列出 users
+  [PASS] DESC users 列出主键列 id
+  [PASS] DESC users 显示列类型
+
+---------- 场景 2 插入并点查 ----------
+  [PASS] INSERT 返回影响行数
+  [PASS] 主键点查读回插入的值
+
+---------- 场景 3 条件查询 ----------
+  [PASS] 多行 INSERT 生效
+  [PASS] 满足 city=北京 AND age>25 的行被返回
+  [PASS] 不满足条件的行(lisi, age=20)未被返回
+  [PASS] 不满足条件的行(zhangsan, 上海)未被返回
+
+---------- 场景 4 更新与删除 ----------
+  [PASS] UPDATE / DELETE 返回影响行数
+  [PASS] UPDATE 后的新值可读回
+  [PASS] DELETE 后该行查不到
+
+---------- 场景 5 主键冲突 ----------
+  [PASS] 重复主键被挡下并明确报错
+  [PASS] 冲突写入没有覆盖原值
+
+---------- 场景 6 错误提示 ----------
+  [PASS] 表不存在有明确提示
+  [PASS] 列不存在有明确提示
+  [PASS] 类型不匹配有明确提示
+  [PASS] 缺主键被拒绝
+  [PASS] 语法错误有明确提示
+  [PASS] 错误输出里没有 Java 堆栈
+
+---------- P2.1 场景 A 反引号标识符 / 省略列名 / SHOW DATABASES ----------
+  [PASS] SHOW DATABASES 输出列头 Database
+  [PASS] SHOW DATABASES 出一行 default
+  [PASS] 反引号建表可用(select/from 做列名)
+  [PASS] 反引号列名插入后能查回
+  [PASS] 反引号列名可 UPDATE(SET `from` = 37)
+  [PASS] 反引号不能包裹语句关键字
+  [PASS] 空反引号报'标识符不能为空'
+  [PASS] 省略列名的多行 INSERT 可用
+  [PASS] 省略列名插入的行能按主键点查读回
+  [PASS] 省略列名少给值时报第几组
+  [PASS] 空列名列表被拒绝
+  [PASS] 输出里不再出现'无法识别的字符'
+
+---------- 场景 7 ★ 元数据重启不丢 ----------
+  [PASS] restart_test 写入 10 行
+  [FAIL] 重启后 SHOW TABLES 仍有 users(期望输出包含: users)
+----- 实际输出 -----
+错误: 找不到或无法加载主类 com.wangyu.tangdb.client.Cli
+原因: java.lang.ClassNotFoundException: com.wangyu.tangdb.client.Cli
+--------------------
+  [FAIL] 重启后 SHOW TABLES 仍有 restart_test(期望输出包含: restart_test)
+----- 实际输出 -----
+错误: 找不到或无法加载主类 com.wangyu.tangdb.client.Cli
+原因: java.lang.ClassNotFoundException: com.wangyu.tangdb.client.Cli
+--------------------
+  [FAIL] 重启后 restart_test 的行数不足(匹配到 0 行)
+错误: 找不到或无法加载主类 com.wangyu.tangdb.client.Cli
+原因: java.lang.ClassNotFoundException: com.wangyu.tangdb.client.Cli
+
+---------- 场景 8 ★ BE 心跳:判死与自动恢复 ----------
+[强杀] 心跳场景:taskkill /F be.exe(此后 3 个周期内应被判死)
+[重启] 心跳场景:重新启动 BE(应自动恢复可用)
+tang_db 命令行客户端（fed 127.0.0.1:12202）
+输入 SQL 以 ; 结束;可用: BEGIN / COMMIT / ROLLBACK | SHOW TABLES | SHOW DATABASES | SHOW SESSIONS | DESC <表> | SHOW BACKENDS | exit
+错误：连不上 fed 127.0.0.1:12202（Connection refused: connect）
+  [FAIL] SHOW BACKENDS 列出 BE 身份信息(期望输出包含: be_id)

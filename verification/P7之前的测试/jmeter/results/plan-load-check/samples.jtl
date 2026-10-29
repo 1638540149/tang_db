@@ -1,0 +1,505 @@
+timeStamp,elapsed,label,responseCode,responseMessage,threadName,dataType,success,failureMessage,bytes,sentBytes,grpThreads,allThreads,URL,Latency,IdleTime,Connect
+1793260257991,109,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,109
+1793260258105,1,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258107,1,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258109,1,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258110,2,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,2
+1793260258112,2,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,2
+1793260258115,1,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258117,1,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258118,2,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,2
+1793260258120,1,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258122,1,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258124,13,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,13
+1793260258138,1,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258140,13,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,13
+1793260258153,16,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,16
+1793260258172,2,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,2
+1793260258175,1,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258177,1,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258178,22,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,22
+1793260258201,1,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258203,13,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,13
+1793260258216,2,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,2
+1793260258218,2,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,2
+1793260258220,11,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,11
+1793260258232,1,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258234,1,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258236,1,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258237,1,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258238,25,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,25
+1793260258263,1,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258265,1,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258266,12,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,12
+1793260258279,14,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,14
+1793260258294,1,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258296,1,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258297,26,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,26
+1793260258324,15,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,15
+1793260258340,1,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258341,1,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258342,1,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258343,1,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258344,2,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,2
+1793260258346,1,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258347,0,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,0
+1793260258348,0,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,0
+1793260258349,0,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,0
+1793260258350,20,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,20
+1793260258370,1,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258372,0,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,0
+1793260258373,1,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258374,1,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258375,26,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,26
+1793260258402,1,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258403,1,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258405,11,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,11
+1793260258416,2,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,2
+1793260258418,1,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258419,1,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258420,1,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258421,1,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258422,1,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258423,1,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258424,23,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,23
+1793260258448,1,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258449,1,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258451,0,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,0
+1793260258452,0,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,0
+1793260258453,25,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,25
+1793260258479,1,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258481,1,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258482,1,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258483,2,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,2
+1793260258485,2,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,2
+1793260258487,1,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258488,1,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258489,20,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,20
+1793260258510,1,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258511,2,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,2
+1793260258513,1,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258515,26,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,26
+1793260258541,16,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,16
+1793260258557,1,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258558,1,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258559,1,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258560,12,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,12
+1793260258572,1,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258574,0,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,0
+1793260258575,12,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,12
+1793260258588,1,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258589,1,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258590,1,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258591,1,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258592,1,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258593,26,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,26
+1793260258619,2,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,2
+1793260258621,14,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,14
+1793260258635,14,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,14
+1793260258650,1,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258651,1,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258652,1,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258653,12,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,12
+1793260258665,1,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258666,1,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258668,12,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,12
+1793260258680,2,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,2
+1793260258682,13,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,13
+1793260258696,1,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258697,14,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,14
+1793260258711,1,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258713,1,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258714,1,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258715,1,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258716,1,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258717,1,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258718,1,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258719,1,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258720,1,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258721,20,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,20
+1793260258742,15,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,15
+1793260258757,1,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258758,14,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,14
+1793260258773,14,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,14
+1793260258788,1,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258789,1,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258790,1,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258791,1,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258792,1,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258794,1,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258795,1,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258796,1,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258797,1,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258798,1,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258799,0,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,0
+1793260258800,0,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,0
+1793260258800,1,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258801,1,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258802,1,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258803,1,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258804,0,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,0
+1793260258804,14,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,14
+1793260258818,15,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,15
+1793260258833,2,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,2
+1793260258835,14,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,14
+1793260258849,2,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,2
+1793260258851,1,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258852,13,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,12
+1793260258865,1,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258866,1,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258867,13,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,13
+1793260258880,16,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,16
+1793260258896,2,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,2
+1793260258898,1,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258899,1,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258900,1,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258901,11,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,11
+1793260258912,1,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258914,0,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,0
+1793260258915,0,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,0
+1793260258915,1,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258916,1,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258917,0,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,0
+1793260258917,26,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,26
+1793260258943,2,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,2
+1793260258945,14,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,14
+1793260258959,1,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258960,1,Point read by primary key,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,1
+1793260258962,12,Filtered aggregate query,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,12
+1793260258974,16,Concurrent unique-key insert,null 0,"java.sql.SQLException: Cannot create PoolableConnectionFactory (Communications link failure
+
+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.)",Concurrent JDBC users 1-1,text,false,,199,0,1,1,null,0,0,16

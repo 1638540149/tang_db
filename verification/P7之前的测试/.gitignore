@@ -1,0 +1,22 @@
+# 大件 / 机器相关产物不入库(脚本可重跑生成)
+# 保留:脚本、JMX、*.log、status.tsv、TEST-REPORT.md、conf、cleanup SQL、samples.jtl
+
+# BE 可执行文件(每次运行 17MB)
+results/*/be.exe
+*.exe
+
+# 数据目录与排序临时目录
+results/*/data/
+results/*/sort-tmp/
+
+# 编译产物
+results/*/classes/
+
+# 造数与导出数据(由脚本确定性生成)
+results/*/*.csv
+
+# JDBC 驱动 jar(第三方二进制,按需自行下载)
+jmeter/lib/*.jar
+
+# JMeter HTML 报告(文件多、体积大;可由 samples.jtl 重新生成)
+jmeter/results/*/html-report/

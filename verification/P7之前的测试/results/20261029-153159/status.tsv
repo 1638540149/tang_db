@@ -1,0 +1,15 @@
+be-build	0
+be-vet	0
+be-unit	0
+fe-build	0
+fe-unit	SKIP
+jdbc-client-build	0
+jdbc-functional	0
+csv-import	0
+csv-import-idempotent-rerun	0
+jdbc-import-export-perf	0
+jdbc-concurrency	0
+jdbc-crash-seed	0
+jdbc-crash-recovery	0
+jdbc-after-fsync-write	0
+jdbc-fsync-replay	0
