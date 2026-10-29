@@ -21,15 +21,18 @@ import (
 )
 
 const (
-	defaultMemtableSize       = 64 * 1024 * 1024
-	defaultMaxTxnWriteSize    = 64 * 1024 * 1024
-	defaultCompactionL0Files  = 4
-	defaultCompactionRatio    = 10
-	defaultCompactionLevelMax = 256 * 1024 * 1024
-	maxTxnWriteCount          = 1_000_000
-	maxImmutableTables        = 2
-	version                   = "P5-0.1.0"
-	maxLevels                 = 7
+	defaultMemtableSize         = 64 * 1024 * 1024
+	defaultMaxTxnWriteSize      = 64 * 1024 * 1024
+	defaultCompactionL0Files    = 4
+	defaultCompactionRatio      = 10
+	defaultCompactionLevelMax   = 256 * 1024 * 1024
+	defaultWALBufferBytes       = 1 * 1024 * 1024
+	defaultGroupCommitMaxBatch  = 64
+	defaultGroupCommitMaxWaitMS = 5
+	maxTxnWriteCount            = 1_000_000
+	maxImmutableTables          = 2
+	version                     = "P5-0.1.0"
+	maxLevels                   = 7
 )
 
 // 崩溃注入点(SPEC-P3 FR-364 / SPEC-P5 ★P5-2)。仅验收使用,默认空 = 关闭。
@@ -42,6 +45,10 @@ const (
 	CrashCompactionAfterWrite = "compaction_after_write"
 	// compaction 中途:MANIFEST 已切换、旧文件尚未删除。
 	CrashCompactionAfterManifest = "compaction_after_manifest"
+	// group commit:一组提交已追加、fsync 尚未完成(SPEC-P6.1 FR-728)。
+	CrashFsyncMidGroup = "fsync_mid_group"
+	// group commit:fsync 已完成、还没回包(崩溃后重放可见)。
+	CrashFsyncAfterDone = "fsync_after_done"
 )
 
 // 事务写入超限错误(FR-309 / FR-361)。
@@ -70,6 +77,11 @@ type Options struct {
 	BloomEnabled            bool
 	// DisableCompaction 仅测试用:关闭后台合并,便于验证"只增不合"的老行为。
 	DisableCompaction bool
+
+	// ---- SPEC-P6.1 §5.2(写路径)----
+	WALBufferBytes      int64 // WAL 追加缓冲大小,默认 1MB
+	GroupCommitMaxBatch int   // 一次 fsync 最多合并的提交数,默认 64
+	GroupCommitMaxWait  int   // 攒批最长等待(毫秒),默认 5
 }
 
 // Write 是提交写集里的一条:key 为用户键(不含版本段)。
@@ -117,6 +129,27 @@ type Engine struct {
 	compactionMu sync.Mutex
 
 	lastCommitTS atomic.Uint64
+	// visibleTS 是所有 commit_ts <= 它的写入都已完成 memtable 应用的水位。
+	// 读路径只认它 —— group commit 下"已取号但还没应用"的提交对读者不可见。
+	visibleTS atomic.Uint64
+
+	// group commit(SPEC-P6.1 FR-698 / FR-699)。
+	// commitMu 保护"排序 → 取号 → 追加"以及 pending 索引;
+	// fsync 与应用由 applyPipeline 串行成组。
+	pending     map[string]uint64 // 用户键 → 已追加未应用的 commit_ts
+	pendingList []*pendingCommit
+	appendedSeq uint64 // 已追加到 WAL 的记录数(commitMu 保护)
+	durableSeq  uint64 // 已 fsync 且已应用的记录数(groupMu 保护)
+	failedSeq   uint64 // 因 fsync 失败被丢弃的最大序号(groupMu 保护)
+
+	applyPipeline sync.Mutex
+	groupMu       sync.Mutex
+	groupCond     *sync.Cond
+	syncErr       error
+
+	groupMaxBatch int
+	groupMaxWait  time.Duration
+	walBufferSize int
 
 	maxTxnWriteBytes int64
 	crashPoint       string
@@ -173,6 +206,18 @@ func OpenWithOptions(dataDir string, opts Options) (*Engine, *Stats, error) {
 	if levelMax <= 0 {
 		levelMax = defaultCompactionLevelMax
 	}
+	walBuffer := opts.WALBufferBytes
+	if walBuffer <= 0 {
+		walBuffer = defaultWALBufferBytes
+	}
+	groupBatch := opts.GroupCommitMaxBatch
+	if groupBatch <= 0 {
+		groupBatch = defaultGroupCommitMaxBatch
+	}
+	groupWaitMS := opts.GroupCommitMaxWait
+	if groupWaitMS < 0 {
+		groupWaitMS = defaultGroupCommitMaxWaitMS
+	}
 
 	e := &Engine{
 		dataDir:            dataDir,
@@ -188,10 +233,15 @@ func OpenWithOptions(dataDir string, opts Options) (*Engine, *Stats, error) {
 		disableCompaction:  opts.DisableCompaction,
 		handles:            make(map[uint64]*segHandle),
 		activeSnapshots:    make(map[uint64]int),
+		pending:            make(map[string]uint64),
+		groupMaxBatch:      groupBatch,
+		groupMaxWait:       time.Duration(groupWaitMS) * time.Millisecond,
+		walBufferSize:      int(walBuffer),
 		flushCh:            make(chan struct{}, 1),
 		closeCh:            make(chan struct{}),
 	}
 	e.flushCond = sync.NewCond(&e.mu)
+	e.groupCond = sync.NewCond(&e.groupMu)
 
 	for _, d := range []string{e.dataDir, e.walDir, e.sstDir, filepath.Join(e.dataDir, "tmp")} {
 		if err := os.MkdirAll(d, 0750); err != nil {
@@ -237,7 +287,7 @@ func OpenWithOptions(dataDir string, opts Options) (*Engine, *Stats, error) {
 		return nil, nil, fmt.Errorf("store: list wal: %w", err)
 	}
 	if len(walNumbers) == 0 {
-		w, err := wal.Open(e.walDir, m.NextWAL)
+		w, err := wal.OpenWithBuffer(e.walDir, m.NextWAL, e.walBufferSize)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -266,7 +316,7 @@ func OpenWithOptions(dataDir string, opts Options) (*Engine, *Stats, error) {
 			w.Close()
 		}
 		current := walNumbers[len(walNumbers)-1]
-		w, err := wal.Open(e.walDir, current)
+		w, err := wal.OpenWithBuffer(e.walDir, current, e.walBufferSize)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -293,6 +343,7 @@ func OpenWithOptions(dataDir string, opts Options) (*Engine, *Stats, error) {
 		last = segMaxTS
 	}
 	e.lastCommitTS.Store(last)
+	e.visibleTS.Store(last)
 
 	m.FormatVersion = manifest.FormatVersion
 	m.LastCommitTS = last
@@ -373,9 +424,13 @@ func (e *Engine) put(key, value []byte) error {
 	return err
 }
 
-// Commit 提交一个写集(SPEC-P3 FR-311 / FR-312):
+// Commit 提交一个写集(SPEC-P3 FR-311 / FR-312;SPEC-P6.1 FR-693 ~ FR-699):
 //
-//	① 冲突检测 → ② 追加批记录 → ③ fsync → ④ 写 memtable → ⑤ 返回
+//	commitMu 内:排序去重 → 单次区间冲突检测 → 取号 → WAL 追加(不 fsync)
+//	commitMu 外:等覆盖本事务的 fsync(世代) → 应用 memtable → 返回 OK
+//
+// 返回 OK 的前提仍然是"覆盖本事务的那次 fsync 已完成" —— 这是正确性红线,
+// group commit 只是把多个事务的 fsync 合并成一次,不改变它。
 func (e *Engine) Commit(snapshot, txnID uint64, writes []Write) (uint64, []byte, error) {
 	if len(writes) == 0 {
 		return 0, nil, nil
@@ -385,25 +440,35 @@ func (e *Engine) Commit(snapshot, txnID uint64, writes []Write) (uint64, []byte,
 	}
 
 	e.commitMu.Lock()
-	defer e.commitMu.Unlock()
 
 	e.mu.RLock()
 	closed := e.closed
 	e.mu.RUnlock()
 	if closed {
+		e.commitMu.Unlock()
 		return 0, nil, errors.New("store: closed")
 	}
 
 	if snapshot == 0 {
-		snapshot = e.lastCommitTS.Load()
+		snapshot = e.visibleTS.Load()
 	}
 
-	for _, w := range writes {
-		latest, ok, err := e.latestVersionTS(w.Key)
-		if err != nil {
-			return 0, nil, err
-		}
-		if ok && latest > snapshot {
+	// SPEC-P6.1 FR-693 / FR-694:排序去重后单次区间扫描做冲突检测。
+	sorted := prepareWrites(writes)
+	conflictKey, err := e.detectConflicts(sorted, snapshot)
+	if err != nil {
+		e.commitMu.Unlock()
+		return 0, nil, err
+	}
+	if conflictKey != nil {
+		e.commitMu.Unlock()
+		return 0, conflictKey, nil
+	}
+	// 已追加、还没应用 memtable 的提交同样在 commit_ts 序列里,必须参与冲突检测,
+	// 否则 group commit 会开出"两个事务同时改同一行"的口子(FR-729)。
+	for _, w := range sorted {
+		if ts, ok := e.pending[string(w.Key)]; ok && ts > snapshot {
+			e.commitMu.Unlock()
 			return 0, append([]byte(nil), w.Key...), nil
 		}
 	}
@@ -411,37 +476,38 @@ func (e *Engine) Commit(snapshot, txnID uint64, writes []Write) (uint64, []byte,
 	e.injectCrash(CrashBeforeWAL)
 
 	commitTS := e.lastCommitTS.Add(1)
-	full := make([]wal.KV, len(writes))
-	for i, w := range writes {
+	full := make([]wal.KV, len(sorted))
+	userKeys := make([][]byte, len(sorted))
+	for i, w := range sorted {
 		full[i] = wal.KV{Key: AppendVersion(w.Key, commitTS), Value: w.Value}
+		userKeys[i] = w.Key
 	}
 
 	e.walMu.Lock()
 	currentWAL := e.wal
-	err := currentWAL.AppendBatch(commitTS, txnID, full)
+	appendErr := currentWAL.AppendBatchBuffered(commitTS, txnID, full)
 	e.walMu.Unlock()
-	if err != nil {
-		return 0, nil, fmt.Errorf("store: wal append: %w", err)
+	if appendErr != nil {
+		e.commitMu.Unlock()
+		return 0, nil, fmt.Errorf("store: wal append: %w", appendErr)
 	}
-	e.lastFsyncMilli.Store(time.Now().UnixMilli())
 
-	e.injectCrash(CrashAfterFsync)
+	e.appendedSeq++
+	p := &pendingCommit{
+		seq:      e.appendedSeq,
+		commitTS: commitTS,
+		userKeys: userKeys,
+		kvs:      full,
+	}
+	e.pendingList = append(e.pendingList, p)
+	for _, k := range userKeys {
+		e.pending[string(k)] = commitTS
+	}
+	e.commitMu.Unlock()
 
-	e.mu.Lock()
-	if e.closed {
-		e.mu.Unlock()
-		return 0, nil, errors.New("store: closed")
+	if err := e.waitDurableAndApply(p.seq); err != nil {
+		return 0, nil, err
 	}
-	for _, kv := range full {
-		e.mem.Put(kv.Key, kv.Value)
-	}
-	if e.mem.ApproximateSize() >= e.threshold {
-		if err := e.rotateMemtableLocked(); err != nil {
-			e.mu.Unlock()
-			return 0, nil, err
-		}
-	}
-	e.mu.Unlock()
 
 	e.injectCrash(CrashAfterMemtable)
 	e.injectCrash(CrashBeforeOK)
@@ -504,7 +570,7 @@ func (e *Engine) rotateMemtableLocked() error {
 
 	e.walMu.Lock()
 	oldWal := e.wal
-	newWal, err := wal.Open(e.walDir, e.state.NextWAL)
+	newWal, err := wal.OpenWithBuffer(e.walDir, e.state.NextWAL, e.walBufferSize)
 	if err != nil {
 		e.walMu.Unlock()
 		return fmt.Errorf("store: create new wal: %w", err)
@@ -812,6 +878,9 @@ type Status struct {
 	LastFsyncUnixMilli int64
 	DiskTotalBytes     uint64
 	DiskAvailableBytes uint64
+	// SPEC-P6.1 FR-706:chunk 解码 / 跳过计数(SHOW SEGMENTS)。
+	ChunksRead    uint64
+	ChunksSkipped uint64
 }
 
 // Status 采集当前状态。
@@ -839,6 +908,13 @@ func (e *Engine) Status() Status {
 		WALBytes:           dirSize(e.walDir),
 	}
 	st.DiskTotalBytes, st.DiskAvailableBytes = diskUsage(dataDir)
+
+	e.mu.RLock()
+	for _, h := range e.handles {
+		st.ChunksRead += h.r.ChunksRead()
+		st.ChunksSkipped += h.r.ChunksSkipped()
+	}
+	e.mu.RUnlock()
 	return st
 }
 

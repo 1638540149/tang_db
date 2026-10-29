@@ -1,0 +1,76 @@
+# 施工提示词 · P6.1 补做(FE 执行层:算子并行 / 并行排序 / 流式结果 / 解码复用)
+
+> 这不是新一期。SPEC-P6.1 里的 5 条 FR 上一轮没做完,本轮只补这 5 条,**不加范围、不改语义、不松门限**。
+
+## 0. 必读(按顺序,只读这些)
+
+1. `AGENTS.md`(仓库根)—— 护栏与构建命令
+2. `specs/P6.1-write-path-perf.md` —— 只看 §4 的 **FR-712 / FR-713 / FR-714 / FR-715 / FR-716**,以及 §7 的 SC-410 / SC-411 / SC-415 / SC-417
+3. `docs/验收报告/P6.1-验收报告.md` —— §3 是"哪 5 条没做、代码在哪一行"的现状锚点,§7 说明既有回归脚本为什么会在嵌套跑里红
+4. 现状代码:
+   - `fe/src/main/java/com/wangyu/tangdb/query/QueryEngine.java`(hashJoin:1296 起、aggregate:2369 起、排序走 `Sorter.sort`、`Relation.rows` 全量物化)
+   - `fe/src/main/java/com/wangyu/tangdb/storage/ProjectedCodec.java`(`decode`:116 起)
+   - `fe/src/main/java/com/wangyu/tangdb/query/Sorter.java`
+   - `fe/src/main/java/com/wangyu/tangdb/execute/Executor.java`(结果输出与 `EXPLAIN`,1062 起的"并行/批/下推"行)
+
+## 1. 本轮要做的 5 条(只有这 5 条)
+
+| FR | 要求 | 验收口径 |
+|---|---|---|
+| FR-716 | 解码复用:投影帧解码不再每行 `new Object[列数]`;复用缓冲与基本类型数组,消除逐行装箱 | 单测覆盖"同一 Plan 连续解 N 行不加分配";结果逐行不变 |
+| FR-714 | 排序并行:`ORDER BY` / `sortDistinct` / `sortMergeJoin` 的排序改为"分片内并行排序 + 归并" | 并行度 1 与 >1 结果**逐行同序**;`sort_spill_bytes` 语义不变 |
+| FR-713 | 聚合分桶并行:`GROUP BY` 按键分桶、局部聚合、二次合并;`COUNT/SUM/AVG/MIN/MAX/STDDEV/VARIANCE/GROUP_CONCAT` 全覆盖 | 与单线程**逐行同序**(顺序按首次出现或 GROUP BY 键序,必须与现状一致) |
+| FR-712 | Hash Join 分桶并行:build 按哈希桶分段并行构建、probe 并行,再按稳定顺序合并 | 与单线程**逐行同序**;LEFT JOIN 的补空行位置不变 |
+| FR-715 | 结果集流式:`LIMIT` 命中即停止向上游取数并终止扫描,不再整表物化后才输出 | `LIMIT n` 返回行数与内容不变;大结果集内存不随行数线性增长 |
+
+**排序/聚合/JOIN 的输出顺序是硬要求**:现有 SC-410 / SC-411 / SC-415 与 p5/p6 的断言都是"逐行一致",并行实现必须做确定性归并(按分片序或键序),不许用"集合相等"糊过去。
+
+## 2. 硬约束(违反即返工)
+
+- **BE 侧一行都不许改**(`be/` 与 `proto/` 保持现状):这 5 条全在 FE。若你认为某条必须动 proto,先停下来说明理由,不要自行改。
+- 依赖红线:FE 不得引入任何第三方 SQL 解析 / 集合 / 并发框架库;只用 JDK 的 `java.util.concurrent`。
+- 开关语义不变:`pushdown_enabled=false` + `query_parallelism=1` 必须仍等价于 P6 原路径(SC-415),并行度=1 时不得走新并行代码。
+- 门限一个都不许改;`EXPLAIN` 的既有行不许动,"并行/批/下推"行可以补充实际并发度/批大小。
+- 不改 `specs/`、不改 `docs/`(验收报告与读代码地图由核验方写)、不 `git commit` / `git push`。
+
+## 3. 工作方式(上一轮踩过的坑,逐条遵守)
+
+- **禁止派子代理**,所有步骤自己顺序做。
+- **禁止用 `nohup` / `disown` / 裸 `&` 起服务**:上一轮这样做把 bash 工具卡死了三次(每次 1~2 小时)。要起服务只用仓库脚本(`bash scripts/start-be.sh --daemon ...` / `bash scripts/tests/p6.1-test.sh`),它们自己负责 daemon 化与 PID 文件;单条 bash 超过 60 秒没返回就换写法。
+- 每个步骤做完**立刻**跑构建与单测,不要攒到最后:
+  1. `cd fe && mvn.cmd compile`
+  2. `cd fe && mvn.cmd test`
+  3. `cd be && go build ./... && go vet ./... && go test ./...`(确保没意外碰到 BE)
+- 测试环境是**独占**的:任何时刻只跑一个脚本。跑验收脚本前先确认没有残留 `be.exe` / `tangdb.fed.Fed` 进程。
+
+## 4. 实现顺序(由易到难,每步可独立回退)
+
+1. **FR-716 解码复用** —— 改 `ProjectedCodec.decode`,加单测;`mvn.cmd test` 全绿再往下。
+2. **FR-714 并行排序** —— 复用现成 `ExecutorService` 思路(参考 `QueryEngine.scanShards` 的线程池写法),并行度取 `options.parallelism()`,=1 时走原路径;结果按分片序归并。
+3. **FR-713 聚合分桶并行** —— 局部聚合对象要可合并(注意 `AVG`/`STDDEV`/`GROUP_CONCAT` 的合并语义)。
+4. **FR-712 Hash Join 分桶并行** —— build 侧按 hash 分段、probe 侧并行,最后按 build 行序 + probe 行序稳定合并;LEFT JOIN 的补空行逻辑保持。
+5. **FR-715 流式结果 + LIMIT 终止** —— 只改 FE 输出链:把"先全量 `Relation.rows` 再输出"改成"逐批取、逐批写";`LIMIT` 满足即停并释放上游扫描。CLI 与 MySQL 协议的回显格式必须完全不变。
+
+## 5. 自证要求(必须真跑,不许写"应该没问题")
+
+按顺序执行并把真实输出贴进交付说明:
+
+```
+cd fe && mvn.cmd compile && mvn.cmd test
+cd be && go build ./... && go vet ./... && go test ./...
+bash scripts/tests/p6.1-test.sh                 # 本体 SC-400~SC-418 必须无新增红
+SKIP_REGRESSION=1 bash scripts/tests/p6.1-test.sh   # 只看本体时更快
+```
+
+- `p6.1-test.sh` 的 SC-417 嵌套回归**红不算你的错**(已知 harness 问题,见验收报告 §7),但 SC-400~SC-416、SC-418 里**不许出现新的红**;若某条由绿转红,必须自己修到绿或明确写出"这条因为我改了什么而无法保持"。
+- 新增的并行路径必须能用 `query_parallelism=1` / `=8` 各跑一遍,给出两条路径的耗时对比(同一个 JVM 内、三次中位数)。
+
+## 6. 交付物
+
+- 改动的 FE 代码 + 新增单测(建议:`ProjectedCodecReuseTest`、`ParallelSortTest`、`ParallelAggregateTest`、`ParallelJoinTest`、`StreamingLimitTest`)
+- `README.md` 的 P6.1 章节:把"本期未做"里已经补掉的条目改成"已实现",并写清并行度对哪些算子生效
+- 交付说明里逐条写:每条 FR 落在哪个文件哪一行、怎么验证的、实测数字
+
+## 7. 做不到就明说
+
+某条实现不了(例如流式改造会破坏协议层兼容),**停下来写清原因与影响面**,不要偷偷降级成"看起来能跑"的半成品,也不要改门限或改断言。

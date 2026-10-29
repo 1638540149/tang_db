@@ -38,6 +38,20 @@ public interface KvStore {
     }
 
     /**
+     * 固定一个快照用于并发分片扫描(SPEC-P6.1 FR-711)。
+     *
+     * <p>返回 0 表示"不固定"(内存假实现);真实客户端返回一个已提交水位,
+     * 分片扫描全部用同一个水位,避免并发写导致跨片读到不同快照。</p>
+     */
+    default long snapshotPin() {
+        return 0;
+    }
+
+    /** 释放 {@link #snapshotPin()} 固定的快照。 */
+    default void snapshotUnpin(long snapshot) {
+    }
+
+    /**
      * 原子写入一批 key(用于 DDL 的多条元数据记录,SPEC-P3 FR-355)。
      *
      * <p>默认实现逐条写(内存假实现用);真实实现必须走一条 CommitTxn 批记录。</p>

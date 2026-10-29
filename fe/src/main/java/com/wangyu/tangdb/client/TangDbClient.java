@@ -41,7 +41,9 @@ import java.util.concurrent.TimeUnit;
  * <p>只通过 {@code proto/tangdb.proto} 定义的接口与 BE 通信，不读写 BE 的任何数据文件。
  * 所有失败都转换成带中文提示的 {@link ClientException}，调用方无需处理 gRPC 异常类型。</p>
  */
-public class TangDbClient implements AutoCloseable, KvStore, TransactionStore {
+public class TangDbClient implements AutoCloseable, KvStore, TransactionStore,
+        com.wangyu.tangdb.storage.ProjectingStore,
+        com.wangyu.tangdb.storage.CursoredStore {
 
     /** 默认 BE 地址。 */
     public static final String DEFAULT_HOST = "127.0.0.1";
@@ -49,18 +51,32 @@ public class TangDbClient implements AutoCloseable, KvStore, TransactionStore {
     /** 默认 gRPC 端口。 */
     public static final int DEFAULT_PORT = 9100;
 
-    /** 单次 RPC 的截止时间，保证 BE 无响应时客户端不会无限挂起。 */
-    private static final long RPC_DEADLINE_SECONDS = 5L;
+    /** 单次 RPC 的截止时间(默认值,SPEC-P6.1 FR-722 的三档之一)。 */
+    private static final long DEFAULT_RPC_DEADLINE_SECONDS = 5L;
 
-    /** 扫描可能返回大量数据,给它比点操作更宽的截止时间。 */
-    private static final long SCAN_DEADLINE_SECONDS = 60L;
+    /** 范围扫描 / 分片扫描期限(默认值)。 */
+    private static final long DEFAULT_SCAN_DEADLINE_SECONDS = 60L;
 
     /**
-     * 批量提交(CSV 导入 / ANALYZE 的统计批写)遇到后台 compaction 时,5 秒会误判超时
-     * (SPEC-P6 的 10 万行导入实测在 compaction 期间单批可超过 5s)。放宽只影响
-     * "失败多久被发现",不影响正确性。
+     * 批量提交 / 导入 / 回填 / ANALYZE 期限(默认值)。
+     *
+     * <p>5 秒会在 compaction 期间误判超时(SPEC-P6 的 10 万行导入实测单批可超过 5s);
+     * 放宽只影响"失败多久被发现",不影响正确性。</p>
      */
-    private static final long COMMIT_DEADLINE_SECONDS = 60L;
+    private static final long DEFAULT_BULK_DEADLINE_SECONDS = 60L;
+
+    /** 三档期限(秒,可在启动时由配置覆盖,SPEC-P6.1 FR-722)。 */
+    private long rpcDeadlineSeconds = DEFAULT_RPC_DEADLINE_SECONDS;
+    private long scanDeadlineSeconds = DEFAULT_SCAN_DEADLINE_SECONDS;
+    private long bulkDeadlineSeconds = DEFAULT_BULK_DEADLINE_SECONDS;
+
+    /** 扫描收到的 key+value 载荷字节数(SPEC-P6.1 SC-405 的实测口径)。 */
+    private final java.util.concurrent.atomic.AtomicLong scanPayloadBytes =
+            new java.util.concurrent.atomic.AtomicLong();
+
+    /** 分片扫描固定的快照 → BE 事务句柄(SPEC-P6.1 FR-711)。 */
+    private final java.util.concurrent.ConcurrentHashMap<Long, Long> pinnedTxns =
+            new java.util.concurrent.ConcurrentHashMap<>();
 
     /** 关闭 channel 时等待在途 RPC 结束的时间。 */
     private static final long SHUTDOWN_TIMEOUT_SECONDS = 5L;
@@ -227,7 +243,7 @@ public class TangDbClient implements AutoCloseable, KvStore, TransactionStore {
         List<KeyValue> rows = new ArrayList<>();
         Iterator<RowBatch> iterator;
         try {
-            iterator = stubWithDeadline(SCAN_DEADLINE_SECONDS).scan(ScanRequest.newBuilder()
+            iterator = stubWithDeadline(scanDeadlineSeconds).scan(ScanRequest.newBuilder()
                     .setStartKey(start == null ? ByteString.EMPTY : ByteString.copyFrom(start))
                     .setEndKey(end == null ? ByteString.EMPTY : ByteString.copyFrom(end))
                     .setLimit(Math.max(limit, 0))
@@ -253,6 +269,7 @@ public class TangDbClient implements AutoCloseable, KvStore, TransactionStore {
                         throw new ClientException("BE 扫描返回的 key 长度非法: " + userKey.length,
                                 "SCAN_FAILED");
                     }
+                    scanPayloadBytes.addAndGet(userKey.length + kv.getValue().size());
                     rows.add(new KeyValue(userKey, kv.getValue().toByteArray()));
                 }
             }
@@ -262,8 +279,293 @@ public class TangDbClient implements AutoCloseable, KvStore, TransactionStore {
         return rows;
     }
 
+    /**
+     * 固定一个快照给并发分片扫描用(SPEC-P6.1 FR-711)。
+     *
+     * <p>借 BeginTxn 取当前已提交水位并登记活跃快照(compaction 的 GC 水位不会越过它),
+     * 用完由 {@link #snapshotUnpin(long)} 释放。失败时返回 0(退回逐片读最新)。</p>
+     */
+    @Override
+    public long snapshotPin() {
+        try {
+            BeginTxnResponse response = stubWithDeadline().beginTxn(
+                    BeginTxnRequest.newBuilder().setReadOnly(true).build());
+            if (response.getStatus() != StatusCode.OK) {
+                return 0;
+            }
+            pinnedTxns.put(response.getSnapshot(), response.getTxnId());
+            return response.getSnapshot();
+        } catch (StatusRuntimeException e) {
+            return 0;
+        }
+    }
+
+    @Override
+    public void snapshotUnpin(long snapshot) {
+        if (snapshot <= 0) {
+            return;
+        }
+        Long txnId = pinnedTxns.remove(snapshot);
+        if (txnId != null) {
+            try {
+                abort(txnId);
+            } catch (RuntimeException ignored) {
+                // 释放失败不影响查询结果;BE 侧句柄最终随会话回收。
+            }
+        }
+    }
+
+    /** 自上次 {@link #resetScanPayloadBytes()} 以来,扫描收到的载荷字节数。 */
+    public long scanPayloadBytes() {
+        return scanPayloadBytes.get();
+    }
+
+    public void resetScanPayloadBytes() {
+        scanPayloadBytes.set(0);
+    }
+
+    /** 应用三档期限(SPEC-P6.1 FR-722);非法值忽略,沿用内置默认。 */
+    public TangDbClient withDeadlines(int rpcSeconds, int bulkSeconds, int scanSeconds) {
+        if (rpcSeconds > 0) {
+            this.rpcDeadlineSeconds = rpcSeconds;
+        }
+        if (bulkSeconds > 0) {
+            this.bulkDeadlineSeconds = bulkSeconds;
+        }
+        if (scanSeconds > 0) {
+            this.scanDeadlineSeconds = scanSeconds;
+        }
+        return this;
+    }
+
+    /** 当前三档期限(秒),日志与 EXPLAIN 用。 */
+    public long[] deadlines() {
+        return new long[]{rpcDeadlineSeconds, bulkDeadlineSeconds, scanDeadlineSeconds};
+    }
+
+    /**
+     * 带列投影 / 谓词下推 / 列式块的扫描(SPEC-P6.1 FR-701 ~ FR-707)。
+     *
+     * <p>返回的 value 是投影帧,不是整行;key 仍是用户键。BE 侧返回 columnar_block
+     * 时按块解码,否则按逐 KV 帧。</p>
+     */
+    @Override
+    public List<KeyValue> scanProjected(byte[] start, byte[] end, long snapshot, int limit,
+                                        com.wangyu.tangdb.storage.ScanOptions options)
+            throws ClientException {
+        com.wangyu.tangdb.storage.ScanOptions opts = options == null
+                ? com.wangyu.tangdb.storage.ScanOptions.plain(0) : options;
+        ScanRequest.Builder builder = ScanRequest.newBuilder()
+                .setStartKey(start == null ? ByteString.EMPTY : ByteString.copyFrom(start))
+                .setEndKey(end == null ? ByteString.EMPTY : ByteString.copyFrom(end))
+                .setLimit(Math.max(limit, 0))
+                .setSnapshot(Math.max(snapshot, 0))
+                .setBatchRows(Math.max(opts.batchRows(), 0))
+                .setColumnMask(opts.columnMask())
+                .setColumnarResult(opts.columnar());
+        if (opts.columnSlots().length > 0) {
+            builder.setColumnSlots(ByteString.copyFrom(opts.columnSlots()));
+        }
+        if (opts.rowFrame().length > 0) {
+            builder.setRowFrame(ByteString.copyFrom(opts.rowFrame()));
+        }
+        if (opts.predicate().length > 0) {
+            builder.setPredicate(ByteString.copyFrom(opts.predicate()));
+        }
+
+        Iterator<RowBatch> iterator;
+        try {
+            iterator = stubWithDeadline(scanDeadlineSeconds).scan(builder.build());
+        } catch (StatusRuntimeException e) {
+            throw translate(e, host, port);
+        }
+
+        List<KeyValue> rows = new ArrayList<>();
+        try {
+            while (iterator.hasNext()) {
+                RowBatch batch = iterator.next();
+                if (batch.getStatus() != StatusCode.OK) {
+                    String detail = batch.getMessage();
+                    throw new ClientException("BE 扫描失败"
+                            + (detail == null || detail.isBlank() ? "" : ": " + detail), "SCAN_FAILED");
+                }
+                if (!batch.getColumnarBlock().isEmpty()) {
+                    if (!batch.getRowsList().isEmpty()) {
+                        throw new ClientException("BE 同一批混用列式块与逐 KV(内部错误)", "SCAN_FAILED");
+                    }
+                    java.util.List<KeyValue> decoded = com.wangyu.tangdb.storage.ProjectedCodec
+                            .decodeBlock(batch.getColumnarBlock().toByteArray());
+                    for (KeyValue kv : decoded) {
+                        scanPayloadBytes.addAndGet(kv.key().length + kv.value().length);
+                    }
+                    rows.addAll(decoded);
+                    continue;
+                }
+                for (com.wangyu.tangdb.proto.Kv kv : batch.getRowsList()) {
+                    scanPayloadBytes.addAndGet(kv.getKey().size() + kv.getValue().size());
+                    rows.add(new KeyValue(kv.getKey().toByteArray(), kv.getValue().toByteArray()));
+                }
+            }
+        } catch (StatusRuntimeException e) {
+            throw translate(e, host, port);
+        }
+        return rows;
+    }
+
+    // ------------------------------------------------------------ 分批扫描游标(FR-715)
+
+    /**
+     * 打开可取消的分批扫描游标(SPEC-P6.1 FR-715)。
+     *
+     * <p>用 async server-streaming call 而不是 blocking stub 的 {@code Iterator}:
+     * 只有拿到 {@code ClientCall} 才能在 {@link ScanCursor#close()} 时真正 cancel 流,
+     * BE 侧才会停止继续扫描(而不是把整个范围跑完再丢弃)。</p>
+     */
+    @Override
+    public com.wangyu.tangdb.storage.ScanCursor openScan(byte[] start, byte[] end, long snapshot,
+                                                         int limit,
+                                                         com.wangyu.tangdb.storage.ScanOptions options) {
+        com.wangyu.tangdb.storage.ScanOptions opts = options == null
+                ? com.wangyu.tangdb.storage.ScanOptions.plain(0) : options;
+        ScanRequest.Builder builder = ScanRequest.newBuilder()
+                .setStartKey(start == null ? ByteString.EMPTY : ByteString.copyFrom(start))
+                .setEndKey(end == null ? ByteString.EMPTY : ByteString.copyFrom(end))
+                .setLimit(Math.max(limit, 0))
+                .setSnapshot(Math.max(snapshot, 0))
+                .setBatchRows(Math.max(opts.batchRows(), 0))
+                .setColumnMask(opts.columnMask())
+                .setColumnarResult(opts.columnar());
+        if (opts.columnSlots().length > 0) {
+            builder.setColumnSlots(ByteString.copyFrom(opts.columnSlots()));
+        }
+        if (opts.rowFrame().length > 0) {
+            builder.setRowFrame(ByteString.copyFrom(opts.rowFrame()));
+        }
+        if (opts.predicate().length > 0) {
+            builder.setPredicate(ByteString.copyFrom(opts.predicate()));
+        }
+        io.grpc.CallOptions callOptions = stub.getCallOptions()
+                .withDeadlineAfter(scanDeadlineSeconds, TimeUnit.SECONDS);
+        io.grpc.ClientCall<ScanRequest, RowBatch> call =
+                channel.newCall(TangDbGrpc.getScanMethod(), callOptions);
+        return new StreamCursor(call, builder.build());
+    }
+
+    /**
+     * 把 server-streaming 的 {@code RowBatch} 桥接成阻塞式分批游标。
+     *
+     * <p>背压:每消费一批才 {@code request(1)},上游最多领先一批;关闭时 cancel。</p>
+     */
+    private final class StreamCursor implements com.wangyu.tangdb.storage.ScanCursor {
+
+        private static final int QUEUE_CAPACITY = 8;
+        private static final Object DONE = new Object();
+
+        private final io.grpc.ClientCall<ScanRequest, RowBatch> call;
+        private final java.util.concurrent.BlockingQueue<Object> queue =
+                new java.util.concurrent.ArrayBlockingQueue<>(QUEUE_CAPACITY);
+        private volatile boolean closed;
+
+        StreamCursor(io.grpc.ClientCall<ScanRequest, RowBatch> call, ScanRequest request) {
+            this.call = call;
+            call.start(new io.grpc.ClientCall.Listener<RowBatch>() {
+                @Override
+                public void onMessage(RowBatch batch) {
+                    enqueue(batch);
+                }
+
+                @Override
+                public void onClose(io.grpc.Status status, io.grpc.Metadata trailers) {
+                    enqueue(status.isOk() ? DONE : status.asRuntimeException(trailers));
+                }
+            }, new io.grpc.Metadata());
+            call.request(1);
+            call.sendMessage(request);
+            call.halfClose();
+        }
+
+        private void enqueue(Object item) {
+            try {
+                queue.put(item);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+
+        @Override
+        public List<KeyValue> nextBatch() {
+            while (!closed) {
+                Object item;
+                try {
+                    item = queue.take();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new StoreException("流式扫描被中断", e);
+                }
+                if (item == DONE) {
+                    return null;
+                }
+                if (item instanceof StatusRuntimeException failure) {
+                    throw new StoreException(translate(failure, host, port).getMessage(), failure);
+                }
+                if (item instanceof Throwable failure) {
+                    throw new StoreException("流式扫描失败: " + failure.getMessage(), failure);
+                }
+                RowBatch batch = (RowBatch) item;
+                if (batch.getStatus() != StatusCode.OK) {
+                    String detail = batch.getMessage();
+                    throw new StoreException("BE 扫描失败"
+                            + (detail == null || detail.isBlank() ? "" : ": " + detail));
+                }
+                List<KeyValue> rows = batchRows(batch);
+                call.request(1); // 背压:消费一批再要下一批
+                if (!rows.isEmpty()) {
+                    return rows;
+                }
+            }
+            return null;
+        }
+
+        @Override
+        public void close() {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            try {
+                call.cancel("结果集已提前结束(不再向上游取数)", null);
+            } catch (RuntimeException ignored) {
+                // 已结束 / 已取消:不影响结果
+            }
+            queue.clear();
+            queue.offer(DONE); // 唤醒可能正在 take() 的消费方
+        }
+    }
+
+    /** 把一个 {@code RowBatch}(列式块或逐 KV)解成 KeyValue 列表。 */
+    private List<KeyValue> batchRows(RowBatch batch) {
+        if (!batch.getColumnarBlock().isEmpty()) {
+            if (!batch.getRowsList().isEmpty()) {
+                throw new StoreException("BE 同一批混用列式块与逐 KV(内部错误)");
+            }
+            List<KeyValue> decoded = com.wangyu.tangdb.storage.ProjectedCodec
+                    .decodeBlock(batch.getColumnarBlock().toByteArray());
+            for (KeyValue kv : decoded) {
+                scanPayloadBytes.addAndGet(kv.key().length + kv.value().length);
+            }
+            return decoded;
+        }
+        List<KeyValue> rows = new ArrayList<>(batch.getRowsCount());
+        for (com.wangyu.tangdb.proto.Kv kv : batch.getRowsList()) {
+            scanPayloadBytes.addAndGet(kv.getKey().size() + kv.getValue().size());
+            rows.add(new KeyValue(kv.getKey().toByteArray(), kv.getValue().toByteArray()));
+        }
+        return rows;
+    }
+
     @Override
     public byte[] get(byte[] key) {
+
         try {
             return getRaw(key);
         } catch (ClientException e) {
@@ -350,7 +652,7 @@ public class TangDbClient implements AutoCloseable, KvStore, TransactionStore {
 
         CommitTxnResponse response;
         try {
-            response = stubWithDeadline(COMMIT_DEADLINE_SECONDS).commitTxn(builder.build());
+            response = stubWithDeadline(bulkDeadlineSeconds).commitTxn(builder.build());
         } catch (StatusRuntimeException e) {
             throw new StoreException(translate(e, host, port).getMessage(), e);
         }
@@ -432,7 +734,7 @@ public class TangDbClient implements AutoCloseable, KvStore, TransactionStore {
      * 每次 RPC 都重新计算截止时间，避免固定 deadline 在客户端长时间运行后失效。
      */
     private TangDbGrpc.TangDbBlockingStub stubWithDeadline() {
-        return stubWithDeadline(RPC_DEADLINE_SECONDS);
+        return stubWithDeadline(rpcDeadlineSeconds);
     }
 
     private TangDbGrpc.TangDbBlockingStub stubWithDeadline(long seconds) {

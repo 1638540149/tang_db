@@ -235,18 +235,13 @@ public final class ConnectionHandler implements Runnable {
                 // FR-557:客户端未声明 CLIENT_MULTI_STATEMENTS → 只回最后一条的结果
                 // (前面的照常执行、结果丢弃),不追加多余结果集,避免协议错位。
                 Result last = results.get(results.size() - 1);
-                for (byte[] packet : ResultSetEncoder.forResult(last, status, clientSessionTrack)) {
-                    io.writePacket(packet);
-                }
+                ResultSetEncoder.writeTo(io, last, status, clientSessionTrack, false);
                 return;
             }
             // 声明了 → 逐条回;非最后一条的结束包带 SERVER_MORE_RESULTS_EXISTS(FR-557)。
             for (int i = 0; i < results.size(); i++) {
                 boolean more = i < results.size() - 1;
-                for (byte[] packet : ResultSetEncoder.forResult(
-                        results.get(i), status, clientSessionTrack, more)) {
-                    io.writePacket(packet);
-                }
+                ResultSetEncoder.writeTo(io, results.get(i), status, clientSessionTrack, more);
             }
         } catch (SqlError e) {
             // FR-558:某条失败只回该条的错误包、不带 MORE 位,后续语句未执行,连接保持。

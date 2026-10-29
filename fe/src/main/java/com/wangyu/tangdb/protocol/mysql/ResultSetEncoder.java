@@ -4,6 +4,7 @@ import com.wangyu.tangdb.execute.Result;
 import com.wangyu.tangdb.storage.Values;
 
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.time.LocalDate;
 import java.util.ArrayList;
@@ -50,6 +51,9 @@ public final class ResultSetEncoder {
             String info = includeInfo ? message.text() : null;
             return List.of(okPacket(affected, 0, terminalStatus, 0, info));
         }
+        if (result instanceof Result.StreamTable streaming) {
+            return drain(streaming, statusFlags, terminalStatus);
+        }
         Result.Table table = (Result.Table) result;
         List<ColumnInfo> columns = new ArrayList<>(table.columns().size());
         int[] types = inferTypes(table);
@@ -70,7 +74,134 @@ public final class ResultSetEncoder {
         return packets;
     }
 
+    // ------------------------------------------------------------ 流式写出(FR-715)
+
+    /**
+     * 直接把结果写进协议连接(SPEC-P6.1 FR-715)。
+     *
+     * <p>普通提示 / 物化结果集与 {@link #forResult} 逐字节一致;流式结果集则
+     * 按批取数、按批写包,不再先攒出整张结果集的包列表。</p>
+     */
+    public static void writeTo(PacketIO io, Result result, int statusFlags, boolean includeInfo,
+                               boolean moreResults) throws IOException {
+        int terminalStatus = moreResults
+                ? statusFlags | Protocol.SERVER_MORE_RESULTS_EXISTS
+                : statusFlags;
+        if (result instanceof Result.StreamTable streaming) {
+            writeStream(io, streaming, statusFlags, terminalStatus);
+            return;
+        }
+        for (byte[] packet : forResult(result, statusFlags, includeInfo, moreResults)) {
+            io.writePacket(packet);
+        }
+    }
+
+    /**
+     * 流式结果集的报文序列与物化结果集完全相同:列数 → 列定义 → EOF → 行 → EOF。
+     *
+     * <p>列类型先按"前若干批"推断(与物化路径的全量推断同口径:取每列第一个非 NULL 值),
+     * 因此常见的全 NULL 列、数值列都不会因为流式而改类型。</p>
+     */
+    private static void writeStream(PacketIO io, Result.StreamTable streaming, int statusFlags,
+                                    int terminalStatus) throws IOException {
+        List<String> columns = streaming.columns();
+        List<Object[]> pending = new ArrayList<>();
+        int[] types = new int[columns.size()];
+        java.util.Arrays.fill(types, TYPE_VAR_STRING);
+        boolean typed = columns.isEmpty();
+        int primed = 0;
+        boolean done = false;
+        // 先缓冲前若干批用于类型推断(上限 8192 行,内存有界)
+        while (!typed && primed < 8192) {
+            List<Object[]> batch = streaming.stream().nextBatch();
+            if (batch == null) {
+                done = true;
+                break;
+            }
+            pending.addAll(batch);
+            primed += batch.size();
+            typed = inferTypes(types, pending);
+        }
+        try {
+            io.writePacket(lenencInt(columns.size()));
+            for (int i = 0; i < columns.size(); i++) {
+                io.writePacket(columnDefPacket(new ColumnInfo(columns.get(i), types[i])));
+            }
+            io.writePacket(eofPacket(0, statusFlags));
+            for (Object[] row : pending) {
+                io.writePacket(rowPacket(row));
+            }
+            while (!done) {
+                List<Object[]> batch = streaming.stream().nextBatch();
+                if (batch == null) {
+                    break;
+                }
+                for (Object[] row : batch) {
+                    io.writePacket(rowPacket(row));
+                }
+            }
+            io.writePacket(eofPacket(0, terminalStatus));
+        } finally {
+            streaming.stream().close();
+        }
+    }
+
+    /** 把流式结果抽干成普通包列表(单测 / 一次性 API 用;服务端走 writeTo 不经过这里)。 */
+    private static List<byte[]> drain(Result.StreamTable streaming, int statusFlags,
+                                      int terminalStatus) {
+        List<String> columns = streaming.columns();
+        List<Object[]> rows = new ArrayList<>();
+        try {
+            while (true) {
+                List<Object[]> batch = streaming.stream().nextBatch();
+                if (batch == null) {
+                    break;
+                }
+                rows.addAll(batch);
+            }
+        } finally {
+            streaming.stream().close();
+        }
+        Result.Table table = new Result.Table(columns, rows);
+        List<byte[]> packets = new ArrayList<>();
+        packets.add(lenencInt(columns.size()));
+        int[] types = inferTypes(table);
+        for (int i = 0; i < columns.size(); i++) {
+            packets.add(columnDefPacket(new ColumnInfo(columns.get(i), types[i])));
+        }
+        packets.add(eofPacket(0, statusFlags));
+        for (Object[] row : rows) {
+            packets.add(rowPacket(row));
+        }
+        packets.add(eofPacket(0, terminalStatus));
+        return packets;
+    }
+
+    /** 用已缓冲的行填充列类型;所有列都定好类型时返回 true。 */
+    private static boolean inferTypes(int[] types, List<Object[]> rows) {
+        boolean all = true;
+        for (int c = 0; c < types.length; c++) {
+            if (types[c] != TYPE_VAR_STRING) {
+                continue;
+            }
+            boolean found = false;
+            for (Object[] row : rows) {
+                Object value = c < row.length ? row[c] : null;
+                if (value != null) {
+                    types[c] = typeOf(value);
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                all = false;
+            }
+        }
+        return all;
+    }
+
     // ------------------------------------------------------------ 包编码
+
 
     public static byte[] okPacket(long affectedRows, long lastInsertId, int statusFlags, int warnings) {
         return okPacket(affectedRows, lastInsertId, statusFlags, warnings, null);

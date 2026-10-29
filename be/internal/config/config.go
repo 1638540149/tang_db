@@ -36,6 +36,9 @@ var crashPoints = map[string]bool{
 	// SPEC-P5 ★P5-2:compaction 中途强杀的两个注入点。
 	"compaction_after_write":    true,
 	"compaction_after_manifest": true,
+	// SPEC-P6.1 FR-728:group commit 的两个新注入点。
+	"fsync_mid_group":  true,
+	"fsync_after_done": true,
 }
 
 // 心跳相关默认值(见 P2 规约 FR-160)。
@@ -45,15 +48,25 @@ const (
 	DefaultHeartbeatIntervalSeconds = 3
 )
 
+// SPEC-P6.1 §5.2 写路径默认值。
+const (
+	// DefaultWALBufferBytes 是 WAL 追加缓冲池的默认大小(FR-700)。
+	DefaultWALBufferBytes int64 = 1 * 1024 * 1024
+	// DefaultGroupCommitMaxBatch 是一次 fsync 最多合并的提交数(FR-700 / K149)。
+	DefaultGroupCommitMaxBatch = 64
+	// DefaultGroupCommitMaxWaitMS 是攒批的最长等待(毫秒,FR-700 / K149)。
+	DefaultGroupCommitMaxWaitMS = 5
+)
+
 // P5 compaction 与列式编码默认值(SPEC-P5 §5.4)。
 const (
-	DefaultQueryBatchRows        = 1024
-	DefaultCompactionL0Files     = 4
-	DefaultCompactionLevelRatio  = 10
-	DefaultCompactionLevelMax    = 256 * 1024 * 1024
-	DefaultCompactionBloom       = true
-	DefaultSortSpillBytes  int64 = 64 * 1024 * 1024
-	DefaultCSVImportBatchRows    = 5000
+	DefaultQueryBatchRows             = 1024
+	DefaultCompactionL0Files          = 4
+	DefaultCompactionLevelRatio       = 10
+	DefaultCompactionLevelMax         = 256 * 1024 * 1024
+	DefaultCompactionBloom            = true
+	DefaultSortSpillBytes       int64 = 64 * 1024 * 1024
+	DefaultCSVImportBatchRows         = 5000
 )
 
 // Config 是 BE 的启动配置。
@@ -79,6 +92,11 @@ type Config struct {
 	CompactionBloomEnabled  bool  // chunk 级布隆过滤
 	SortSpillBytes          int64 // 排序溢写阈值
 	CSVImportBatchRows      int   // CSV 导入批大小
+
+	// ---- SPEC-P6.1 §5.2(写路径)----
+	WALBufferBytes      int64 // WAL 追加缓冲池大小
+	GroupCommitMaxBatch int   // 一次 fsync 最多合并的提交数
+	GroupCommitMaxWait  int   // 攒批最长等待(毫秒);0 = 不等待
 }
 
 // Default 返回内置默认配置。
@@ -99,6 +117,9 @@ func Default() Config {
 		CompactionBloomEnabled:   DefaultCompactionBloom,
 		SortSpillBytes:           DefaultSortSpillBytes,
 		CSVImportBatchRows:       DefaultCSVImportBatchRows,
+		WALBufferBytes:           DefaultWALBufferBytes,
+		GroupCommitMaxBatch:      DefaultGroupCommitMaxBatch,
+		GroupCommitMaxWait:       DefaultGroupCommitMaxWaitMS,
 	}
 }
 
@@ -228,6 +249,27 @@ func Parse(r io.Reader) (Config, error) {
 				return Config{}, fmt.Errorf("第 %d 行 csv_import_batch_rows 无效:%q(应为 1-10000000)", lineNo, value)
 			}
 			cfg.CSVImportBatchRows = n
+		case "wal_buffer_bytes":
+			size, err := ParseSize(value)
+			if err != nil {
+				return Config{}, fmt.Errorf("第 %d 行 wal_buffer_bytes 无效:%v", lineNo, err)
+			}
+			if size < 64*1024 || size > 256*1024*1024 {
+				return Config{}, fmt.Errorf("第 %d 行 wal_buffer_bytes 无效:%q(应为 64KB-256MB)", lineNo, value)
+			}
+			cfg.WALBufferBytes = size
+		case "group_commit_max_batch":
+			n, err := strconv.Atoi(value)
+			if err != nil || n < 1 || n > 65536 {
+				return Config{}, fmt.Errorf("第 %d 行 group_commit_max_batch 无效:%q(应为 1-65536)", lineNo, value)
+			}
+			cfg.GroupCommitMaxBatch = n
+		case "group_commit_max_wait_ms":
+			n, err := strconv.Atoi(value)
+			if err != nil || n < 0 || n > 1000 {
+				return Config{}, fmt.Errorf("第 %d 行 group_commit_max_wait_ms 无效:%q(应为 0-1000)", lineNo, value)
+			}
+			cfg.GroupCommitMaxWait = n
 		default:
 			return Config{}, fmt.Errorf("第 %d 行未知配置项:%q", lineNo, key)
 		}

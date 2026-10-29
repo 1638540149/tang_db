@@ -48,7 +48,8 @@ public final class QueryEngine {
                           Path sortTmpDir, boolean vectorized,
                           com.wangyu.tangdb.planner.OptimizerConfig optimizer,
                           com.wangyu.tangdb.stats.StatsService stats,
-                          com.wangyu.tangdb.execute.VirtualTables virtualTables) {
+                          com.wangyu.tangdb.execute.VirtualTables virtualTables,
+                          int parallelism, boolean pushdown, int scanBatchRows) {
 
         public Options {
             if (optimizer == null) {
@@ -56,6 +57,12 @@ public final class QueryEngine {
             }
             if (virtualTables == null) {
                 virtualTables = com.wangyu.tangdb.execute.VirtualTables.NONE;
+            }
+            if (parallelism < 1) {
+                parallelism = 1;
+            }
+            if (scanBatchRows < 1) {
+                scanBatchRows = batchRows;
             }
         }
 
@@ -76,11 +83,28 @@ public final class QueryEngine {
                     com.wangyu.tangdb.execute.VirtualTables.NONE);
         }
 
+        /** 8 参构造(虚拟表非空;P6.1 的执行层参数取默认值)。 */
+        public Options(String currentDatabase, int batchRows, long sortSpillBytes,
+                       Path sortTmpDir, boolean vectorized,
+                       com.wangyu.tangdb.planner.OptimizerConfig optimizer,
+                       com.wangyu.tangdb.stats.StatsService stats,
+                       com.wangyu.tangdb.execute.VirtualTables virtualTables) {
+            this(currentDatabase, batchRows, sortSpillBytes, sortTmpDir, vectorized, optimizer,
+                    stats, virtualTables, 1, false, batchRows);
+        }
+
         /** 附带虚拟表访问器(SPEC-P6 FR-667)。 */
         public Options withVirtualTables(com.wangyu.tangdb.execute.VirtualTables tables) {
             return new Options(currentDatabase, batchRows, sortSpillBytes, sortTmpDir, vectorized,
                     optimizer, stats, tables == null
-                    ? com.wangyu.tangdb.execute.VirtualTables.NONE : tables);
+                    ? com.wangyu.tangdb.execute.VirtualTables.NONE : tables,
+                    parallelism, pushdown, scanBatchRows);
+        }
+
+        /** 设置 SPEC-P6.1 的执行层参数(并行度 / 下推开关 / 扫描批)。 */
+        public Options withExecution(int parallelism, boolean pushdown, int scanBatchRows) {
+            return new Options(currentDatabase, batchRows, sortSpillBytes, sortTmpDir, vectorized,
+                    optimizer, stats, virtualTables, parallelism, pushdown, scanBatchRows);
         }
 
         public static Options defaults(String database) {
@@ -125,7 +149,9 @@ public final class QueryEngine {
         this.evaluator = new Evaluator(aggregateValues, subqueryValues, this.warnings);
         this.evaluator.withSubqueryResolver(this::subqueryValueForEval);
         this.batchEvaluator = new BatchEvaluator(subqueryValues);
-        this.sorter = new Sorter(this.options.sortSpillBytes(), this.options.sortTmpDir());
+        // SPEC-P6.1 FR-714:并行度 1 时 Sorter 走原单线程路径(逐行同序)
+        this.sorter = new Sorter(this.options.sortSpillBytes(), this.options.sortTmpDir(),
+                this.options.parallelism());
     }
 
     public QueryEngine withOuterSchema(Schema schema) {
@@ -154,6 +180,186 @@ public final class QueryEngine {
     public Result.Table execute(Ast.QueryBody body) {
         Relation relation = run(body);
         return new Result.Table(relation.schema.names(), relation.rows);
+    }
+
+    // ------------------------------------------------------------ 流式结果(FR-715)
+
+    /**
+     * 把"简单单表查询"做成流式结果集(SPEC-P6.1 FR-715)。
+     *
+     * <p>满足以下条件才走流式,否则返回 null 由调用方退回物化路径
+     * (结果逐行一致,只是内存占用不同):</p>
+     * <ul>
+     *   <li>单表、无 JOIN / 派生表 / 虚拟表、无 DISTINCT / GROUP BY / HAVING / ORDER BY;</li>
+     *   <li>投影与 WHERE 里没有聚合、没有子查询(不需要预求值);</li>
+     *   <li>最新已提交视图 + 存储在 {@link com.wangyu.tangdb.storage.CursoredStore}
+     *       上(真实 BE 客户端;事务视图与内存实现退回物化);</li>
+     *   <li>访问路径是全表范围(点查 / 索引路径本来就只取少量行)。</li>
+     * </ul>
+     *
+     * <p>{@code LIMIT} 不再下推给扫描,而是"取够就 close 游标"—— 上游不再继续扫描,
+     * 内存只与一批行数相关。</p>
+     */
+    public Result.StreamTable stream(Ast.QueryBody body) {
+        if (body.from() == null || body.distinct() || !body.groupBy().isEmpty()
+                || body.having() != null || !body.orderBy().isEmpty()
+                || !body.from().joins().isEmpty()) {
+            return null;
+        }
+        for (Ast.SelectItem item : body.items()) {
+            if (item.expr() != null
+                    && (containsAggregate(item.expr()) || containsSubquery(item.expr()))) {
+                return null;
+            }
+        }
+        if (containsSubquery(body.where())) {
+            return null; // 子查询要预求值,交给物化路径
+        }
+        if (!view.isLatest()
+                || !(kv instanceof com.wangyu.tangdb.storage.CursoredStore cursored)) {
+            return null;
+        }
+        FromPlan plan = buildFromPlan(body);
+        if (plan.sqlOrder.size() != 1) {
+            return null;
+        }
+        SourcePlan source = plan.sqlOrder.get(0);
+        if (source.table == null || source.derived() || source.virtualName != null) {
+            return null;
+        }
+        com.wangyu.tangdb.planner.Plan access = source.access == null ? null : source.access.plan();
+        if (access != null && access.kind() != com.wangyu.tangdb.planner.Plan.Kind.RANGE) {
+            return null;
+        }
+        TableMeta table = source.table;
+        byte[] start = access == null ? KeyCodec.tableRangeStart(table.id()) : access.start();
+        byte[] end = access == null ? KeyCodec.tableRangeEnd(table.id()) : access.end();
+
+        com.wangyu.tangdb.storage.ProjectedCodec.Plan projection = projectionFor(source, table);
+        com.wangyu.tangdb.storage.ScanOptions scanOptions = null;
+        if (projection != null) {
+            byte[] predicate = PredicateCodec.compile(source.pushed, table, source.qualifier);
+            scanOptions = new com.wangyu.tangdb.storage.ScanOptions(options.scanBatchRows(),
+                    projection.mask(), projection.columnSlots(), projection.rowFrame(), predicate,
+                    true);
+        }
+        // 列名先算出来(空结果也要能给出正确的列定义)
+        Schema columnsOnly = project(List.of(), source.schema, body.items(), false, body,
+                Map.of()).schema;
+        com.wangyu.tangdb.storage.ScanCursor cursor = cursored.openScan(start, end, 0, 0,
+                scanOptions);
+        return new Result.StreamTable(columnsOnly.names(),
+                new StreamingRows(cursor, source, table, projection, body));
+    }
+
+    /** 游标 → 结果批的行源:逐批解码、过滤、投影,并按 LIMIT 提前收尾。 */
+    private final class StreamingRows implements com.wangyu.tangdb.execute.RowStream {
+
+        private final com.wangyu.tangdb.storage.ScanCursor cursor;
+        private final SourcePlan source;
+        private final TableMeta table;
+        private final com.wangyu.tangdb.storage.ProjectedCodec.Plan projection;
+        private final com.wangyu.tangdb.storage.ProjectedCodec.Decoder decoder;
+        private final Ast.QueryBody body;
+        private final int offset;
+        private final Integer limit;
+        private int skipped;
+        private int emitted;
+        private boolean closed;
+
+        StreamingRows(com.wangyu.tangdb.storage.ScanCursor cursor, SourcePlan source,
+                      TableMeta table, com.wangyu.tangdb.storage.ProjectedCodec.Plan projection,
+                      Ast.QueryBody body) {
+            this.cursor = cursor;
+            this.source = source;
+            this.table = table;
+            this.projection = projection;
+            this.decoder = projection == null ? null
+                    : new com.wangyu.tangdb.storage.ProjectedCodec.Decoder(table, projection);
+            this.body = body;
+            this.offset = body.offset() == null ? 0 : body.offset();
+            this.limit = body.limit();
+        }
+
+        @Override
+        public List<String> columns() {
+            return project(List.of(), source.schema, body.items(), false, body, Map.of())
+                    .schema.names();
+        }
+
+        @Override
+        public List<Object[]> nextBatch() {
+            while (!closed) {
+                if (limit != null && emitted >= limit) {
+                    close();
+                    return null;
+                }
+                List<KeyValue> batch = cursor.nextBatch();
+                if (batch == null) {
+                    close();
+                    return null;
+                }
+                List<Object[]> out = projectBatch(batch);
+                if (!out.isEmpty()) {
+                    return out;
+                }
+            }
+            return null;
+        }
+
+        private List<Object[]> projectBatch(List<KeyValue> batch) {
+            List<Object[]> rows = new ArrayList<>(batch.size());
+            for (KeyValue kv : batch) {
+                if (KeyCodec.indexId(kv.key()) != KeyCodec.INDEX_ID_PRIMARY) {
+                    continue; // 同一表前缀下的索引项
+                }
+                if (projection != null) {
+                    rows.add(decoder.decodeInto(kv.value(), new Object[table.columnCount()]));
+                    continue;
+                }
+                byte[] raw = kv.value();
+                if (raw != null && raw.length > 0 && raw[0] == RowCodec.FORMAT_TOMBSTONE) {
+                    continue;
+                }
+                RowCodec.Decoded decoded = source.needed == null
+                        ? RowCodec.decode(table, raw) : RowCodec.decode(table, raw, source.needed);
+                if (decoded.tombstone()) {
+                    continue;
+                }
+                rows.add(decoded.values());
+            }
+            Relation relation = new Relation(source.schema, rows, rows.size(), null);
+            if (source.pushed != null) {
+                relation = filter(relation, source.pushed);
+            }
+            if (body.where() != null) {
+                relation = filter(relation, body.where());
+            }
+            Projection projected = project(relation.rows, source.schema, body.items(), false, body,
+                    Map.of());
+            List<Object[]> out = new ArrayList<>(projected.rows.size());
+            for (Object[] row : projected.rows) {
+                if (skipped < offset) {
+                    skipped++;
+                    continue;
+                }
+                if (limit != null && emitted >= limit) {
+                    break;
+                }
+                out.add(row);
+                emitted++;
+            }
+            return out;
+        }
+
+        @Override
+        public void close() {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            cursor.close();
+        }
     }
 
     /** 行结果(单测 / 子查询复用)。 */
@@ -649,7 +855,8 @@ public final class QueryEngine {
         // LIMIT 下推只在"扫描侧没有任何过滤"时成立:谓词在 FE 侧执行,先截断会漏行。
         boolean limitPushdown = sqlOrder.size() == 1 && body.groupBy().isEmpty()
                 && body.having() == null && body.orderBy().isEmpty()
-                && body.where() == null && body.limit() != null;
+                && body.limit() != null
+                && (body.where() == null || fullyPushable(sqlOrder.get(0)));
         int scanLimit = limitPushdown
                 ? body.limit() + (body.offset() == null ? 0 : body.offset()) : 0;
 
@@ -827,7 +1034,31 @@ public final class QueryEngine {
         }
         byte[] start = plan == null ? KeyCodec.tableRangeStart(table.id()) : plan.start();
         byte[] end = plan == null ? KeyCodec.tableRangeEnd(table.id()) : plan.end();
-        List<KeyValue> kvs = view.scan(start, end, scanLimit);
+
+        // SPEC-P6.1 FR-701 / FR-703:列投影 + 谓词下推(开关关闭时走原全行路径)。
+        com.wangyu.tangdb.storage.ProjectedCodec.Plan projection = projectionFor(source, table);
+        if (projection != null) {
+            byte[] predicate = PredicateCodec.compile(source.pushed, table, source.qualifier);
+            com.wangyu.tangdb.storage.ScanOptions scanOptions =
+                    new com.wangyu.tangdb.storage.ScanOptions(options.scanBatchRows(),
+                            projection.mask(), projection.columnSlots(), projection.rowFrame(),
+                            predicate, true);
+            List<KeyValue> projected = scanShards(start, end, scanLimit, scanOptions);
+            // SPEC-P6.1 FR-716:解码复用缓冲(短值/数值装箱缓存),只保留每行一个结果数组。
+            com.wangyu.tangdb.storage.ProjectedCodec.Decoder decoder =
+                    new com.wangyu.tangdb.storage.ProjectedCodec.Decoder(table, projection);
+            for (KeyValue row : projected) {
+                if (KeyCodec.indexId(row.key()) != KeyCodec.INDEX_ID_PRIMARY) {
+                    continue;
+                }
+                rows.add(decoder.decodeInto(row.value(),
+                        new Object[table.columnCount()]));
+                seq.add(new long[]{seq.size()});
+            }
+            return new Relation(source.schema, rows, source.estimatedRows, seq);
+        }
+
+        List<KeyValue> kvs = scanShards(start, end, scanLimit, null);
         for (KeyValue row : kvs) {
             if (KeyCodec.indexId(row.key()) != KeyCodec.INDEX_ID_PRIMARY) {
                 continue;
@@ -846,6 +1077,145 @@ public final class QueryEngine {
             seq.add(new long[]{seq.size()});
         }
         return new Relation(source.schema, rows, source.estimatedRows, seq);
+    }
+
+    /**
+     * 单表谓词是否**整条**都能下推。只有这样才能把 LIMIT 也推到扫描:
+     * BE 先过滤再截断 ⇒ 结果与"FE 过滤后截断"一致(SC-406 / 边界 #120)。
+     */
+    private boolean fullyPushable(SourcePlan source) {
+        return options.pushdown() && source.table != null && source.pushed != null
+                && PredicateCodec.compileFully(source.pushed, source.table, source.qualifier) != null;
+    }
+
+    /**
+     * 按 key 范围分片并发扫描(SPEC-P6.1 FR-705 / FR-711)。
+     *
+     * <ul>
+     *   <li>只在"无 LIMIT 下推、最新视图、真实可投影客户端、并行度 &gt; 1"时并发;</li>
+     *   <li>各片按片序拼接 ⇒ 行集合与行序与单线程扫描完全一致;</li>
+     *   <li>所有片共用一个固定快照,并发写不会让不同片看到不同版本(★P6.1-3);</li>
+     *   <li>任何一片失败 → 整条查询失败,不返回部分结果(边界 #121)。</li>
+     * </ul>
+     */
+    private List<KeyValue> scanShards(byte[] start, byte[] end, int limit,
+                                      com.wangyu.tangdb.storage.ScanOptions scanOptions) {
+        int shards = this.options.parallelism();
+        boolean canParallel = shards > 1 && limit <= 0 && view.isLatest()
+                && start != null && end != null && end.length > 0
+                && kv instanceof com.wangyu.tangdb.storage.ProjectingStore;
+        if (!canParallel) {
+            return scanOptions == null ? view.scan(start, end, limit)
+                    : view.scanProjected(start, end, limit, scanOptions);
+        }
+        List<byte[]> bounds = shardBoundaries(start, end, shards);
+        if (bounds.size() <= 2) {
+            return scanOptions == null ? view.scan(start, end, limit)
+                    : view.scanProjected(start, end, limit, scanOptions);
+        }
+
+        com.wangyu.tangdb.storage.ProjectingStore store =
+                (com.wangyu.tangdb.storage.ProjectingStore) kv;
+        long snapshot = kv.snapshotPin();
+        java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors
+                .newFixedThreadPool(Math.min(shards, bounds.size() - 1), r -> {
+                    Thread t = new Thread(r, "tangdb-scan-shard");
+                    t.setDaemon(true);
+                    return t;
+                });
+        try {
+            List<java.util.concurrent.Future<List<KeyValue>>> futures = new ArrayList<>();
+            for (int i = 0; i + 1 < bounds.size(); i++) {
+                byte[] from = bounds.get(i);
+                byte[] to = bounds.get(i + 1);
+                futures.add(pool.submit(() -> {
+                    if (scanOptions == null) {
+                        return kv.scan(from, to, snapshot, 0);
+                    }
+                    try {
+                        return store.scanProjected(from, to, snapshot, 0, scanOptions);
+                    } catch (com.wangyu.tangdb.client.ClientException e) {
+                        throw new com.wangyu.tangdb.storage.StoreException(e.getMessage(), e);
+                    }
+                }));
+            }
+            List<KeyValue> out = new ArrayList<>();
+            for (java.util.concurrent.Future<List<KeyValue>> future : futures) {
+                try {
+                    out.addAll(future.get());
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new com.wangyu.tangdb.storage.StoreException("并行扫描被中断", e);
+                } catch (java.util.concurrent.ExecutionException e) {
+                    Throwable cause = e.getCause() == null ? e : e.getCause();
+                    throw new com.wangyu.tangdb.storage.StoreException(
+                            "并行扫描失败(整条查询失败,不返回部分结果): " + cause.getMessage(), cause);
+                }
+            }
+            return out;
+        } finally {
+            pool.shutdownNow();
+            kv.snapshotUnpin(snapshot);
+        }
+    }
+
+    /**
+     * 把 [start, end) 按字节空间等分成 shards 片的边界(SPEC-P6.1 FR-705)。
+     *
+     * <p>首片一律从原始 start 开始:把 start 右补 0 会漏掉"用户键恰好等于 start"的那一行。</p>
+     */
+    static List<byte[]> shardBoundaries(byte[] start, byte[] end, int shards) {
+        List<byte[]> out = new ArrayList<>();
+        out.add(start);
+        if (shards <= 1 || end == null || end.length == 0) {
+            out.add(end);
+            return out;
+        }
+        int len = Math.max(start.length, end.length);
+        java.math.BigInteger from = new java.math.BigInteger(1,
+                start.length == 0 ? new byte[]{0} : start);
+        java.math.BigInteger to = new java.math.BigInteger(1, end);
+        if (to.compareTo(from) <= 0) {
+            out.add(end);
+            return out;
+        }
+        java.math.BigInteger span = to.subtract(from);
+        for (int i = 1; i < shards; i++) {
+            java.math.BigInteger point = from.add(span
+                    .multiply(java.math.BigInteger.valueOf(i))
+                    .divide(java.math.BigInteger.valueOf(shards)));
+            byte[] boundary = toFixedBytes(point, len);
+            byte[] previous = out.get(out.size() - 1);
+            if (Arrays.compareUnsigned(boundary, previous) > 0
+                    && Arrays.compareUnsigned(boundary, end) < 0) {
+                out.add(boundary);
+            }
+        }
+        out.add(end);
+        return out;
+    }
+
+    private static byte[] toFixedBytes(java.math.BigInteger value, int len) {
+        byte[] raw = value.toByteArray();
+        byte[] out = new byte[len];
+        int copy = Math.min(raw.length, len);
+        System.arraycopy(raw, raw.length - copy, out, len - copy, copy);
+        return out;
+    }
+
+    /**
+     * 计算某来源的投影方案(SPEC-P6.1 FR-701)。
+     *
+     * <p>{@code pushdown_enabled=false} 时返回 null,调用方走原全行路径 ——
+     * 这是"与 P6 逐行一致"的回退保证(FR-710 / FR-718)。</p>
+     */
+    private com.wangyu.tangdb.storage.ProjectedCodec.Plan projectionFor(SourcePlan source,
+                                                                       TableMeta table) {
+        if (!options.pushdown() || table == null) {
+            return null;
+        }
+        boolean[] needed = source.needed == null ? allColumns(table) : source.needed;
+        return com.wangyu.tangdb.storage.ProjectedCodec.plan(table, needed);
     }
 
     /** 索引区间扫描 + 逐行回表 + 二次校验(与执行器同口径,FR-511)。 */
@@ -1112,12 +1482,30 @@ public final class QueryEngine {
                               List<EquiPair> pairs, Schema combined, boolean buildLeft) {
         Relation build = buildLeft ? left : right;
         Relation probe = buildLeft ? right : left;
-
-        Map<List<Object>, List<Integer>> table = new LinkedHashMap<>();
         int[] buildKeyIdx = new int[pairs.size()];
         for (int i = 0; i < pairs.size(); i++) {
             buildKeyIdx[i] = buildLeft ? pairs.get(i).leftIndex() : pairs.get(i).rightIndex();
         }
+        int[] probeKeyIdx = new int[pairs.size()];
+        for (int i = 0; i < pairs.size(); i++) {
+            probeKeyIdx[i] = buildLeft ? pairs.get(i).rightIndex() : pairs.get(i).leftIndex();
+        }
+        // SPEC-P6.1 FR-712:build 按哈希桶分段并行构建 + probe 并行,再按稳定顺序合并。
+        // 并行度 1 / 行数太少 / ON 里有子查询 ⇒ 走原单线程循环(结果与之逐行同序)。
+        int parallelism = parallelTasks(build.rows.size() + probe.rows.size(), 2048);
+        if (parallelism <= 1 || (on != null && containsSubquery(on))) {
+            return hashJoinSerial(left, right, on, combined, buildLeft, build, probe,
+                    buildKeyIdx, probeKeyIdx);
+        }
+        return hashJoinParallel(left, right, on, combined, buildLeft, build, probe,
+                buildKeyIdx, probeKeyIdx, parallelism);
+    }
+
+    /** 原单线程哈希连接(并行度 1 的路径,SC-415 的对拍基准)。 */
+    private Relation hashJoinSerial(Relation left, Relation right, Ast.Expr on, Schema combined,
+                                    boolean buildLeft, Relation build, Relation probe,
+                                    int[] buildKeyIdx, int[] probeKeyIdx) {
+        Map<List<Object>, List<Integer>> table = new LinkedHashMap<>();
         for (int r = 0; r < build.rows.size(); r++) {
             List<Object> key = keyOf(build.rows.get(r), buildKeyIdx);
             if (key == null) {
@@ -1126,10 +1514,6 @@ public final class QueryEngine {
             table.computeIfAbsent(key, k -> new ArrayList<>()).add(r);
         }
 
-        int[] probeKeyIdx = new int[pairs.size()];
-        for (int i = 0; i < pairs.size(); i++) {
-            probeKeyIdx[i] = buildLeft ? pairs.get(i).rightIndex() : pairs.get(i).leftIndex();
-        }
         List<Object[]> out = new ArrayList<>();
         List<long[]> outSeq = new ArrayList<>();
         boolean[] matchedBuild = new boolean[build.rows.size()];
@@ -1170,6 +1554,98 @@ public final class QueryEngine {
             }
         }
         return new Relation(combined, out, out.size(), outSeq);
+    }
+
+    /**
+     * 分桶并行的哈希连接(SPEC-P6.1 FR-712)。
+     *
+     * <ul>
+     *   <li>build 侧按连接键哈希分桶,桶内行序不变 ⇒ 桶内匹配顺序与单线程一致;</li>
+     *   <li>probe 侧按行序切片并行,结果按片序拼接 ⇒ 输出行序与单线程一致;</li>
+     *   <li>probe key 只会落进同一个桶,lookup 不跨桶;</li>
+     *   <li>LEFT JOIN 补空行位置不变:probe 侧补空在片内当场产生,
+     *       build 侧未匹配行按 build 行序统一追加在末尾。</li>
+     * </ul>
+     */
+    private Relation hashJoinParallel(Relation left, Relation right, Ast.Expr on, Schema combined,
+                                      boolean buildLeft, Relation build, Relation probe,
+                                      int[] buildKeyIdx, int[] probeKeyIdx, int parallelism) {
+        List<List<Integer>> partitioned = new ArrayList<>(parallelism);
+        for (int i = 0; i < parallelism; i++) {
+            partitioned.add(new ArrayList<>());
+        }
+        for (int r = 0; r < build.rows.size(); r++) {
+            List<Object> key = keyOf(build.rows.get(r), buildKeyIdx);
+            if (key == null) {
+                continue; // NULL 连接键不入表(FR-592)
+            }
+            partitioned.get(Math.floorMod(key.hashCode(), parallelism)).add(r);
+        }
+        List<Map<List<Object>, List<Integer>>> tables = Parallel.run(parallelism, parallelism, i -> {
+            Map<List<Object>, List<Integer>> map = new LinkedHashMap<>();
+            for (int r : partitioned.get(i)) {
+                List<Object> key = keyOf(build.rows.get(r), buildKeyIdx);
+                map.computeIfAbsent(key, k -> new ArrayList<>()).add(r);
+            }
+            return map;
+        });
+
+        java.util.concurrent.atomic.AtomicIntegerArray matchedBuild = buildLeft
+                ? new java.util.concurrent.atomic.AtomicIntegerArray(build.rows.size()) : null;
+        int[][] ranges = Parallel.ranges(probe.rows.size(), parallelism);
+        List<JoinChunk> chunks = Parallel.run(parallelism, parallelism, i -> {
+            List<Object[]> out = new ArrayList<>();
+            List<long[]> seq = new ArrayList<>();
+            for (int p = ranges[i][0]; p < ranges[i][1]; p++) {
+                Object[] probeRow = probe.rows.get(p);
+                List<Object> key = keyOf(probeRow, probeKeyIdx);
+                List<Integer> matches = key == null ? null
+                        : tables.get(Math.floorMod(key.hashCode(), parallelism)).get(key);
+                boolean any = false;
+                if (matches != null) {
+                    for (int buildIndex : matches) {
+                        Object[] buildRow = build.rows.get(buildIndex);
+                        Object[] combinedRow = buildLeft
+                                ? concat(buildRow, probeRow) : concat(probeRow, buildRow);
+                        if (on != null && !Boolean.TRUE.equals(ValueOps.truth(evaluator.eval(
+                                on, combinedRow, combined)))) {
+                            continue;
+                        }
+                        out.add(combinedRow);
+                        seq.add(joinSeq(buildLeft, build, probe, buildIndex, p));
+                        any = true;
+                        if (matchedBuild != null) {
+                            matchedBuild.set(buildIndex, 1);
+                        }
+                    }
+                }
+                if (!any && !buildLeft) {
+                    out.add(concat(probeRow, new Object[right.schema.size()]));
+                    seq.add(joinSeqNull(right, buildLeft, build, probe, p));
+                }
+            }
+            return new JoinChunk(out, seq);
+        });
+
+        List<Object[]> out = new ArrayList<>();
+        List<long[]> outSeq = new ArrayList<>();
+        for (JoinChunk chunk : chunks) {
+            out.addAll(chunk.rows);
+            outSeq.addAll(chunk.seq);
+        }
+        if (buildLeft) {
+            for (int b = 0; b < build.rows.size(); b++) {
+                if (matchedBuild.get(b) != 0) {
+                    continue;
+                }
+                out.add(concat(build.rows.get(b), new Object[right.schema.size()]));
+                outSeq.add(joinSeqNullLeft(build, b));
+            }
+        }
+        return new Relation(combined, out, out.size(), outSeq);
+    }
+
+    private record JoinChunk(List<Object[]> rows, List<long[]> seq) {
     }
 
     private static long[] joinSeq(boolean buildLeft, Relation build, Relation probe,
@@ -2208,15 +2684,11 @@ public final class QueryEngine {
         List<Ast.Expr> aggNodes = new ArrayList<>(aggregates.keySet());
         Map<List<Object>, Group> groups = new LinkedHashMap<>();
         if (groupBy.isEmpty()) {
-            Group single = newGroup(aggNodes, aggregates, filtered.schema);
-            groups.put(List.of(), single);
-            for (Object[] row : filtered.rows) {
-                for (Ast.Expr node : aggNodes) {
-                    single.accs.get(node).add(row, filtered.schema);
-                }
-            }
+            groups = singleGroup(aggNodes, aggregates, filtered);
         } else if (impl != null && impl.startsWith("Sort")) {
             groups = sortBasedGroups(groupBy, aggNodes, aggregates, filtered);
+        } else if (parallelAggregate(groupBy, aggNodes, filtered)) {
+            groups = parallelGroups(groupBy, aggNodes, aggregates, filtered);
         } else {
             for (Object[] row : filtered.rows) {
                 List<Object> key = groupKey(groupBy, row, filtered.schema);
@@ -2256,6 +2728,138 @@ public final class QueryEngine {
             rows.add(base);
         }
         return new BaseResult(resultSchema, rows);
+    }
+
+    /**
+     * 无 GROUP BY 的聚合(单组):并行时按行序切段各自局部聚合,再按段序合并累加器。
+     */
+    private Map<List<Object>, Group> singleGroup(List<Ast.Expr> aggNodes,
+                                                 Map<Ast.Expr, Ast.Func> aggregates,
+                                                 Relation filtered) {
+        Map<List<Object>, Group> groups = new LinkedHashMap<>();
+        List<Object[]> rows = filtered.rows;
+        boolean concat = aggNodes.stream()
+                .anyMatch(node -> "GROUP_CONCAT".equalsIgnoreCase(aggregates.get(node).name()));
+        // GROUP_CONCAT 的截断发生在值级别,跨段合并无法逐值复现 ⇒ 该形态保持单线程
+        int tasks = concat ? 1 : parallelTasks(rows.size(), 1024);
+        if (tasks <= 1 || containsAnySubquery(aggNodes)) {
+            Group single = newGroup(aggNodes, aggregates, filtered.schema);
+            for (Object[] row : rows) {
+                for (Ast.Expr node : aggNodes) {
+                    single.accs.get(node).add(row, filtered.schema);
+                }
+            }
+            groups.put(List.of(), single);
+            return groups;
+        }
+        int[][] ranges = Parallel.ranges(rows.size(), tasks);
+        List<Group> parts = Parallel.run(tasks, tasks, i -> {
+            Group group = newGroup(aggNodes, aggregates, filtered.schema, localEvaluator());
+            for (int r = ranges[i][0]; r < ranges[i][1]; r++) {
+                Object[] row = rows.get(r);
+                for (Ast.Expr node : aggNodes) {
+                    group.accs.get(node).add(row, filtered.schema);
+                }
+            }
+            return group;
+        });
+        Group merged = newGroup(aggNodes, aggregates, filtered.schema);
+        for (Group part : parts) {
+            for (Ast.Expr node : aggNodes) {
+                merged.accs.get(node).mergeFrom(part.accs.get(node));
+            }
+        }
+        groups.put(List.of(), merged);
+        return groups;
+    }
+
+    /** 并行分桶聚合是否可用(FR-713):并行度 &gt;1、行数够、表达式里没有子查询。 */
+    private boolean parallelAggregate(List<Ast.Expr> groupBy, List<Ast.Expr> aggNodes,
+                                      Relation filtered) {
+        if (parallelTasks(filtered.rows.size(), 1024) <= 1) {
+            return false;
+        }
+        List<Ast.Expr> exprs = new ArrayList<>(groupBy);
+        exprs.addAll(aggNodes);
+        return !containsAnySubquery(exprs);
+    }
+
+    private int parallelTasks(int rows, int rowsPerTask) {
+        if (options.parallelism() <= 1 || rows < Parallel.MIN_ROWS) {
+            return 1;
+        }
+        return Parallel.tasks(options.parallelism(), Math.max(1, rows / rowsPerTask));
+    }
+
+    private static boolean containsAnySubquery(List<Ast.Expr> exprs) {
+        for (Ast.Expr expr : exprs) {
+            List<Ast.Expr> found = new ArrayList<>();
+            Evaluator.collectSubqueries(expr, found);
+            if (!found.isEmpty()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** 并行任务用的求值器:共享只读映射,告警串行化(ArrayList 不是线程安全的)。 */
+    private Evaluator localEvaluator() {
+        return new Evaluator(aggregateValues, subqueryValues, message -> {
+            synchronized (warnings) {
+                warnings.warn(message);
+            }
+        });
+    }
+
+    /**
+     * GROUP BY 按键分桶并行聚合(SPEC-P6.1 FR-713)。
+     *
+     * <p>同一 group key 只会落进一个桶,所以桶之间没有同键累加器需要合并;
+     * 二次合并只做"按首次出现位置还原行序",与单线程 Hash Aggregate 的行序逐行一致。</p>
+     */
+    private Map<List<Object>, Group> parallelGroups(List<Ast.Expr> groupBy,
+                                                    List<Ast.Expr> aggNodes,
+                                                    Map<Ast.Expr, Ast.Func> aggregates,
+                                                    Relation filtered) {
+        List<Object[]> rows = filtered.rows;
+        int tasks = parallelTasks(rows.size(), 1024);
+        List<List<Integer>> buckets = new ArrayList<>(tasks);
+        for (int i = 0; i < tasks; i++) {
+            buckets.add(new ArrayList<>());
+        }
+        for (int r = 0; r < rows.size(); r++) {
+            List<Object> key = groupKey(groupBy, rows.get(r), filtered.schema);
+            buckets.get(Math.floorMod(key.hashCode(), tasks)).add(r);
+        }
+        List<Map<List<Object>, Group>> parts = Parallel.run(tasks, tasks, i -> {
+            Evaluator local = localEvaluator();
+            Map<List<Object>, Group> map = new LinkedHashMap<>();
+            for (int r : buckets.get(i)) {
+                Object[] row = rows.get(r);
+                List<Object> key = groupKey(groupBy, row, filtered.schema);
+                Group group = map.get(key);
+                if (group == null) {
+                    group = newGroup(aggNodes, aggregates, filtered.schema, local);
+                    group.keyValues = groupValues(groupBy, row, filtered.schema);
+                    group.firstOrder = r;
+                    map.put(key, group);
+                }
+                for (Ast.Expr node : aggNodes) {
+                    group.accs.get(node).add(row, filtered.schema);
+                }
+            }
+            return map;
+        });
+        List<Group> ordered = new ArrayList<>();
+        for (Map<List<Object>, Group> part : parts) {
+            ordered.addAll(part.values());
+        }
+        ordered.sort(Comparator.comparingLong(group -> group.firstOrder));
+        Map<List<Object>, Group> groups = new LinkedHashMap<>();
+        for (Group group : ordered) {
+            groups.put(List.of(group.firstOrder), group);
+        }
+        return groups;
     }
 
     /**
@@ -2345,9 +2949,16 @@ public final class QueryEngine {
 
     private Group newGroup(List<Ast.Expr> nodes, Map<Ast.Expr, Ast.Func> aggregates,
                            Schema schema) {
+        return newGroup(nodes, aggregates, schema, evaluator);
+    }
+
+    private Group newGroup(List<Ast.Expr> nodes, Map<Ast.Expr, Ast.Func> aggregates,
+                           Schema schema, Evaluator groupEvaluator) {
         Group group = new Group();
         for (Ast.Expr node : nodes) {
-            group.accs.put(node, Aggregates.create(aggregates.get(node), evaluator, warnings));
+            group.accs.put(node,
+                    Aggregates.create(aggregates.get(node), groupEvaluator,
+                            groupEvaluator.warnings()));
         }
         return group;
     }
@@ -2640,6 +3251,10 @@ public final class QueryEngine {
         if (totalColumns > 0) {
             lines.add("列: 读取 " + readColumns + " / 表 " + totalColumns + " 列");
         }
+        // SPEC-P6.1 FR-719 / SC-414:新增"并行/批/下推"行(既有行不变)
+        lines.add("并行/批/下推: 并行度=" + options.parallelism()
+                + ", 扫描批=" + options.scanBatchRows()
+                + ", 下推=" + (options.pushdown() ? "开(列投影 + 谓词字节码)" : "关(全行回退,P6 行为)"));
         // P4/P5 的既有行(FR-671:既有行只增不改)
         lines.add("实际读取列: " + String.join(", ", columnsRead(body)));
         if (!body.groupBy().isEmpty()) {

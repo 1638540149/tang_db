@@ -49,6 +49,10 @@ public final class SqlEngine {
     private final String sortTmpDir;
     private final com.wangyu.tangdb.planner.OptimizerConfig optimizer;
     private final com.wangyu.tangdb.stats.StatsService stats;
+    /** SPEC-P6.1 执行层参数(默认取 P6 语义,由常驻 FE 按配置覆盖)。 */
+    private int queryParallelism = 1;
+    private boolean pushdownEnabled = false;
+    private int scanBatchRows = 4096;
 
     public SqlEngine(KvStore kv, Catalog catalog, SessionManager sessions,
                      BackendRegistry backends, boolean heartbeatEnabled, String user) {
@@ -70,6 +74,29 @@ public final class SqlEngine {
         this.sortTmpDir = "tmp/fe-sort";
         this.optimizer = com.wangyu.tangdb.planner.OptimizerConfig.defaults();
         this.stats = new com.wangyu.tangdb.stats.StatsService(kv, catalog, optimizer);
+    }
+
+    /** SPEC-P6.1:注入并行度 / 下推开关 / 扫描批大小(FR-711 / FR-718)。 */
+    public SqlEngine withExecution(int parallelism, boolean pushdown, int scanBatchRows) {
+        this.queryParallelism = parallelism > 0 ? parallelism : 1;
+        this.pushdownEnabled = pushdown;
+        if (scanBatchRows > 0) {
+            this.scanBatchRows = scanBatchRows;
+        }
+        return this;
+    }
+
+    /** 当前执行层参数(启动日志与 EXPLAIN 用)。 */
+    public int queryParallelism() {
+        return queryParallelism;
+    }
+
+    public boolean pushdownEnabled() {
+        return pushdownEnabled;
+    }
+
+    public int scanBatchRows() {
+        return scanBatchRows;
     }
 
     /** SPEC-P5 §5.4:查询引擎参数(query_batch_rows / sort_spill_bytes / sort_tmp_dir)。 */
@@ -287,12 +314,18 @@ public final class SqlEngine {
                     .withQueryOptions(queryBatchRows, sortSpillBytes, sortTmpDir)
                     .withOptimizer(optimizer)
                     .withStats(stats)
+                    .withExecution(queryParallelism, pushdownEnabled, scanBatchRows)
+                    .withStreamingResults(true)
+                    .withBackends(backends)
                     .attachServer(sessions, user, 0, indexBackfillBatch);
         }
         return session.executor()
                 .withQueryOptions(queryBatchRows, sortSpillBytes, sortTmpDir)
                 .withOptimizer(optimizer)
                 .withStats(stats)
+                .withExecution(queryParallelism, pushdownEnabled, scanBatchRows)
+                .withStreamingResults(true)
+                .withBackends(backends)
                 .attachServer(sessions, user, session.id(), indexBackfillBatch);
     }
 

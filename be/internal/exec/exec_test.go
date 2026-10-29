@@ -2,7 +2,9 @@ package exec
 
 import (
 	"bytes"
+	"fmt"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/1638540149/tang_db/be/internal/memtable"
@@ -226,4 +228,41 @@ func equal(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// TestScannerRebuildsOnConcurrentMemtableWrite 惰性游标失效后由 exec 层重建,
+// 扫描结果必须是完整、升序、无重复的(SPEC-P6.1 FR-697)。
+func TestScannerRebuildsOnConcurrentMemtableWrite(t *testing.T) {
+	m := memtable.New()
+	const n = 800
+	for i := 0; i < n; i++ {
+		m.Put([]byte(fmt.Sprintf("k-%05d", i)), []byte("v"))
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < n; i++ {
+			m.Put([]byte(fmt.Sprintf("w-%05d", i)), []byte("v"))
+			runtime.Gosched()
+		}
+	}()
+
+	sc := NewScanner([]Cursor{NewMemCursor(m)}, nil, nil, 0)
+	var keys []string
+	for sc.Next() {
+		keys = append(keys, string(sc.Key()))
+	}
+	if err := sc.Err(); err != nil {
+		t.Fatalf("scan err: %v", err)
+	}
+	<-done
+	if len(keys) < n {
+		t.Fatalf("扫描到 %d 行,至少应有 %d 行(重建不得丢行)", len(keys), n)
+	}
+	for i := 1; i < len(keys); i++ {
+		if keys[i-1] >= keys[i] {
+			t.Fatalf("行序不升序/有重复: %q → %q", keys[i-1], keys[i])
+		}
+	}
 }

@@ -101,6 +101,9 @@ func run() error {
 		CompactionLevelRatio:    cfg.CompactionLevelRatio,
 		CompactionLevelMaxBytes: cfg.CompactionLevelMaxBytes,
 		BloomEnabled:            cfg.CompactionBloomEnabled,
+		WALBufferBytes:          cfg.WALBufferBytes,
+		GroupCommitMaxBatch:     cfg.GroupCommitMaxBatch,
+		GroupCommitMaxWait:      cfg.GroupCommitMaxWait,
 	})
 	if err != nil {
 		return fmt.Errorf("打开存储引擎失败: %w", err)

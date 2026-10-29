@@ -88,6 +88,8 @@ func BuildHeartbeat(beID, endpoint, version string, interval time.Duration, star
 		GetErrorCount:            st.GetErrCount,
 		ScanErrorCount:           st.ScanErrCount,
 		LastFsyncUnixMillis:      st.LastFsyncUnixMilli,
+		ChunksRead:               st.ChunksRead,
+		ChunksSkipped:            st.ChunksSkipped,
 	}
 }
 

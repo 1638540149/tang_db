@@ -30,6 +30,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 const (
@@ -72,6 +73,8 @@ type WAL struct {
 	writer *bufWriter
 	mu     sync.Mutex
 	closed bool
+	// syncs 记录成功 fsync 的次数(诊断/验收用,SPEC-P6.1 group commit 合批观测)。
+	syncs atomic.Uint64
 }
 
 // bufWriter 在内存中缓冲少量数据,减少系统调用次数,但 fsync 前会刷新缓冲区。
@@ -80,8 +83,14 @@ type bufWriter struct {
 	buf []byte
 }
 
-func newBufWriter(f *os.File) *bufWriter {
-	return &bufWriter{w: f, buf: make([]byte, 0, 64*1024)}
+// DefaultBufferBytes 是 WAL 追加缓冲的默认大小(SPEC-P6.1 §5.2 未配置时)。
+const DefaultBufferBytes = 64 * 1024
+
+func newBufWriter(f *os.File, bufferBytes int) *bufWriter {
+	if bufferBytes < 4096 {
+		bufferBytes = 4096
+	}
+	return &bufWriter{w: f, buf: make([]byte, 0, bufferBytes)}
 }
 
 func (bw *bufWriter) Write(p []byte) error {
@@ -107,8 +116,14 @@ func (bw *bufWriter) Flush() error {
 	return err
 }
 
-// Open 打开或创建指定编号的 WAL 文件。
+// Open 打开或创建指定编号的 WAL 文件(默认缓冲)。
 func Open(dir string, number uint64) (*WAL, error) {
+	return OpenWithBuffer(dir, number, DefaultBufferBytes)
+}
+
+// OpenWithBuffer 打开或创建指定编号的 WAL 文件,追加缓冲大小为 bufferBytes
+// (SPEC-P6.1 FR-699 / `wal_buffer_bytes`)。
+func OpenWithBuffer(dir string, number uint64, bufferBytes int) (*WAL, error) {
 	if err := os.MkdirAll(dir, 0750); err != nil {
 		return nil, fmt.Errorf("create wal dir %s: %w", dir, err)
 	}
@@ -128,7 +143,7 @@ func Open(dir string, number uint64) (*WAL, error) {
 		dir:    dir,
 		number: number,
 		file:   f,
-		writer: newBufWriter(f),
+		writer: newBufWriter(f, bufferBytes),
 	}, nil
 }
 
@@ -168,6 +183,36 @@ func (w *WAL) AppendBatch(commitTS, txnID uint64, kvs []KV) error {
 }
 
 func (w *WAL) appendRecord(rec *Record) error {
+	return w.appendRecordBuffered(rec, true)
+}
+
+// AppendBatchBuffered 把批记录写进缓冲但**不做 fsync**(SPEC-P6.1 FR-698 / FR-699)。
+//
+// 供 group commit 使用:多个提交顺序追加,由 leader 用一次 Sync 覆盖它们,
+// 每个事务在"覆盖它的 fsync"完成后才算提交成功。缓冲写失败仍会立刻返回错误。
+func (w *WAL) AppendBatchBuffered(commitTS, txnID uint64, kvs []KV) error {
+	if len(kvs) == 0 {
+		return errors.New("wal: empty batch")
+	}
+	for _, kv := range kvs {
+		if len(kv.Key) == 0 {
+			return errors.New("wal: empty key in batch")
+		}
+	}
+	rec := &Record{Type: TypeBatch, CommitTS: commitTS, TxnID: txnID, KVs: kvs}
+	return w.appendRecordBuffered(rec, false)
+}
+
+// recordBufPool 复用编码缓冲,消除每批一次大块分配(FR-699)。
+// 只有不超过 1MB 的缓冲回池,避免池被单次大批撑大。
+var recordBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 0, 64*1024)
+		return &b
+	},
+}
+
+func (w *WAL) appendRecordBuffered(rec *Record, doSync bool) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -175,12 +220,22 @@ func (w *WAL) appendRecord(rec *Record) error {
 		return errors.New("wal: closed")
 	}
 
-	buf, err := encodeRecord(rec)
+	holder := recordBufPool.Get().(*[]byte)
+	buf, err := encodeRecordInto((*holder)[:0], rec)
 	if err != nil {
+		recordBufPool.Put(holder)
 		return err
 	}
-	if err := w.writer.Write(buf); err != nil {
-		return fmt.Errorf("wal: write record: %w", err)
+	writeErr := w.writer.Write(buf)
+	if cap(buf) <= 1<<20 {
+		*holder = buf
+		recordBufPool.Put(holder)
+	}
+	if writeErr != nil {
+		return fmt.Errorf("wal: write record: %w", writeErr)
+	}
+	if !doSync {
+		return nil
 	}
 	if err := w.writer.Flush(); err != nil {
 		return fmt.Errorf("wal: flush record: %w", err)
@@ -188,6 +243,7 @@ func (w *WAL) appendRecord(rec *Record) error {
 	if err := w.file.Sync(); err != nil {
 		return fmt.Errorf("wal: fsync failed: %w", err)
 	}
+	w.syncs.Add(1)
 	return nil
 }
 
@@ -213,23 +269,39 @@ func (w *WAL) Sync() error {
 	if err := w.writer.Flush(); err != nil {
 		return err
 	}
-	return w.file.Sync()
+	if err := w.file.Sync(); err != nil {
+		return err
+	}
+	w.syncs.Add(1)
+	return nil
 }
+
+// SyncCount 返回成功 fsync 的次数(测试与验收观测 group commit 合批效果)。
+func (w *WAL) SyncCount() uint64 { return w.syncs.Load() }
 
 // encodeRecord 将记录编码为字节序列。
 func encodeRecord(r *Record) ([]byte, error) {
-	var payload []byte
+	return encodeRecordInto(nil, r)
+}
+
+// encodeRecordInto 把记录编码进 dst(dst[:0] 起用,容量不够时重新分配)。
+// 复用缓冲是 FR-699 的核心:每批不再分配两块大内存。
+func encodeRecordInto(dst []byte, r *Record) ([]byte, error) {
+	payloadLen, err := recordPayloadLen(r)
+	if err != nil {
+		return nil, err
+	}
+	total := headerSize + payloadLen
+	if cap(dst) < total {
+		dst = make([]byte, total)
+	} else {
+		dst = dst[:total]
+	}
+	payload := dst[headerSize:]
+
 	switch r.Type {
 	case TypePut:
-		if len(r.KVs) != 1 {
-			return nil, errors.New("wal: PUT record must have exactly one kv")
-		}
 		k, v := r.KVs[0].Key, r.KVs[0].Value
-		payloadLen := 4 + len(k) + 4 + len(v)
-		if payloadLen > maxPayloadSize {
-			return nil, fmt.Errorf("wal: payload too large %d", payloadLen)
-		}
-		payload = make([]byte, payloadLen)
 		off := 0
 		binary.LittleEndian.PutUint32(payload[off:], uint32(len(k)))
 		off += 4
@@ -239,21 +311,6 @@ func encodeRecord(r *Record) ([]byte, error) {
 		off += 4
 		copy(payload[off:], v)
 	case TypeBatch:
-		const countSize = 4
-		if len(r.KVs) == 0 {
-			return nil, errors.New("wal: empty batch")
-		}
-		payloadLen := batchHeadSize
-		for _, kv := range r.KVs {
-			if len(kv.Key) == 0 {
-				return nil, errors.New("wal: empty key in batch")
-			}
-			payloadLen += 4 + len(kv.Key) + 4 + len(kv.Value)
-			if payloadLen > maxPayloadSize {
-				return nil, fmt.Errorf("wal: payload too large %d", payloadLen)
-			}
-		}
-		payload = make([]byte, payloadLen)
 		binary.BigEndian.PutUint64(payload[0:8], r.CommitTS)
 		binary.BigEndian.PutUint64(payload[8:16], r.TxnID)
 		binary.LittleEndian.PutUint32(payload[16:20], uint32(len(r.KVs)))
@@ -272,13 +329,43 @@ func encodeRecord(r *Record) ([]byte, error) {
 		return nil, fmt.Errorf("wal: unknown record type %d", r.Type)
 	}
 
-	buf := make([]byte, headerSize+len(payload))
-	buf[4] = r.Type
-	binary.LittleEndian.PutUint32(buf[5:9], uint32(len(payload)))
-	copy(buf[headerSize:], payload)
-	crc := crc32.Checksum(buf[4:], castagnoli)
-	binary.LittleEndian.PutUint32(buf[0:4], crc)
-	return buf, nil
+	dst[4] = r.Type
+	binary.LittleEndian.PutUint32(dst[5:9], uint32(payloadLen))
+	crc := crc32.Checksum(dst[4:], castagnoli)
+	binary.LittleEndian.PutUint32(dst[0:4], crc)
+	return dst, nil
+}
+
+// recordPayloadLen 校验记录结构并返回载荷长度(编码前的一次遍历,不做分配)。
+func recordPayloadLen(r *Record) (int, error) {
+	switch r.Type {
+	case TypePut:
+		if len(r.KVs) != 1 {
+			return 0, errors.New("wal: PUT record must have exactly one kv")
+		}
+		payloadLen := 4 + len(r.KVs[0].Key) + 4 + len(r.KVs[0].Value)
+		if payloadLen > maxPayloadSize {
+			return 0, fmt.Errorf("wal: payload too large %d", payloadLen)
+		}
+		return payloadLen, nil
+	case TypeBatch:
+		if len(r.KVs) == 0 {
+			return 0, errors.New("wal: empty batch")
+		}
+		payloadLen := batchHeadSize
+		for _, kv := range r.KVs {
+			if len(kv.Key) == 0 {
+				return 0, errors.New("wal: empty key in batch")
+			}
+			payloadLen += 4 + len(kv.Key) + 4 + len(kv.Value)
+			if payloadLen > maxPayloadSize {
+				return 0, fmt.Errorf("wal: payload too large %d", payloadLen)
+			}
+		}
+		return payloadLen, nil
+	default:
+		return 0, fmt.Errorf("wal: unknown record type %d", r.Type)
+	}
 }
 
 // Replay 逐条读取并回调 fn;遇到记录不完整或 CRC 不符时在断点处**物理截断**

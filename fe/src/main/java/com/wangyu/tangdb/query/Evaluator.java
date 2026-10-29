@@ -49,6 +49,11 @@ public final class Evaluator {
         this.subqueryResolver = (sub, row, schema) -> subqueryValues.get(sub);
     }
 
+    /** 本求值器使用的告警出口(聚合累加器沿用它,保证并行任务的告警也串行化)。 */
+    Evaluator.Warnings warnings() {
+        return warnings;
+    }
+
     /** 设置"聚合节点 → 结果列序号";聚合结果从当前行里取。 */
     public Evaluator withAggregateColumns(Map<Ast.Expr, Integer> columns) {
         this.aggregateColumns = columns;

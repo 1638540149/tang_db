@@ -2,6 +2,8 @@ package com.wangyu.tangdb.txn;
 
 import com.wangyu.tangdb.storage.KeyValue;
 import com.wangyu.tangdb.storage.KvStore;
+import com.wangyu.tangdb.storage.ProjectingStore;
+import com.wangyu.tangdb.storage.ScanOptions;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -26,6 +28,24 @@ public final class ReadViews {
             @Override
             public List<KeyValue> scan(byte[] start, byte[] end, int limit) {
                 // KvStore 的契约就是"返回用户键";剥版本段由真实客户端(TangDbClient)完成。
+                return kv.scan(start, end, 0, limit);
+            }
+
+            @Override
+            public boolean isLatest() {
+                return true;
+            }
+
+            @Override
+            public List<KeyValue> scanProjected(byte[] start, byte[] end, int limit,
+                                                ScanOptions options) {
+                if (kv instanceof ProjectingStore projecting) {
+                    try {
+                        return projecting.scanProjected(start, end, 0, limit, options);
+                    } catch (com.wangyu.tangdb.client.ClientException e) {
+                        throw new com.wangyu.tangdb.storage.StoreException(e.getMessage(), e);
+                    }
+                }
                 return kv.scan(start, end, 0, limit);
             }
         };

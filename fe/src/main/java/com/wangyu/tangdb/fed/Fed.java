@@ -60,7 +60,9 @@ public final class Fed implements AutoCloseable {
         // ① 连 BE(FR-407:连不上报明确原因)
         TangDbClient client;
         try {
-            client = new TangDbClient(config.beHost(), config.bePort());
+            client = new TangDbClient(config.beHost(), config.bePort())
+                    .withDeadlines(config.rpcDeadlineSeconds(), config.rpcBulkDeadlineSeconds(),
+                            config.rpcScanDeadlineSeconds());
             client.ping(); // 快速探活,拿到明确失败原因
         } catch (RuntimeException e) {
             throw new FeStartupException("无法连接 BE " + config.beHost() + ":" + config.bePort()
@@ -101,7 +103,16 @@ public final class Fed implements AutoCloseable {
         SqlEngine engine = new SqlEngine(client, catalog, sessions, registry,
                 config.heartbeatEnabled(), config.user(), config.indexBackfillBatch(),
                 config.queryBatchRows(), config.sortSpillBytes(), config.sortTmpDir(),
-                config.optimizer());
+                config.optimizer())
+                .withExecution(config.queryParallelism(), config.pushdownEnabled(),
+                        config.scanBatchRows());
+        // FR-724:启动日志必须写明本次使用的期限与并行度。
+        System.err.println("信息: 执行层配置 parallelism=" + config.queryParallelism()
+                + " pushdown=" + config.pushdownEnabled()
+                + " scan_batch_rows=" + config.scanBatchRows()
+                + " rpc_deadline=" + config.rpcDeadlineSeconds() + "s"
+                + " bulk_deadline=" + config.rpcBulkDeadlineSeconds() + "s"
+                + " scan_deadline=" + config.rpcScanDeadlineSeconds() + "s");
         byte[] storedHash = NativePassword.deriveStoredHash(config.password());
 
         MysqlServer mysqlServer;

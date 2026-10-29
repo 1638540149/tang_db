@@ -187,3 +187,42 @@ func TestLoadErrorMentionsFile(t *testing.T) {
 		t.Fatalf("错误信息应包含文件名与行号,实际: %v", err)
 	}
 }
+
+// TestParseP61Fields SPEC-P6.1 §5.2 三项写路径配置的解析与校验(FR-700 / FR-723)。
+func TestParseP61Fields(t *testing.T) {
+	src := `wal_buffer_bytes = 2MB
+group_commit_max_batch = 32
+group_commit_max_wait_ms = 0
+`
+	cfg, err := Parse(strings.NewReader(src))
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	if cfg.WALBufferBytes != 2*1024*1024 {
+		t.Fatalf("wal_buffer_bytes = %d", cfg.WALBufferBytes)
+	}
+	if cfg.GroupCommitMaxBatch != 32 || cfg.GroupCommitMaxWait != 0 {
+		t.Fatalf("group commit = %d/%dms", cfg.GroupCommitMaxBatch, cfg.GroupCommitMaxWait)
+	}
+
+	def := Default()
+	if def.WALBufferBytes != 1024*1024 || def.GroupCommitMaxBatch != 64 || def.GroupCommitMaxWait != 5 {
+		t.Fatalf("P6.1 默认值不对: %+v", def)
+	}
+
+	for name, bad := range map[string]string{
+		"缓冲过小":   "wal_buffer_bytes = 1KB",
+		"缓冲非法单位": "wal_buffer_bytes = 1XB",
+		"合并数为零":  "group_commit_max_batch = 0",
+		"合并数越界":  "group_commit_max_batch = 70000",
+		"等待为负":   "group_commit_max_wait_ms = -1",
+		"等待越界":   "group_commit_max_wait_ms = 5000",
+		"等待非数字":  "group_commit_max_wait_ms = abc",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Parse(strings.NewReader(bad)); err == nil {
+				t.Fatalf("期望报错,实际通过了: %q", bad)
+			}
+		})
+	}
+}

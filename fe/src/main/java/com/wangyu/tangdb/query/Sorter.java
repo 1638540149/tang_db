@@ -38,10 +38,17 @@ public final class Sorter {
 
     private final long spillBytes;
     private final Path workDir;
+    /** 分片内并行排序的并行度(SPEC-P6.1 FR-714);1 = 原单线程路径。 */
+    private final int parallelism;
 
     public Sorter(long spillBytes, Path workDir) {
+        this(spillBytes, workDir, 1);
+    }
+
+    public Sorter(long spillBytes, Path workDir, int parallelism) {
         this.spillBytes = spillBytes > 0 ? spillBytes : DEFAULT_SPILL_BYTES;
         this.workDir = workDir;
+        this.parallelism = Math.max(1, parallelism);
     }
 
     /** 启动时清理残留的排序临时文件(K114 精神:崩溃残留不得被当成有效数据)。 */
@@ -81,11 +88,63 @@ public final class Sorter {
         }
         long estimated = estimateBytes(rows);
         if (estimated <= spillBytes) {
+            if (parallelism > 1 && rows.size() >= Parallel.MIN_ROWS) {
+                return parallelSort(rows, cmp); // FR-714
+            }
             List<Object[]> sorted = new ArrayList<>(rows);
             sorted.sort(cmp);
             return sorted;
         }
         return externalSort(rows, cmp); // FR-580
+    }
+
+    /**
+     * 分片内并行排序 + 确定性归并(SPEC-P6.1 FR-714)。
+     *
+     * <p>每片用同一个稳定比较器排好,再按"片序优先"做 k 路归并 —— 与单线程
+     * {@code List.sort}(TimSort,稳定)的结果逐行同序,排序键相等的行不会被换序。</p>
+     */
+    private List<Object[]> parallelSort(List<Object[]> rows, Comparator<Object[]> cmp) {
+        int tasks = Parallel.tasks(parallelism, rows.size() / 1024);
+        if (tasks <= 1) {
+            List<Object[]> sorted = new ArrayList<>(rows);
+            sorted.sort(cmp);
+            return sorted;
+        }
+        int[][] ranges = Parallel.ranges(rows.size(), tasks);
+        List<List<Object[]>> parts = Parallel.run(tasks, tasks, i -> {
+            List<Object[]> part = new ArrayList<>(rows.subList(ranges[i][0], ranges[i][1]));
+            part.sort(cmp);
+            return part;
+        });
+        return mergeParts(parts, cmp);
+    }
+
+    /** k 路归并:键相等时按片序取(片内已稳定排序 ⇒ 全局稳定)。 */
+    private static List<Object[]> mergeParts(List<List<Object[]>> parts, Comparator<Object[]> cmp) {
+        java.util.PriorityQueue<int[]> heap = new java.util.PriorityQueue<>(
+                Math.max(1, parts.size()),
+                (a, b) -> {
+                    int c = cmp.compare(parts.get(a[0]).get(a[1]), parts.get(b[0]).get(b[1]));
+                    return c != 0 ? c : Integer.compare(a[0], b[0]);
+                });
+        int total = 0;
+        for (int p = 0; p < parts.size(); p++) {
+            total += parts.get(p).size();
+            if (!parts.get(p).isEmpty()) {
+                heap.add(new int[]{p, 0});
+            }
+        }
+        List<Object[]> out = new ArrayList<>(total);
+        while (!heap.isEmpty()) {
+            int[] top = heap.poll();
+            out.add(parts.get(top[0]).get(top[1]));
+            if (top[1] + 1 < parts.get(top[0]).size()) {
+                top[1]++;
+                heap.add(top);
+            }
+        }
+        return out;
     }
 
     private static Comparator<Object[]> comparator(int[] keyCols, boolean[] descending) {
@@ -141,13 +200,19 @@ public final class Sorter {
         List<Path> runs = new ArrayList<>();
         long rowBytes = Math.max(64, estimateBytes(rows) / Math.max(1, rows.size()));
         int chunkRows = (int) Math.max(256, Math.min(rows.size(), spillBytes / rowBytes));
+        int chunks = (rows.size() + chunkRows - 1) / chunkRows;
         try {
-            for (int from = 0; from < rows.size(); from += chunkRows) {
+            // SPEC-P6.1 FR-714:分片内并行排序(落盘与归并仍按片序,保证稳定)
+            List<List<Object[]>> sorted = Parallel.run(parallelism, chunks, i -> {
+                int from = i * chunkRows;
                 int to = Math.min(rows.size(), from + chunkRows);
                 List<Object[]> chunk = new ArrayList<>(rows.subList(from, to));
                 chunk.sort(cmp);
-                Path run = dir.resolve("sort-run-" + System.nanoTime() + "-" + runs.size() + ".bin");
-                writeRun(run, chunk);
+                return chunk;
+            });
+            for (int i = 0; i < sorted.size(); i++) {
+                Path run = dir.resolve("sort-run-" + System.nanoTime() + "-" + i + ".bin");
+                writeRun(run, sorted.get(i));
                 runs.add(run);
             }
             return mergeRuns(runs, cmp);
@@ -189,12 +254,16 @@ public final class Sorter {
             throws IOException {
         List<RunReader> readers = new ArrayList<>(runs.size());
         try {
-            for (Path run : runs) {
-                readers.add(new RunReader(run));
+            for (int i = 0; i < runs.size(); i++) {
+                readers.add(new RunReader(runs.get(i), i));
             }
+            // 键相等时按 run 序取:run 是按原始行序落盘的,这样归并结果与稳定排序一致
             PriorityQueue<RunReader> heap = new PriorityQueue<>(
                     Math.max(1, readers.size()),
-                    (a, b) -> cmp.compare(a.current(), b.current()));
+                    (a, b) -> {
+                        int c = cmp.compare(a.current(), b.current());
+                        return c != 0 ? c : Integer.compare(a.index, b.index);
+                    });
             for (RunReader reader : readers) {
                 if (reader.advance()) {
                     heap.add(reader);
@@ -219,11 +288,13 @@ public final class Sorter {
     private static final class RunReader implements AutoCloseable {
         private final InputStream raw;
         private final DataInputStream in;
+        private final int index;
         private Object[] current;
 
-        RunReader(Path path) throws IOException {
+        RunReader(Path path, int index) throws IOException {
             this.raw = Files.newInputStream(path);
             this.in = new DataInputStream(new BufferedInputStream(raw, 1 << 16));
+            this.index = index;
         }
 
         Object[] current() {

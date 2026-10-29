@@ -467,9 +467,20 @@ type ScanRequest struct {
 	Limit     uint32 `protobuf:"varint,3,opt,name=limit,proto3" json:"limit,omitempty"`                          // 0 = 不限;限制的是"每个用户键只输出一次"之后的行数
 	BatchRows uint32 `protobuf:"varint,4,opt,name=batch_rows,json=batchRows,proto3" json:"batch_rows,omitempty"` // 0 = 默认 1024
 	// 快照水位(SPEC-P3 FR-304):0 = 最新已提交。
-	Snapshot      uint64 `protobuf:"varint,5,opt,name=snapshot,proto3" json:"snapshot,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Snapshot uint64 `protobuf:"varint,5,opt,name=snapshot,proto3" json:"snapshot,omitempty"`
+	// ---- SPEC-P6.1 §5.1:只加字段,不改既有字段语义 ----
+	// 位图:第 k 位 = 是否要第 k 列。0 = 不裁剪(老路径,回整行)。
+	ColumnMask uint32 `protobuf:"varint,6,opt,name=column_mask,json=columnMask,proto3" json:"column_mask,omitempty"`
+	// 每列槽位(序号 + 字节宽度/长度前缀描述),由 FE 生成;BE 只按偏移切片。
+	ColumnSlots []byte `protobuf:"bytes,7,opt,name=column_slots,json=columnSlots,proto3" json:"column_slots,omitempty"`
+	// 行框架参数:nullmap 字节数 + 列数。
+	RowFrame []byte `protobuf:"bytes,8,opt,name=row_frame,json=rowFrame,proto3" json:"row_frame,omitempty"`
+	// 谓词字节码:列槽号 + 保序编码后的字面量字节;BE 只做字节比较。
+	Predicate []byte `protobuf:"bytes,9,opt,name=predicate,proto3" json:"predicate,omitempty"`
+	// true = 需要列式块返回;false = 逐 KV(兼容老路径)。
+	ColumnarResult bool `protobuf:"varint,10,opt,name=columnar_result,json=columnarResult,proto3" json:"columnar_result,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *ScanRequest) Reset() {
@@ -537,13 +548,51 @@ func (x *ScanRequest) GetSnapshot() uint64 {
 	return 0
 }
 
+func (x *ScanRequest) GetColumnMask() uint32 {
+	if x != nil {
+		return x.ColumnMask
+	}
+	return 0
+}
+
+func (x *ScanRequest) GetColumnSlots() []byte {
+	if x != nil {
+		return x.ColumnSlots
+	}
+	return nil
+}
+
+func (x *ScanRequest) GetRowFrame() []byte {
+	if x != nil {
+		return x.RowFrame
+	}
+	return nil
+}
+
+func (x *ScanRequest) GetPredicate() []byte {
+	if x != nil {
+		return x.Predicate
+	}
+	return nil
+}
+
+func (x *ScanRequest) GetColumnarResult() bool {
+	if x != nil {
+		return x.ColumnarResult
+	}
+	return false
+}
+
 // 服务端流式返回的一批行。status 不是 OK 时表示扫描中途出错,
 // 客户端必须把它当作失败结束,不能当成正常截断。
 type RowBatch struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Status        StatusCode             `protobuf:"varint,1,opt,name=status,proto3,enum=tangdb.v1.StatusCode" json:"status,omitempty"`
-	Message       string                 `protobuf:"bytes,2,opt,name=message,proto3" json:"message,omitempty"`
-	Rows          []*Kv                  `protobuf:"bytes,3,rep,name=rows,proto3" json:"rows,omitempty"`
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Status  StatusCode             `protobuf:"varint,1,opt,name=status,proto3,enum=tangdb.v1.StatusCode" json:"status,omitempty"`
+	Message string                 `protobuf:"bytes,2,opt,name=message,proto3" json:"message,omitempty"`
+	Rows    []*Kv                  `protobuf:"bytes,3,rep,name=rows,proto3" json:"rows,omitempty"`
+	// SPEC-P6.1 FR-707:原始字节块 + 偏移数组;为空则回退逐 KV。
+	// 布局:[行数 u32][每行偏移 u32 ×(行数+1)][行框架字节]
+	ColumnarBlock []byte `protobuf:"bytes,4,opt,name=columnar_block,json=columnarBlock,proto3" json:"columnar_block,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -595,6 +644,13 @@ func (x *RowBatch) GetMessage() string {
 func (x *RowBatch) GetRows() []*Kv {
 	if x != nil {
 		return x.Rows
+	}
+	return nil
+}
+
+func (x *RowBatch) GetColumnarBlock() []byte {
+	if x != nil {
+		return x.ColumnarBlock
 	}
 	return nil
 }
@@ -1096,8 +1152,12 @@ type HeartbeatRequest struct {
 	ScanErrorCount uint64 `protobuf:"varint,45,opt,name=scan_error_count,json=scanErrorCount,proto3" json:"scan_error_count,omitempty"`
 	// 持久性
 	LastFsyncUnixMillis int64 `protobuf:"varint,50,opt,name=last_fsync_unix_millis,json=lastFsyncUnixMillis,proto3" json:"last_fsync_unix_millis,omitempty"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	// 扫描剪枝(SPEC-P6.1 FR-706):chunk 解码次数 / 因 key 范围(ZoneMap 二分)
+	// 被跳过的 chunk 数;SHOW SEGMENTS 展示用。只加字段,不改既有语义。
+	ChunksRead    uint64 `protobuf:"varint,60,opt,name=chunks_read,json=chunksRead,proto3" json:"chunks_read,omitempty"`
+	ChunksSkipped uint64 `protobuf:"varint,61,opt,name=chunks_skipped,json=chunksSkipped,proto3" json:"chunks_skipped,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *HeartbeatRequest) Reset() {
@@ -1270,6 +1330,20 @@ func (x *HeartbeatRequest) GetLastFsyncUnixMillis() int64 {
 	return 0
 }
 
+func (x *HeartbeatRequest) GetChunksRead() uint64 {
+	if x != nil {
+		return x.ChunksRead
+	}
+	return 0
+}
+
+func (x *HeartbeatRequest) GetChunksSkipped() uint64 {
+	if x != nil {
+		return x.ChunksSkipped
+	}
+	return 0
+}
+
 type HeartbeatResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Status        StatusCode             `protobuf:"varint,1,opt,name=status,proto3,enum=tangdb.v1.StatusCode" json:"status,omitempty"`
@@ -1348,18 +1422,26 @@ const file_tangdb_proto_rawDesc = "" +
 	"\amessage\x18\x03 \x01(\tR\amessage\",\n" +
 	"\x02Kv\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\fR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\fR\x05value\"\x94\x01\n" +
+	"\x05value\x18\x02 \x01(\fR\x05value\"\xbc\x02\n" +
 	"\vScanRequest\x12\x1b\n" +
 	"\tstart_key\x18\x01 \x01(\fR\bstartKey\x12\x17\n" +
 	"\aend_key\x18\x02 \x01(\fR\x06endKey\x12\x14\n" +
 	"\x05limit\x18\x03 \x01(\rR\x05limit\x12\x1d\n" +
 	"\n" +
 	"batch_rows\x18\x04 \x01(\rR\tbatchRows\x12\x1a\n" +
-	"\bsnapshot\x18\x05 \x01(\x04R\bsnapshot\"v\n" +
+	"\bsnapshot\x18\x05 \x01(\x04R\bsnapshot\x12\x1f\n" +
+	"\vcolumn_mask\x18\x06 \x01(\rR\n" +
+	"columnMask\x12!\n" +
+	"\fcolumn_slots\x18\a \x01(\fR\vcolumnSlots\x12\x1b\n" +
+	"\trow_frame\x18\b \x01(\fR\browFrame\x12\x1c\n" +
+	"\tpredicate\x18\t \x01(\fR\tpredicate\x12'\n" +
+	"\x0fcolumnar_result\x18\n" +
+	" \x01(\bR\x0ecolumnarResult\"\x9d\x01\n" +
 	"\bRowBatch\x12-\n" +
 	"\x06status\x18\x01 \x01(\x0e2\x15.tangdb.v1.StatusCodeR\x06status\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\tR\amessage\x12!\n" +
-	"\x04rows\x18\x03 \x03(\v2\r.tangdb.v1.KvR\x04rows\".\n" +
+	"\x04rows\x18\x03 \x03(\v2\r.tangdb.v1.KvR\x04rows\x12%\n" +
+	"\x0ecolumnar_block\x18\x04 \x01(\fR\rcolumnarBlock\".\n" +
 	"\x0fBeginTxnRequest\x12\x1b\n" +
 	"\tread_only\x18\x01 \x01(\bR\breadOnly\"\x8e\x01\n" +
 	"\x10BeginTxnResponse\x12-\n" +
@@ -1389,7 +1471,7 @@ const file_tangdb_proto_rawDesc = "" +
 	"\x1aheartbeat_interval_seconds\x18\x05 \x01(\rR\x18heartbeatIntervalSeconds\"]\n" +
 	"\x12RegisterBeResponse\x12-\n" +
 	"\x06status\x18\x01 \x01(\x0e2\x15.tangdb.v1.StatusCodeR\x06status\x12\x18\n" +
-	"\amessage\x18\x02 \x01(\tR\amessage\"\x97\x06\n" +
+	"\amessage\x18\x02 \x01(\tR\amessage\"\xdf\x06\n" +
 	"\x10HeartbeatRequest\x12\x13\n" +
 	"\x05be_id\x18\x01 \x01(\tR\x04beId\x12\x1a\n" +
 	"\bendpoint\x18\x02 \x01(\tR\bendpoint\x12\x18\n" +
@@ -1412,7 +1494,10 @@ const file_tangdb_proto_rawDesc = "" +
 	"\x0fput_error_count\x18+ \x01(\x04R\rputErrorCount\x12&\n" +
 	"\x0fget_error_count\x18, \x01(\x04R\rgetErrorCount\x12(\n" +
 	"\x10scan_error_count\x18- \x01(\x04R\x0escanErrorCount\x123\n" +
-	"\x16last_fsync_unix_millis\x182 \x01(\x03R\x13lastFsyncUnixMillis\"\\\n" +
+	"\x16last_fsync_unix_millis\x182 \x01(\x03R\x13lastFsyncUnixMillis\x12\x1f\n" +
+	"\vchunks_read\x18< \x01(\x04R\n" +
+	"chunksRead\x12%\n" +
+	"\x0echunks_skipped\x18= \x01(\x04R\rchunksSkipped\"\\\n" +
 	"\x11HeartbeatResponse\x12-\n" +
 	"\x06status\x18\x01 \x01(\x0e2\x15.tangdb.v1.StatusCodeR\x06status\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\tR\amessage*m\n" +

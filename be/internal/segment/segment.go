@@ -26,6 +26,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 const (
@@ -47,8 +48,8 @@ var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 
 // Builder 将有序 KV 序列写入一个 segment 文件。
 type Builder struct {
-	path        string
-	rows        []kv
+	path         string
+	rows         []kv
 	bloomEnabled bool
 }
 
@@ -147,24 +148,24 @@ func (b *Builder) Finish() (*Footer, error) {
 		footer.EncodingCounts[valueInfo.Encoding]++
 
 		entries[ci] = indexEntry{
-			firstKey:      append([]byte(nil), keys[0]...),
-			keyMin:        append([]byte(nil), keyInfo.Min...),
-			keyMax:        append([]byte(nil), keyInfo.Max...),
-			keyOffset:     keyOff,
-			keyLen:        len(keyChunk),
-			keyHeaderLen:  keyInfo.headerLen,
-			keyEnc:        keyInfo.Encoding,
-			keyRaw:        keyInfo.RawBytes,
-			keyComp:       keyInfo.CompBytes,
-			keyNull:       keyInfo.NullCount,
-			valueOffset:   valueOff,
-			valueLen:      len(valueChunk),
+			firstKey:       append([]byte(nil), keys[0]...),
+			keyMin:         append([]byte(nil), keyInfo.Min...),
+			keyMax:         append([]byte(nil), keyInfo.Max...),
+			keyOffset:      keyOff,
+			keyLen:         len(keyChunk),
+			keyHeaderLen:   keyInfo.headerLen,
+			keyEnc:         keyInfo.Encoding,
+			keyRaw:         keyInfo.RawBytes,
+			keyComp:        keyInfo.CompBytes,
+			keyNull:        keyInfo.NullCount,
+			valueOffset:    valueOff,
+			valueLen:       len(valueChunk),
 			valueHeaderLen: valueInfo.headerLen,
-			valueEnc:      valueInfo.Encoding,
-			valueRaw:      valueInfo.RawBytes,
-			valueComp:     valueInfo.CompBytes,
-			valueNull:     valueInfo.NullCount,
-			rowCount:      rows,
+			valueEnc:       valueInfo.Encoding,
+			valueRaw:       valueInfo.RawBytes,
+			valueComp:      valueInfo.CompBytes,
+			valueNull:      valueInfo.NullCount,
+			rowCount:       rows,
 		}
 	}
 
@@ -216,13 +217,13 @@ type indexEntry struct {
 	keyMin   []byte
 	keyMax   []byte
 
-	keyOffset   uint64
-	keyLen      int
+	keyOffset    uint64
+	keyLen       int
 	keyHeaderLen int
-	keyEnc      Encoding
-	keyRaw      int
-	keyComp     int
-	keyNull     int
+	keyEnc       Encoding
+	keyRaw       int
+	keyComp      int
+	keyNull      int
 
 	valueOffset    uint64
 	valueLen       int
@@ -384,6 +385,10 @@ type Reader struct {
 	chunkTouches  int
 	headerTouches int
 	bytesRead     int64
+
+	// SPEC-P6.1 FR-706:chunk 解码次数 / 因 key 范围被跳过的 chunk 数(SHOW SEGMENTS 用)。
+	chunksRead    atomic.Uint64
+	chunksSkipped atomic.Uint64
 }
 
 type zoneEntry struct { // 仅 v1
@@ -735,6 +740,22 @@ func (r *Reader) Stats() SegmentStats {
 	}
 	return st
 }
+
+// ChunksRead 返回已解码的 chunk 数(SPEC-P6.1 FR-706)。
+func (r *Reader) ChunksRead() uint64 { return r.chunksRead.Load() }
+
+// ChunksSkipped 返回因 key 范围(Index/ZoneMap 二分)被跳过的 chunk 数。
+func (r *Reader) ChunksSkipped() uint64 { return r.chunksSkipped.Load() }
+
+// AddSkippedChunks 由迭代器在 Seek 跳过前缀 chunk 时调用。
+func (r *Reader) AddSkippedChunks(n int) {
+	if n > 0 {
+		r.chunksSkipped.Add(uint64(n))
+	}
+}
+
+// AddReadChunk 由迭代器在解码一个 chunk 时调用。
+func (r *Reader) AddReadChunk() { r.chunksRead.Add(1) }
 
 // ChunkTouches/HeaderTouches/BytesRead 是读放大观测口径(INV 观测清单)。
 func (r *Reader) ChunkTouches() int {

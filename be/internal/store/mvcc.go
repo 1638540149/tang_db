@@ -36,10 +36,11 @@ func SplitVersion(fullKey []byte) (userKey []byte, commitTS uint64, err error) {
 	return userKey, commitTS, nil
 }
 
-// MaxCommittedTS 返回当前已提交水位(最后分配出去的 commit_ts)。
+// MaxCommittedTS 返回当前**可见**水位(group commit 下最后一条已完成 memtable 应用的
+// commit_ts)。已取号但还没应用的提交对读者不可见,因此读路径只认这个水位。
 //
 // snapshot = 0 表示"最新已提交",读路径用它作为上界。
-func (e *Engine) MaxCommittedTS() uint64 { return e.lastCommitTS.Load() }
+func (e *Engine) MaxCommittedTS() uint64 { return e.visibleTS.Load() }
 
 // GetSnapshot 返回用户键在快照 s 下可见的版本值(SPEC-P3 FR-322 / FR-325)。
 //

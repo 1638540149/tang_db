@@ -89,6 +89,18 @@ message ScanRequest {
   uint32 batch_rows = 4;   // 0 = 默认 1024
   // 快照水位(SPEC-P3 FR-304):0 = 最新已提交。
   uint64 snapshot   = 5;
+
+  // ---- SPEC-P6.1 §5.1:只加字段,不改既有字段语义 ----
+  // 位图:第 k 位 = 是否要第 k 列。0 = 不裁剪(老路径,回整行)。
+  uint32 column_mask      = 6;
+  // 每列槽位(序号 + 字节宽度/长度前缀描述),由 FE 生成;BE 只按偏移切片。
+  bytes  column_slots     = 7;
+  // 行框架参数:nullmap 字节数 + 列数。
+  bytes  row_frame        = 8;
+  // 谓词字节码:列槽号 + 保序编码后的字面量字节;BE 只做字节比较。
+  bytes  predicate        = 9;
+  // true = 需要列式块返回;false = 逐 KV(兼容老路径)。
+  bool   columnar_result  = 10;
 }
 
 // 服务端流式返回的一批行。status 不是 OK 时表示扫描中途出错,
@@ -97,6 +109,9 @@ message RowBatch {
   StatusCode  status  = 1;
   string      message = 2;
   repeated Kv rows    = 3;
+  // SPEC-P6.1 FR-707:原始字节块 + 偏移数组;为空则回退逐 KV。
+  // 布局:[行数 u32][每行偏移 u32 ×(行数+1)][行框架字节]
+  bytes       columnar_block = 4;
 }
 
 // ---------------------------------------------------------------- 事务(P3)
@@ -211,6 +226,11 @@ message HeartbeatRequest {
 
   // 持久性
   int64 last_fsync_unix_millis = 50;
+
+  // 扫描剪枝(SPEC-P6.1 FR-706):chunk 解码次数 / 因 key 范围(ZoneMap 二分)
+  // 被跳过的 chunk 数;SHOW SEGMENTS 展示用。只加字段,不改既有语义。
+  uint64 chunks_read        = 60;
+  uint64 chunks_skipped     = 61;
 }
 
 message HeartbeatResponse {

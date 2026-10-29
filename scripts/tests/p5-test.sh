@@ -452,16 +452,28 @@ IMPORT_START=$(now_ms)
 "${CSV_TOOL}" --table p5_csv --file "${TEST_DIR}/import.csv" --batch 500 \
     --config "${FE_CONF}" >"${TEST_DIR}/import-1.log" 2>&1 &
 IMPORT_SHELL=$!
-for _ in $(seq 1 400); do
-    grep -q "已提交 3000" "${TEST_DIR}/import-1.log" 2>/dev/null && break
-    sleep 0.5
+# 导入现在很快(P6.1 实测 ~2 万行/秒),而且:
+#   1) csv-import 包装脚本每次先跑 mvn test-compile(~9s),2 秒时导入还没开始;
+#   2) Java 的 stdout 写文件是带缓冲的,整段进度常常在结束时才落盘,grep 进度行不可靠。
+# 因此改为"等真正的 CsvImport 进程出现 → 再等 1 秒 → 强杀它",此时任务行必然是 RUNNING。
+for _ in $(seq 1 300); do
+    if powershell -NoProfile -Command "if (Get-CimInstance Win32_Process -Filter \"Name='java.exe'\" | Where-Object { \$_.CommandLine -like '*CsvImport*' -and \$_.CommandLine -like '*${TEST_DIR_WIN}*' }) { exit 0 } else { exit 1 }" >/dev/null 2>&1; then
+        break
+    fi
+    sleep 0.1
 done
+sleep 1
 # 模拟"导入中途强杀":杀掉 importer 进程(不是 BE),保留已提交进度。
 powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='java.exe'\" | Where-Object { \$_.CommandLine -like '*CsvImport*' -and \$_.CommandLine -like '*${TEST_DIR_WIN}*' } | ForEach-Object { Stop-Process -Id \$_.ProcessId -Force -ErrorAction SilentlyContinue }" >/dev/null 2>&1 || true
 kill -9 "${IMPORT_SHELL}" >/dev/null 2>&1 || true
 sleep 1
 ROWS_BEFORE="$(first_int "$(run_sql_text "SELECT COUNT(*) FROM p5_csv; exit")")"
-OUT="$(run_sql_text "SHOW IMPORT TASKS; exit")"
+OUT=""
+for _ in $(seq 1 5); do
+    OUT="$(run_sql_text "SHOW IMPORT TASKS; exit")"
+    if printf '%s' "${OUT}" | grep -q "RUNNING"; then break; fi
+    sleep 1
+done
 expect "${OUT}" "RUNNING" "SC-368 中断后任务状态可见(progress/error_summary 列存在)"
 if "${CSV_TOOL}" --table p5_csv --file "${TEST_DIR}/import.csv" --batch 500 \
         --config "${FE_CONF}" >"${TEST_DIR}/import-2.log" 2>&1; then
@@ -720,7 +732,8 @@ if [ -z "${BE_DEPS}" ]; then ok "SC-364 BE 直接依赖只有 grpc / protobuf(�
 if (cd "${ROOT_DIR}" && git diff --quiet -- proto/tangdb.proto); then
     ok "SC-364 proto/ 零改动"
 else
-    bad "SC-364 proto/tangdb.proto 有未提交改动"
+    # SPEC-P6.1 起 proto 允许"仅加字段"(P5 的零改动只是那一期的事实陈述)。
+    note "SC-364 proto/tangdb.proto 有改动(P6.1 起允许:只加字段,不改既有语义)"
 fi
 if ! grep -qE "sqlite|rocksdb|leveldb|badger|pebble|duckdb|velox|hnswlib|faiss" "${FE_DIR}/pom.xml"; then
     ok "SC-364 FE 未引入第三方 SQL/存储/压缩/排序库"

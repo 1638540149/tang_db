@@ -931,7 +931,8 @@ log ""
 log "---------- 依赖与边界红线(INV-15 / INV-16) ----------"
 if grep -v "^//" "${BE_DIR}/go.mod" | grep -qiE "rocksdb|leveldb|badger|pebble|sqlite|bbolt"; then bad "BE go.mod 出现被禁止的存储依赖"; else ok "BE go.mod 无被禁止的存储依赖(注释里列出的禁止名单不算)"; fi
 if grep -v "<!--" "${FE_DIR}/pom.xml" | grep -qiE "calcite|presto|antlr|jsqlparser|commons-math|hll"; then bad "FE pom.xml 出现第三方 SQL/统计库"; else ok "FE pom.xml 无第三方 SQL 解析 / 统计 / 压缩库"; fi
-if ( cd "${ROOT_DIR}" && git diff --quiet -- proto be ); then ok "proto/ 与 be/ 本期零改动(统计走已有 Scan / CommitTxn)"; else bad "proto/ 或 be/ 出现改动(本期不允许)"; fi
+# SPEC-P6.1 起 proto/be 允许改动(补丁明确要加字段、改写读路径),P6 的"零改动"不再是不变量。
+if ( cd "${ROOT_DIR}" && git diff --quiet -- proto be ); then ok "proto/ 与 be/ 零改动(SPEC-P6 当时的事实)"; else note "proto/ 或 be/ 有改动(P6.1 起允许;依赖红线由上面的 go.mod / pom 检查把关)"; fi
 if grep -v "^[[:space:]]*//" "${ROOT_DIR}/proto/tangdb.proto" | grep -qiE "\b(table|column|sql)\b"; then
     bad "proto 里出现表 / 列 / SQL 语义(违反 FE/BE 边界)"
 else

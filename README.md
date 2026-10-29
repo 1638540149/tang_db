@@ -724,6 +724,117 @@ bash scripts/tests/p4-test.sh       # SC-319 ~ SC-343,报告 tmp/p4-test/report.
 > 这些数字同机同数据、只用于本期基线(P4 的 RBO 没有代价模型,`K82` 明确承认可能选出比全表扫更慢的路);
 > P6 拿到统计信息后用 CBO 替换。INSERT 的增量主要来自索引项与行记录同批写入的额外字节与 fsync 时间。
 
+### P6.1 执行层全链路性能(BE 写路径 + BE 读路径 + FE 并行)
+
+补丁期:**不动磁盘格式、不改语义**,收益全部来自内存结构、协议增量与执行调度。两个开关
+(`pushdown_enabled` / `query_parallelism`)可以一键回到 P6 行为:
+`pushdown_enabled=false` + `query_parallelism=1` 时扫描走原全行路径、单线程执行,结果逐行一致。
+
+**① 九项新配置**
+
+| 配置 | 位置 | 默认 | 含义 |
+|---|---|---|---|
+| `query_parallelism` | `fe.conf` | `min(8, CPU)` | 扫描与算子的并行度;`1` = 与 P6 完全一致的单线程路径 |
+| `pushdown_enabled` | `fe.conf` | `true` | 列投影 + 谓词下推总开关;`false` = 全行回退 |
+| `scan_batch_rows` | `fe.conf` | `4096` | 扫描批行数(自适应上限 8192) |
+| `rpc_deadline_seconds` | `fe.conf` | `5` | 普通读写 / 事务期限 |
+| `rpc_bulk_deadline_seconds` | `fe.conf` | `60` | 批量导入 / 索引回填 / `ANALYZE` 期限 |
+| `rpc_scan_deadline_seconds` | `fe.conf` | `60` | 范围扫描 / 分片扫描期限 |
+| `wal_buffer_bytes` | `be.conf` | `1MB` | WAL 追加缓冲池大小 |
+| `group_commit_max_batch` | `be.conf` | `64` | 一次 fsync 最多合并的提交数 |
+| `group_commit_max_wait_ms` | `be.conf` | `5` | 攒批最长等待(0 = 不等待) |
+
+取值非法(未知项、越界、非数字)**启动失败并指出第几行**;`query_parallelism` 超过 CPU×4 会给出建议上限。
+
+**② BE 写路径(A 组)**
+
+- **批量冲突检测**:写集先按用户键排序去重(同 key 保留最后一次写),再用**一次区间扫描**归并判断
+  `latest_commit_ts > snapshot`;不再"每个 key 建一次 scanner"。用户键互为前缀时(裸 KV 才有)
+  放开上界,保证冲突不漏检。
+- **惰性 memtable 游标**:`Seek` 走跳表下降,不再把整表拷成切片;创建时记写计数水位,
+  越过水位返回 `unsafe`,由 exec 层**重建**游标并 Seek 回原位置(并发写下自动重试);
+  `IteratorSnapshot()` 保留拷贝语义给长生命周期调用方。
+- **group commit**:多个提交的 WAL 记录顺序追加后合并一次 fsync,事务记住自己的世代,
+  **返回 OK 前必须等到覆盖它的那次 fsync 完成**;`commitMu` 只保护"排序 → 取号 → 追加",
+  fsync 与 memtable 应用按组串行。实测 32 条并发提交合并成 **1 次 fsync**(单测断言)。
+- **正确性细节**:`visibleTS` 只在"memtable 应用完成"后推进,读者不会看到"已取号未应用"的事务;
+  已追加未应用的写也会参与冲突检测(填住 group commit 的并发空白)。
+- 崩溃注入新增两点:`fsync_mid_group`(已追加、fsync 未完成)与 `fsync_after_done`
+  (fsync 完成、未回包)——前者重启后不可见,后者重启后可见(全在)。
+
+**③ BE 读路径(B 组)**
+
+- **行框架协议**(`[nullmap][len][bytes]×n`):FE 下发 `column_slots`(每列序号 + 编码种类 + 宽度)
+  与 `row_frame`(nullmap 字节数 / 列数 / 前缀字节数),BE 只按偏移切片,**不理解列名与类型**;
+  帧里的 `len` 是载荷长度(VARCHAR 的 4 字节长度前缀由 BE 剥掉)。
+- **谓词字节码**:栈式指令 `EQ/NE/LT/LE/GT/GE/IS_NULL/IS_NOT_NULL/BETWEEN/IN/AND/OR/NOT`,
+  参数是"列槽号 + 保序编码后的字面量字节";BE 只做字节比较。数值列在比较时做保序变换
+  (`INT32/INT64` 翻符号位后大端、`FLOAT64` IEEE 保序),字符串列按 FE 的有符号字节序比较;
+  `JSON` 列不下推。**FE 始终保留残余过滤**,下推只减少扫描量,不改变结果集。
+- **列式块**:`RowBatch.columnar_block = [u32 行数][u32 偏移×(行数+1)][帧…]`,
+  每帧 = `[u32 keyLen][key][投影帧]`;为空则回退逐 KV(同一批不允许混用)。
+- **批大小自适应**:FE 下发 `scan_batch_rows`;BE 在行数上限之外再按字节预算(2MB)切批,
+  最少 1024 行、最多 8192 行。
+- **剪枝计数**:`SHOW SEGMENTS` 末尾新增 `pruned_chunks(be_total)` / `skipped_chunks(be_total)`,
+  数值来自 BE 心跳上报的"因 key 范围(Index/ZoneMap 二分)跳过的 chunk 数"与"已解码 chunk 数"。
+  **口径是整个 BE 进程累计,不是单表**;列名已注明。
+- **预读**:顺序扫描在解码第 i 个 chunk 时后台预读第 i+1 个 chunk 的原始字节(只读、不改格式);
+  预读失败只影响性能,消费时退回同步读。
+
+**④ FE 执行(C 组)**
+
+- **分片并发扫描**:一次全表扫描按 key 字节空间等分成 `query_parallelism` 片并发拉取,
+  按片序拼接(**行集合与行序与单线程一致**);所有片共用一个固定快照(借 `BeginTxn` 取水位并登记
+  活跃快照,避免并发写让不同片看到不同版本);任何一片失败 → 整条查询失败,不返回部分结果。
+- **`LIMIT` 提前终止**:无 `ORDER BY`/聚合、且整条单表谓词都能下推时,`LIMIT n` 下推到扫描,
+  BE 只回 n 行后立刻停止(实测 `LIMIT 10` 只回 10 行)。
+- **`EXPLAIN`**:新增 `并行/批/下推: 并行度=…, 扫描批=…, 下推=开(列投影 + 谓词字节码)` 一行;
+  P4/P5/P6 的既有行一字未改。
+- **启动日志**(FR-724):fed 启动打印本次使用的三档期限与并行度/下推开关。
+
+**⑤ 一键验收**
+
+```bash
+bash scripts/tests/p6.1-test.sh     # SC-400 ~ SC-418,报告 tmp/p6.1-test/report.txt
+# 只跑本期主项、跳过既有回归:SKIP_REGRESSION=1 bash scripts/tests/p6.1-test.sh
+```
+
+端口固定 **BE 9940 / MySQL 9946 / 心跳 9951**,数据目录 `tmp/p6.1-test/data`;
+脚本只杀自己起的 `tmp/p6.1-test/be.exe` 与带该目录配置的 `fed`,不碰 9100 / 3406。
+`scripts/bench-exec.sh` 为吞吐 / 并行度扫参工具。
+
+**⑥ 实测口径(本机,同报条件)**
+
+条件:Windows 11 / i7-13620H / 40GB / Go 1.27 / Java 17.0.12,gRPC 本地回环,数据目录本地盘。
+导入吞吐 = CSV 工具墙钟;查询为 `P61Bench` 同 JVM 三次中位数;INSERT 为 `InsertLatencyBench` 三次中位数。
+
+| 项 | 门限 | 实测(最终一轮) | 结论 |
+|---|---|---|---|
+| 单批冲突检测(1,000 行 + 2MB memtable) | ≤ 5 ms | 3.17 ms(多轮 2.6 ~ 3.6 ms) | 达标 |
+| 导入吞吐(2MB memtable) | ≥ 8,000 行/秒 | 14,706 行/秒(多轮 8,900 ~ 15,600) | 达标 |
+| 导入吞吐(64MB) | ≥ 5,000 行/秒 | 12,626 行/秒(多轮 8,800 ~ 12,600) | 达标 |
+| 全表扫描 + 聚合 | ≥ 27 万行/秒 | 632,911 行/秒(多轮 63 万 ~ 116 万) | 达标 |
+| 三表 JOIN(128k ⋈ 50k ⋈ 20k) | ≤ 3 s | 245 ms(多轮 148 ~ 245 ms) | 达标 |
+| 宽表列投影(20 列读 2 列) | ≤ 全行 1/5 | 0.175 | 达标 |
+| `LIMIT 10` | 读取 < 全表 1/10 | 回 10 行 / 全表 20,000 行 | 达标 |
+| 单行 INSERT P99 | ≤ 12 ms | 5.5 ms(独占机单跑)/ 16 ~ 44 ms(整套脚本连跑) | **未达标(见下)** |
+| 8 并发导入 | ≥ 3× 现状(1,100×3) | 13,418 行/秒 | 达标 |
+
+> **INSERT P99 的实情**:独占机器单跑 `InsertLatencyBench` 是 5.5 ms;在验收脚本里紧跟构建与其他
+> 压测之后连跑,中位数会升到 12~16 ms(冷启动与 G1 GC 抖动占主因,p50 本身仍 4~9 ms)。
+> 门限不改,该项在整套脚本里的结论文档为"临界",独占机复测达标。
+
+**⑦ 本期明确未做(如实记录)**
+
+- 结果集**流式写协议 socket**(FR-715):仍先把结果物化到 `Relation` 再交由协议层输出;
+  `LIMIT` 的提前终止通过"下推到扫描"实现。
+- Hash Join **build/probe 分桶并行**(FR-712)与聚合**分桶并行**(FR-713):仍是单线程算子;
+  三表 JOIN 的收益来自并行扫描 + 哈希连接 + 下推。
+- 按**列值**的 chunk 级剪枝:磁盘格式没有值列 zone map(加它就等于改格式,`K154` 禁止),
+  现有剪枝是 key 范围(Index/ZoneMap 二分)剪枝 + 解码后按字节比较过滤。
+- `go test -race`:本机无 C 工具链(cgo 不可用),已用 `-count` 重复跑并发生命周期用例,
+  race detector 未运行。
+
 ## 状态
 
 **P1(基座)、P2(表与 SQL)、P2.1(SQL 兼容性补齐)、P3(事务与 MVCC)、P3.5(常驻 FE + 多库 + MySQL 协议)、P4(索引)均已实现。**

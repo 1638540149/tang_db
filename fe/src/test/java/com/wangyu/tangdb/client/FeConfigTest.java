@@ -85,6 +85,49 @@ class FeConfigTest {
         assertMessage("be_offline_cycles = x", "be_offline_cycles 无效");
     }
 
+    /** SPEC-P6.1 §5.2:9 项里的 FE 6 项默认值与解析(FR-722 / FR-723)。 */
+    @Test
+    void p61Fields() throws IOException {
+        FeConfig d = FeConfig.defaults();
+        assertEquals(Math.min(8, Runtime.getRuntime().availableProcessors()), d.queryParallelism());
+        assertTrue(d.pushdownEnabled());
+        assertEquals(4096, d.scanBatchRows());
+        assertEquals(5, d.rpcDeadlineSeconds());
+        assertEquals(60, d.rpcBulkDeadlineSeconds());
+        assertEquals(60, d.rpcScanDeadlineSeconds());
+
+        Path file = write("""
+                query_parallelism = 3
+                pushdown_enabled = false
+                scan_batch_rows = 1024
+                rpc_deadline_seconds = 7
+                rpc_bulk_deadline_seconds = 90
+                rpc_scan_deadline_seconds = 120
+                """);
+        FeConfig cfg = FeConfig.load(file.toString());
+        assertEquals(3, cfg.queryParallelism());
+        assertFalse(cfg.pushdownEnabled());
+        assertEquals(1024, cfg.scanBatchRows());
+        assertEquals(7, cfg.rpcDeadlineSeconds());
+        assertEquals(90, cfg.rpcBulkDeadlineSeconds());
+        assertEquals(120, cfg.rpcScanDeadlineSeconds());
+    }
+
+    /** 非法值启动失败并指出行号(§8 #115/#116/#122)。 */
+    @Test
+    void p61RejectsBadValues() throws IOException {
+        assertMessage("query_parallelism = 0", "query_parallelism 无效");
+        assertMessage("query_parallelism = abc", "query_parallelism 无效");
+        int over = Math.max(1, Runtime.getRuntime().availableProcessors() * 4) + 1;
+        assertMessage("query_parallelism = " + over, "建议不超过");
+        assertMessage("pushdown_enabled = maybe", "pushdown_enabled 无效");
+        assertMessage("scan_batch_rows = 0", "scan_batch_rows 无效");
+        assertMessage("scan_batch_rows = 8193", "scan_batch_rows 无效");
+        assertMessage("rpc_deadline_seconds = 0", "rpc_deadline_seconds 无效");
+        assertMessage("rpc_deadline_seconds = 601", "rpc_deadline_seconds 无效");
+        assertMessage("rpc_scan_deadline_seconds = x", "rpc_scan_deadline_seconds 无效");
+    }
+
     /** 命令行参数覆盖配置文件。 */
     @Test
     void commandLineOverridesConfigFile() throws IOException {

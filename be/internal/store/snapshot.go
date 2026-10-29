@@ -11,7 +11,7 @@ import "sync/atomic"
 func (e *Engine) BeginSnapshot() uint64 {
 	e.snapMu.Lock()
 	defer e.snapMu.Unlock()
-	ts := e.lastCommitTS.Load()
+	ts := e.visibleTS.Load()
 	e.activeSnapshots[ts]++
 	return ts
 }

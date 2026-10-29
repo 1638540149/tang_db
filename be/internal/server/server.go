@@ -4,19 +4,26 @@ package server
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
 	"sync/atomic"
 
+	"github.com/1638540149/tang_db/be/internal/exec"
 	"github.com/1638540149/tang_db/be/internal/server/pb"
 	"github.com/1638540149/tang_db/be/internal/store"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
-const defaultBatchRows = 1024
+const (
+	defaultBatchRows    = 4096
+	minScanBatchRows    = 1024
+	maxScanBatchRows    = 8192
+	scanBatchByteBudget = 2 * 1024 * 1024
+)
 
 // TangDbServer 实现 proto/tangdb.proto 中定义的 gRPC 服务。
 type TangDbServer struct {
@@ -99,11 +106,70 @@ func (s *TangDbServer) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResp
 	}, nil
 }
 
+// scanPlan 是本次扫描的投影/谓词参数(SPEC-P6.1 B 组)。
+//
+// BE 只认"列序号 / 字节偏移 / 操作码 / 字节字面量",不理解列名/类型/SQL。
+type scanPlan struct {
+	layout   *exec.RowLayout
+	mask     uint32
+	pred     *exec.Predicate
+	columnar bool
+	slots    []exec.Slot
+}
+
+func (p *scanPlan) slot(ordinal int) exec.Slot {
+	for _, s := range p.slots {
+		if s.Ordinal == ordinal {
+			return s
+		}
+	}
+	return exec.Slot{Ordinal: ordinal, Kind: exec.SlotFixed, Width: 1}
+}
+
+// buildScanPlan 解析 ScanRequest 的 6~10 号字段;没有任何下推参数时返回 nil(老路径)。
+func buildScanPlan(req *pb.ScanRequest) (*scanPlan, error) {
+	if req.ColumnMask == 0 && len(req.Predicate) == 0 && len(req.ColumnSlots) == 0 {
+		return nil, nil
+	}
+	if len(req.ColumnSlots) == 0 || len(req.RowFrame) == 0 {
+		return nil, fmt.Errorf("列投影参数不完整:需要同时提供 column_slots 与 row_frame")
+	}
+	slots, err := exec.ParseSlots(req.ColumnSlots)
+	if err != nil {
+		return nil, err
+	}
+	frame, err := exec.ParseRowFrame(req.RowFrame)
+	if err != nil {
+		return nil, err
+	}
+	layout, err := exec.NewRowLayout(frame, slots)
+	if err != nil {
+		return nil, err
+	}
+	pred, err := exec.ParsePredicate(req.Predicate)
+	if err != nil {
+		return nil, err
+	}
+	return &scanPlan{
+		layout:   layout,
+		mask:     req.ColumnMask,
+		pred:     pred,
+		columnar: req.ColumnarResult,
+		slots:    slots,
+	}, nil
+}
+
 // Scan 按**用户键**范围 [start_key, end_key) 有序流式返回;每个用户键只出现一次。
+//
+// SPEC-P6.1:请求带列投影 / 谓词时走"按字节切片 + 字节比较"路径;
+// 不带任何下推参数时与 P6 完全一致(全行、逐 KV)。
 func (s *TangDbServer) Scan(req *pb.ScanRequest, stream pb.TangDb_ScanServer) error {
 	batchRows := int(req.BatchRows)
 	if batchRows <= 0 {
 		batchRows = defaultBatchRows
+	}
+	if batchRows > maxScanBatchRows {
+		batchRows = maxScanBatchRows
 	}
 	limit := int(req.Limit)
 	if len(req.EndKey) > 0 && len(req.StartKey) > 0 &&
@@ -114,49 +180,157 @@ func (s *TangDbServer) Scan(req *pb.ScanRequest, stream pb.TangDb_ScanServer) er
 		})
 	}
 
+	plan, err := buildScanPlan(req)
+	if err != nil {
+		return stream.Send(&pb.RowBatch{
+			Status:  pb.StatusCode_INVALID_ARGUMENT,
+			Message: err.Error(),
+		})
+	}
+
 	sc := s.engine.NewMVCCScanner(req.StartKey, req.EndKey, req.Snapshot, limit)
 	defer sc.Close()
+
 	batch := make([]*pb.Kv, 0, batchRows)
+	var block []byte
+	var offsets []uint32
+	blockBytes := 0
+
+	reset := func() {
+		batch = make([]*pb.Kv, 0, batchRows)
+		block = block[:0]
+		offsets = offsets[:0]
+		blockBytes = 0
+	}
 
 	send := func(status pb.StatusCode, message string) error {
-		if err := stream.Send(&pb.RowBatch{Status: status, Message: message, Rows: batch}); err != nil {
+		out := &pb.RowBatch{Status: status, Message: message, Rows: batch}
+		if len(offsets) > 0 {
+			out.ColumnarBlock = encodeColumnarBlock(offsets, block)
+		}
+		if err := stream.Send(out); err != nil {
 			return err
 		}
 		return nil
 	}
 
+	// 谓词求值时的列值比较态缓冲:每列一份,避免栈上值互相覆盖。
+	var scratch [][]byte
+
 	for sc.Next() {
 		if err := stream.Context().Err(); err != nil {
 			return err
 		}
-		batch = append(batch, &pb.Kv{
-			Key:   append([]byte(nil), sc.Key()...),
-			Value: append([]byte(nil), sc.Value()...),
-		})
-		if len(batch) >= batchRows {
+		value := sc.Value()
+
+		if plan != nil && plan.pred != nil {
+			cols, ok := plan.layout.Locate(value)
+			if !ok {
+				// 墓碑 / 非行格式:FE 侧本来就会丢弃,下推路径直接跳过。
+				continue
+			}
+			if cap(scratch) < len(cols) {
+				scratch = make([][]byte, len(cols))
+			} else {
+				scratch = scratch[:len(cols)]
+			}
+			pass, err := plan.pred.Eval(func(ordinal int) (bool, []byte) {
+				if ordinal < 0 || ordinal >= len(cols) {
+					return true, nil
+				}
+				c := cols[ordinal]
+				if c.Null {
+					return true, nil
+				}
+				slot := plan.slot(ordinal)
+				scratch[ordinal] = exec.CompareBytes(value[c.Off:c.Off+c.Len], slot.Kind,
+					scratch[ordinal])
+				return false, scratch[ordinal]
+			})
+			if err != nil {
+				s.engine.RecordScanError()
+				return send(pb.StatusCode_INTERNAL, "谓词求值失败: "+err.Error())
+			}
+			if !pass {
+				continue
+			}
+		}
+
+		if plan != nil {
+			frame, _, ok := plan.layout.ProjectRow(value, plan.mask)
+			if !ok {
+				continue // 墓碑
+			}
+			if plan.columnar {
+				key := sc.Key()
+				var lenBuf [4]byte
+				binary.LittleEndian.PutUint32(lenBuf[:], uint32(len(key)))
+				offsets = append(offsets, uint32(len(block)))
+				block = append(block, lenBuf[:]...)
+				block = append(block, key...)
+				block = append(block, frame...)
+				blockBytes += len(lenBuf) + len(key) + len(frame)
+			} else {
+				batch = append(batch, &pb.Kv{
+					Key:   append([]byte(nil), sc.Key()...),
+					Value: frame,
+				})
+			}
+		} else {
+			batch = append(batch, &pb.Kv{
+				Key:   append([]byte(nil), sc.Key()...),
+				Value: append([]byte(nil), value...),
+			})
+			blockBytes += len(sc.Key()) + len(value)
+		}
+
+		// 批大小自适应(FR-708):行数到上限,或字节量超过预算且至少 1024 行时切批。
+		if len(batch) >= batchRows || len(offsets) >= batchRows ||
+			(blockBytes >= scanBatchByteBudget && rowsInBatch(batch, offsets) >= minScanBatchRows) {
 			if err := send(pb.StatusCode_OK, ""); err != nil {
 				return err
 			}
-			batch = make([]*pb.Kv, 0, batchRows)
+			reset()
 		}
 	}
 
 	if err := sc.Err(); err != nil {
 		s.engine.RecordScanError()
 		slog.Error("scan failed", "error", err)
-		// 已经读到的行先发出去(它们本身是正确的),再明确报错,不让客户端误以为扫描正常结束。
-		if len(batch) > 0 {
-			if err := send(pb.StatusCode_OK, ""); err != nil {
-				return err
-			}
-			batch = make([]*pb.Kv, 0, batchRows)
+		if err := send(pb.StatusCode_OK, ""); err != nil {
+			return err
 		}
 		return send(pb.StatusCode_INTERNAL, "扫描失败: "+err.Error())
 	}
-	if len(batch) > 0 {
+	if len(batch) > 0 || len(offsets) > 0 {
 		return send(pb.StatusCode_OK, "")
 	}
 	return nil
+}
+
+func rowsInBatch(batch []*pb.Kv, offsets []uint32) int {
+	if offsets != nil {
+		return len(offsets)
+	}
+	return len(batch)
+}
+
+// encodeColumnarBlock 把"行偏移数组 + 原始字节块"编码成 RowBatch.columnar_block。
+//
+// 布局:[u32 rowCount][u32 offsets rowCount+1][frames...]
+func encodeColumnarBlock(offsets []uint32, block []byte) []byte {
+	out := make([]byte, 0, 4+4*(len(offsets)+1)+len(block))
+	var buf [4]byte
+	binary.LittleEndian.PutUint32(buf[:], uint32(len(offsets)))
+	out = append(out, buf[:]...)
+	for _, off := range offsets {
+		binary.LittleEndian.PutUint32(buf[:], off)
+		out = append(out, buf[:]...)
+	}
+	binary.LittleEndian.PutUint32(buf[:], uint32(len(block)))
+	out = append(out, buf[:]...)
+	out = append(out, block...)
+	return out
 }
 
 // BeginTxn 发放事务句柄并返回当前已提交水位(SPEC-P3 FR-301)。

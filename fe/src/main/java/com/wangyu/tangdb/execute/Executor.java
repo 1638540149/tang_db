@@ -88,6 +88,14 @@ public final class Executor {
     // ---- P5:查询引擎参数(§5.4)与 SHOW WARNINGS 计数 ----
     private int queryBatchRows = 1024;
     private long sortSpillBytes = 64L * 1024 * 1024;
+    /** SPEC-P6.1:扫描/算子并行度;1 = 与 P6 完全一致的执行路径。 */
+    private int queryParallelism = 1;
+    /** SPEC-P6.1:列投影 + 谓词下推总开关。 */
+    private boolean pushdownEnabled = false;
+    /** SPEC-P6.1:扫描批行数(自适应起点)。 */
+    private int scanBatchRows = 4096;
+    /** SPEC-P6.1 FR-715:结果集流式写协议(仅 fed 服务端开启;单测默认物化)。 */
+    private boolean streamingResults = false;
     private java.nio.file.Path sortTmpDir = java.nio.file.Path.of("tmp", "fe-sort");
     private boolean vectorized = true;
     private final List<String> warnings = new ArrayList<>();
@@ -98,6 +106,8 @@ public final class Executor {
     private com.wangyu.tangdb.planner.OptimizerConfig optimizer =
             com.wangyu.tangdb.planner.OptimizerConfig.defaults();
     private com.wangyu.tangdb.stats.StatsService stats;
+    /** 后端注册表(SHOW SEGMENTS 的剪枝计数来自心跳,SPEC-P6.1 FR-706)。 */
+    private com.wangyu.tangdb.server.BackendRegistry backends;
 
     public Executor(KvStore kv, Catalog catalog) {
         this.kv = kv;
@@ -133,6 +143,27 @@ public final class Executor {
         return this;
     }
 
+    /** SPEC-P6.1:并行度 / 下推开关 / 扫描批大小(FR-711 / FR-718)。 */
+    public Executor withExecution(int parallelism, boolean pushdown, int scanBatchRows) {
+        this.queryParallelism = parallelism > 0 ? parallelism : 1;
+        this.pushdownEnabled = pushdown;
+        if (scanBatchRows > 0) {
+            this.scanBatchRows = scanBatchRows;
+        }
+        return this;
+    }
+
+    /** SPEC-P6.1 FR-715:开启结果集流式输出(协议层逐批写 socket)。 */
+    public Executor withStreamingResults(boolean enabled) {
+        this.streamingResults = enabled;
+        return this;
+    }
+
+    /** 测试用:强制关闭下推 / 并行(等价 P6 对拍档)。 */
+    public Executor withLegacyExecution() {
+        return withExecution(1, false, queryBatchRows);
+    }
+
     /** 测试用:切换向量化 / 逐行路径(FR-576 对拍)。 */
     public Executor withVectorized(boolean enabled) {
         this.vectorized = enabled;
@@ -145,6 +176,12 @@ public final class Executor {
             this.optimizer = config;
             this.stats = null; // 统计服务的配置跟着优化器配置走
         }
+        return this;
+    }
+
+    /** 注入后端注册表(心跳里有 chunk 剪枝计数)。 */
+    public Executor withBackends(com.wangyu.tangdb.server.BackendRegistry registry) {
+        this.backends = registry;
         return this;
     }
 
@@ -179,7 +216,8 @@ public final class Executor {
     /** 查询引擎参数(含优化器 / 统计 / 虚拟表)。 */
     private QueryEngine.Options queryOptions() {
         return new QueryEngine.Options(currentDatabase, queryBatchRows, sortSpillBytes, sortTmpDir,
-                vectorized, optimizer, stats()).withVirtualTables(virtualTables());
+                vectorized, optimizer, stats()).withVirtualTables(virtualTables())
+                .withExecution(queryParallelism, pushdownEnabled, scanBatchRows);
     }
 
     /** 统计服务(懒创建:单测里 new Executor(kv, catalog) 也能用 ANALYZE)。 */
@@ -831,6 +869,22 @@ public final class Executor {
         } else {
             tables.addAll(catalog.tables(resolveDatabase(show.database())));
         }
+
+        // SPEC-P6.1 FR-706:新增"剪枝命中 / 跳过 chunk 数"。数值来自 BE 心跳上报的
+        // chunks_skipped / chunks_read 累计值 —— 口径是整个 BE 进程(不是单表),
+        // 因此列名带 (be_total);BE 不可用时为 0。
+        long pruned = 0;
+        long scanned = 0;
+        if (backends != null) {
+            for (com.wangyu.tangdb.server.BackendRegistry.Backend backend : backends.all()) {
+                com.wangyu.tangdb.proto.HeartbeatRequest hb = backend.lastHeartbeat();
+                if (hb != null) {
+                    pruned += hb.getChunksSkipped();
+                    scanned += hb.getChunksRead();
+                }
+            }
+        }
+
         List<Object[]> rows = new ArrayList<>();
         for (TableMeta table : tables) {
             TableSize size = tableSize(table);
@@ -845,12 +899,15 @@ public final class Executor {
                         column.rawBytes(),
                         column.compressedBytes(),
                         String.format(java.util.Locale.ROOT, "%.2f", ratio),
-                        encodingText(column.encodings())
+                        encodingText(column.encodings()),
+                        pruned,
+                        scanned
                 });
             }
         }
         return new Result.Table(List.of("segment", "column", "rows", "chunks",
-                "raw_bytes", "compressed_bytes", "ratio", "encodings"), rows);
+                "raw_bytes", "compressed_bytes", "ratio", "encodings",
+                "pruned_chunks(be_total)", "skipped_chunks(be_total)"), rows);
     }
 
     /** SHOW IMPORT TASKS(FR-614):task_id / status / progress / error_summary。 */
@@ -1009,6 +1066,10 @@ public final class Executor {
         rows.add(new String[]{"残余过滤: " + (where == null ? "无" : formatCondition(where))
                 + "(由 FE 按谓词执行)"});
         rows.add(new String[]{"扫描方式: " + describeScan(plan)});
+        // SPEC-P6.1 FR-719:执行层参数进 EXPLAIN(既有行不变)
+        rows.add(new String[]{"并行/批/下推: 并行度=" + queryParallelism
+                + ", 扫描批=" + scanBatchRows
+                + ", 下推=" + (pushdownEnabled ? "开(列投影 + 谓词字节码)" : "关(全行回退,P6 行为)")});
         // ---- SPEC-P6 D 组:下推 / 列裁剪 / LIMIT 下推(只追加,不改上面 P4 的既有行) ----
         if (where != null) {
             rows.add(new String[]{"已下推: " + formatCondition(where)
@@ -1514,6 +1575,13 @@ public final class Executor {
         QueryEngine.Options options = queryOptions();
         QueryEngine engine = new QueryEngine(kv, catalog, currentView(null), options,
                 message -> warnings.add(message));
+        if (streamingResults) {
+            // SPEC-P6.1 FR-715:简单单表查询直接给流式结果;其余形态退回物化路径
+            Result streamed = engine.stream(query.body());
+            if (streamed != null) {
+                return streamed;
+            }
+        }
         return engine.execute(query.body());
     }
 
@@ -1559,10 +1627,18 @@ public final class Executor {
         // 分页语义(FR-551):先过滤(forEachMatch 已按计划 + 残余谓词过滤)→ 再跳过 offset
         // → 再截断 count。索引路径与全表扫路径都经过这里,行为天然一致(FR-552)。
         int[] skipped = {0};
-        // FR-647:无谓词时把 LIMIT 下推到扫描(返回的 key 里主键在前、索引项在后)。
-        int scanLimit = (limit != null && select.where() == null) ? limit + offset : 0;
         // 事务内:固定快照 + 读己之写;事务外:最新已提交(FR-343 / FR-500 / FR-510)。
         ReadView view = currentView(null);
+        // SPEC-P6.1 FR-715:单表范围扫描 + 最新视图 + 可游标存储 ⇒ 流式结果集。
+        // 这里不把 LIMIT 下推给扫描,而是"取够就关游标"(上游立即停止扫描)。
+        if (streamingResults && plan.kind() == Plan.Kind.RANGE && view.isLatest()
+                && kv instanceof com.wangyu.tangdb.storage.CursoredStore cursored) {
+            return new Result.StreamTable(projection.names(), new ScanRowStream(
+                    cursored.openScan(plan.start(), plan.end(), 0, 0, null), table, plan,
+                    projection, limit, offset));
+        }
+        // FR-647:无谓词时把 LIMIT 下推到扫描(返回的 key 里主键在前、索引项在后)。
+        int scanLimit = (limit != null && select.where() == null) ? limit + offset : 0;
         RowVisitor visitor = (key, values) -> {
             if (skipped[0] < offset) {
                 skipped[0]++;
@@ -1583,6 +1659,90 @@ public final class Executor {
             forEachMatch(plan, table, view, 0, visitor);
         }
         return new Result.Table(projection.names(), rows);
+    }
+
+    /**
+     * 单表范围扫描的流式行源(SPEC-P6.1 FR-715):逐批解码 → 残余谓词 → 跳 offset → 截 limit,
+     * 取够或读完后 close 游标,把"整表物化"换成"一批行"。
+     */
+    private final class ScanRowStream implements RowStream {
+
+        private final com.wangyu.tangdb.storage.ScanCursor cursor;
+        private final TableMeta table;
+        private final Plan plan;
+        private final Planner.Projection projection;
+        private final Integer limit;
+        private final int offset;
+        private int skipped;
+        private int emitted;
+        private boolean closed;
+
+        ScanRowStream(com.wangyu.tangdb.storage.ScanCursor cursor, TableMeta table, Plan plan,
+                      Planner.Projection projection, Integer limit, int offset) {
+            this.cursor = cursor;
+            this.table = table;
+            this.plan = plan;
+            this.projection = projection;
+            this.limit = limit;
+            this.offset = offset;
+        }
+
+        @Override
+        public List<String> columns() {
+            return projection.names();
+        }
+
+        @Override
+        public List<Object[]> nextBatch() {
+            while (!closed) {
+                if (limit != null && emitted >= limit) {
+                    close();
+                    return null;
+                }
+                List<KeyValue> batch = cursor.nextBatch();
+                if (batch == null) {
+                    close();
+                    return null;
+                }
+                List<Object[]> out = new ArrayList<>();
+                int[] indexes = projection.indexes();
+                for (KeyValue kv : batch) {
+                    if (KeyCodec.indexId(kv.key()) != KeyCodec.INDEX_ID_PRIMARY) {
+                        continue; // 同一表前缀下的索引项
+                    }
+                    RowCodec.Decoded decoded = RowCodec.decode(table, kv.value());
+                    if (decoded.tombstone() || !matches(plan, decoded.values())) {
+                        continue;
+                    }
+                    if (skipped < offset) {
+                        skipped++;
+                        continue;
+                    }
+                    if (limit != null && emitted >= limit) {
+                        break;
+                    }
+                    Object[] row = new Object[indexes.length];
+                    for (int i = 0; i < indexes.length; i++) {
+                        row[i] = decoded.values()[indexes[i]];
+                    }
+                    out.add(row);
+                    emitted++;
+                }
+                if (!out.isEmpty()) {
+                    return out;
+                }
+            }
+            return null;
+        }
+
+        @Override
+        public void close() {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            cursor.close();
+        }
     }
 
     /** 与执行共用同一个计划构造入口(FR-517):查询、DML、EXPLAIN 都走这里。 */

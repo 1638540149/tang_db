@@ -1,0 +1,57 @@
+# 全面测试提示词 · P6.1 补做后验收(FE 算子并行 / 并行排序 / 流式结果 / 解码复用)
+
+> 你的角色是**独立测试方**:只做验证与取证,不重构、不"顺手优化"、不改门限、不改断言。
+> 被测对象:`D:\projects\tang_db` 工作区里**未提交**的 P6.1(含本轮补做 FR-712/713/714/715/716)。
+
+## 0. 上一轮的基线(别重复它的结论,要对照它)
+
+- `docs/验收报告/P6.1-验收报告.md` —— 上一轮核验方的完整结论:产品侧通过、SC-400~416/418 全绿;**当时 FR-712/713/714/715/716 未实现**。
+- `docs/读代码地图/读代码地图-P6.1.md` —— 本期的代码落点。
+- **本轮的重点**:证明这 5 条补做**真的生效**,且**没有破坏任何既有能力**。
+
+## 1. 环境纪律(违反则结果不可信)
+
+- **独占**:同一时刻只允许一个测试脚本在跑。开跑前确认没有残留 `be.exe` / `tangdb.fed.Fed`:
+  `ps -W | grep -iE 'be\.exe|java\.exe'` 与 `netstat -ano | grep LISTENING | grep -E ':(9900|9906|9991|9716|9940|9946|9951|9110)\s'`
+- **不要在 IDEA 里跑任何东西**:IDEA 的 fed 用 `fe/target/classes`,与 `mvn` 会互相踩(会报 `NoClassDefFoundError: ...Ast$Func`)。
+- **起服务只用仓库脚本**:`scripts/start-be.sh` / `scripts/start-fe.sh` / `scripts/tests/*.sh`;禁止 `nohup` / `disown` / 裸 `&`(上一轮这样把 bash 工具卡死三次)。单条命令超过 90 秒没返回就换写法。
+- 端口/数据目录不要改成业务环境的 9100/3406;脚本各自带端口。
+
+## 2. 必跑项(顺序执行,每项留日志到 `tmp/codex-test/`)
+
+1. `cd be && go build ./... && go vet ./... && go test ./...`
+2. `cd fe && mvn.cmd test`(记录 `Tests run:` 总数;上一轮是 367,本轮预期 390+)
+3. `SKIP_REGRESSION=1 bash scripts/tests/p6.1-test.sh`(本体 SC-400~SC-418,约 15~25 分钟;**不许出现新的红**)
+4. 既有回归**逐个单跑**(不要串在一层脚本里跑,那是上一轮假红的根源):
+   `p2-test.sh` → `p3-test.sh` → `p35-test.sh` → `p4-test.sh` → `p5-test.sh` → `p6-test.sh` → `crash-test.sh`
+   每个跑完先清场再跑下一个。已知豁免:`p5` 的 SC-368 是"提速后状态探针太快"的竞态、`p6` 的 SC-387 是 P6 遗留未达标项——**除这两条,其余不许红**。
+5. 真客户端探针:用仓库里现成的 `MysqlClientConnection` / `MysqlErrorCheck` 测试辅助类(或用 `docker run --rm -i mysql:8.0 mysql ...` 连 fed 的 MySQL 端口)打几条:宽表投影、谓词 + LIMIT、`SHOW TABLES`、`information_schema` 查询,要求 `CODE=0` 且行数对得上。
+
+## 3. 本轮 5 条 FR 的定向验证(重点,必须自己设计查询)
+
+| FR | 怎么证它生效 |
+|---|---|
+| FR-716 解码复用 | 同一张 20 列表,`SELECT *` 与 `SELECT 两列` 各跑 N 次:结果逐行一致;并记录 GC/分配情况(可用 `-verbose:gc` 日志条数或对比耗时) |
+| FR-714 并行排序 | 大表 `ORDER BY 多列` + `LIMIT`:并行度 1 与 8 的**结果逐行一致且顺序一致**,并行度 8 更快 |
+| FR-713 聚合并行 | `GROUP BY` + `COUNT/SUM/AVG/MIN/MAX/STDDEV/VARIANCE/GROUP_CONCAT`:并行度 1 与 8 **逐行一致(含行序)** |
+| FR-712 Hash Join 并行 | 三表 JOIN(含 `LEFT JOIN` 的补空行):并行度 1 与 8 逐行一致;8 更快 |
+| FR-715 结果流式 | `SELECT * FROM 宽表 LIMIT 10` 与 `LIMIT 5 OFFSET 100`:行数/内容与关闭流式时一致;大结果集(≥20 万行)不 OOM |
+
+对每条给出:命令、SQL、并行度、耗时(三次中位数)、结论(生效 / 没生效 / 生效但有副作用)。
+
+## 4. 不算通过的情形(自己先排除,别写进结论)
+
+- 端口被占、上一轮残留 BE、`target/classes` 被 IDE 重写导致的 `ClassNotFoundException` / `Connection refused` / `BE 启动失败` —— 这是环境,重跑一次再判。
+- 嵌套脚本里才出现的红:必须**单独再跑一次**该脚本,只认单跑结果,并在报告里注明"嵌套红不作数"。
+
+## 5. 交付
+
+- `tmp/codex-test/` 下每个脚本一份日志;
+- 一份 `tmp/codex-test/结论.md`:逐项 PASS/FAIL + 真实回显摘录 + 5 条 FR 的定向结论 + 与上一轮验收数字的对比表(导入行/秒、扫描行/秒、三表 JOIN 耗时、单行 P99);
+- **每一行数字都必须是你自己跑出来的**。没跑的项写"未验证",不许把"应该没问题"写成通过。
+
+## 6. 明确不要做
+
+- 不改 `specs/`、不写 `docs/验收报告`、不 `git commit` / `git push`;
+- 不改门限、不改断言、不为了让脚本变绿去降级判定;
+- 不派子代理、不并发跑脚本。

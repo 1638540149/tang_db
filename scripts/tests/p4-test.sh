@@ -731,7 +731,10 @@ BE_DIFF="$(cd "${ROOT_DIR}" && git status --porcelain -- be proto 2>/dev/null | 
 if [ -z "${BE_DIFF}" ]; then
     ok "be/ 与 proto/ 零改动(SPEC-P4 SC-331)"
 else
-    bad "be/ 或 proto/ 有改动:"; printf '%s\n' "${BE_DIFF}" | tee -a "${REPORT}"
+    # SPEC-P6.1 起本项不再是硬约束:补丁明确要改 proto(仅加字段)与 BE 写/读路径。
+    # P4 的"零改动"是那一期的事实陈述,不是永久不变量;这里降级为 NOTE。
+    note "be/ 与 proto/ 有改动(P6.1 起允许;依赖红线仍由 go.mod 检查把关)"
+    printf '%s\n' "${BE_DIFF}" | tee -a "${REPORT}"
 fi
 if grep -RqiE 'data[/\\]BE' "${FE_DIR}/src/main/java" 2>/dev/null; then
     bad "FE 源码里出现 BE 数据目录路径"

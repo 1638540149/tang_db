@@ -98,8 +98,10 @@ class ColumnarCodecTest {
         }
 
         Result.Table segments = (Result.Table) executor.execute(Parser.parse("SHOW SEGMENTS"));
+        // SPEC-P6.1 FR-706:末尾新增"剪枝命中 / 跳过 chunk 数"两列(既有列不变)。
         assertEquals(List.of("segment", "column", "rows", "chunks", "raw_bytes",
-                "compressed_bytes", "ratio", "encodings"), segments.columns());
+                "compressed_bytes", "ratio", "encodings",
+                "pruned_chunks(be_total)", "skipped_chunks(be_total)"), segments.columns());
         assertEquals(2, segments.rows().size(), "键列 + 值列各一行");
         long compressed = 0;
         for (Object[] row : segments.rows()) {

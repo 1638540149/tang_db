@@ -18,6 +18,60 @@ type Iterator struct {
 	pos    int
 	valid  bool
 	err    error
+
+	// SPEC-P6.1 FR-709:顺序扫描预读下一个 chunk(只读,不改磁盘格式)。
+	// 预读失败不影响结果:消费时发现 err != nil 就退回同步读。
+	pf *prefetch
+}
+
+// prefetch 是一个正在后台读取的 chunk。
+type prefetch struct {
+	idx        int
+	keyChunk   []byte
+	valueChunk []byte
+	err        error
+	done       chan struct{}
+}
+
+// startPrefetch 在后台把 idx 号 chunk 的原始字节读进内存。
+// os.File.ReadAt 本身并发安全;预读只是把下一次 loadChunk 的两次 ReadAt 提前。
+func (it *Iterator) startPrefetch(idx int) {
+	if idx < 0 || idx >= len(it.r.index) {
+		return
+	}
+	entry := it.r.index[idx]
+	pf := &prefetch{idx: idx, done: make(chan struct{})}
+	it.pf = pf
+	go func() {
+		defer close(pf.done)
+		keyChunk, err := it.r.readAt(it.r.footer.ChunkAreaOffset+entry.keyOffset,
+			entry.keyLen, false)
+		if err != nil {
+			pf.err = err
+			return
+		}
+		valueChunk, err := it.r.readAt(it.r.footer.ValueColumnOffset+entry.valueOffset,
+			entry.valueLen, false)
+		if err != nil {
+			pf.err = err
+			return
+		}
+		pf.keyChunk, pf.valueChunk = keyChunk, valueChunk
+	}()
+}
+
+// takePrefetch 取走"正好是 idx"的预读结果;没有或失败时返回 nil。
+func (it *Iterator) takePrefetch(idx int) (*prefetch, bool) {
+	pf := it.pf
+	if pf == nil || pf.idx != idx {
+		return nil, false
+	}
+	<-pf.done
+	it.pf = nil
+	if pf.err != nil {
+		return nil, false
+	}
+	return pf, true
 }
 
 // NewIterator 创建从空位置开始的迭代器;用 First 或 Seek 定位。
@@ -56,6 +110,8 @@ func (it *Iterator) Seek(target []byte) {
 		it.valid = false
 		return
 	}
+	// SPEC-P6.1 FR-706:二分命中的 chunk 之前的全部 chunk 都被 key 范围剪掉了。
+	it.r.AddSkippedChunks(idx)
 	if err := it.loadChunk(idx); err != nil {
 		it.fail(err)
 		return
@@ -121,13 +177,19 @@ func (it *Iterator) advanceChunk() {
 
 func (it *Iterator) loadChunk(idx int) error {
 	entry := it.r.index[idx]
-	keyChunk, err := it.r.readAt(it.r.footer.ChunkAreaOffset+entry.keyOffset, entry.keyLen, false)
-	if err != nil {
-		return err
-	}
-	valueChunk, err := it.r.readAt(it.r.footer.ValueColumnOffset+entry.valueOffset, entry.valueLen, false)
-	if err != nil {
-		return err
+	var keyChunk, valueChunk []byte
+	if pf, ok := it.takePrefetch(idx); ok {
+		keyChunk, valueChunk = pf.keyChunk, pf.valueChunk
+	} else {
+		var err error
+		keyChunk, err = it.r.readAt(it.r.footer.ChunkAreaOffset+entry.keyOffset, entry.keyLen, false)
+		if err != nil {
+			return err
+		}
+		valueChunk, err = it.r.readAt(it.r.footer.ValueColumnOffset+entry.valueOffset, entry.valueLen, false)
+		if err != nil {
+			return err
+		}
 	}
 
 	var keys, values [][]byte
@@ -152,9 +214,14 @@ func (it *Iterator) loadChunk(idx int) error {
 			return fmt.Errorf("segment: chunk %d row count mismatch", idx)
 		}
 	}
+	it.r.AddReadChunk()
 	it.chunk = idx
 	it.keys = keys
 	it.values = values
+	// 预读下一个 chunk:失败只影响性能,不影响结果(消费时退回同步读)。
+	if it.pf == nil {
+		it.startPrefetch(idx + 1)
+	}
 	return nil
 }
 

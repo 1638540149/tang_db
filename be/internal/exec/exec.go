@@ -13,6 +13,7 @@ package exec
 import (
 	"bytes"
 	"container/heap"
+	"runtime"
 	"sync"
 
 	"github.com/1638540149/tang_db/be/internal/memtable"
@@ -186,20 +187,83 @@ func (s *Scanner) firstErr() error {
 // ---------------------------------------------------------------- 适配器
 
 // NewMemCursor 把 memtable 包装成 Cursor。
+//
+// memtable 的惰性游标在"创建之后又被写过"时返回 memtable.ErrUnsafe(SPEC-P6.1 FR-697)。
+// 本层负责**重建**:丢掉旧游标,新建一个并 Seek 回最后读到的 key,再继续前进。
+// 这样上层扫描器看到的是"同一位置之后的完整数据",既不会静默读到过期数据,
+// 也不会把常态并发写变成查询失败。
 func NewMemCursor(m *memtable.MemTable) Cursor {
-	return &memCursor{it: m.Iterator()}
+	return &memCursor{m: m, it: m.Iterator()}
 }
+
+// memCursorRebuildMax 是一次调用里允许的重建次数上限;超过即把错误交给上层。
+//
+// 8 路并发导入实测会连续撞上水位失效(每次重建都可能被下一批写打断),
+// 所以给足重试次数;真正持续写不停时仍以错误收场(不静默返回过期数据)。
+const memCursorRebuildMax = 200
 
 type memCursor struct {
-	it *memtable.Iterator
+	m    *memtable.MemTable
+	it   *memtable.Iterator
+	last []byte // 最近一次读到的 key(重建时 Seek 回去)
+	err  error
 }
 
-func (c *memCursor) Seek(target []byte) { c.it.Seek(target) }
-func (c *memCursor) Valid() bool        { return c.it.Valid() }
-func (c *memCursor) Key() []byte        { return c.it.Key() }
-func (c *memCursor) Value() []byte      { return c.it.Value() }
-func (c *memCursor) Next()              { c.it.Next() }
-func (c *memCursor) Err() error         { return nil }
+func (c *memCursor) Seek(target []byte) {
+	if c.err != nil {
+		return
+	}
+	c.it = c.m.IteratorAt(target)
+	for attempt := 0; c.it.Err() != nil; attempt++ {
+		if attempt >= memCursorRebuildMax {
+			c.err = c.it.Err()
+			return
+		}
+		runtime.Gosched()
+		c.it = c.m.IteratorAt(target)
+	}
+	c.last = nil
+	if c.it.Valid() {
+		c.last = append(c.last[:0], c.it.Key()...)
+	}
+}
+
+func (c *memCursor) Valid() bool {
+	return c.err == nil && c.it.Err() == nil && c.it.Valid()
+}
+
+func (c *memCursor) Key() []byte   { return c.it.Key() }
+func (c *memCursor) Value() []byte { return c.it.Value() }
+
+func (c *memCursor) Next() {
+	if c.err != nil {
+		return
+	}
+	c.it.Next()
+	for attempt := 0; c.it.Err() != nil; attempt++ {
+		if attempt >= memCursorRebuildMax {
+			c.err = c.it.Err()
+			return
+		}
+		// 重建后 Seek 回上一个位置,再前进一格 —— 位置与旧游标一一对应。
+		runtime.Gosched()
+		fresh := c.m.IteratorAt(c.last)
+		if c.last != nil && fresh.Valid() && bytes.Equal(fresh.Key(), c.last) {
+			fresh.Next()
+		}
+		c.it = fresh
+	}
+	if c.it.Valid() {
+		c.last = append(c.last[:0], c.it.Key()...)
+	}
+}
+
+func (c *memCursor) Err() error {
+	if c.err != nil {
+		return c.err
+	}
+	return c.it.Err()
+}
 
 // NewSegmentCursor 把 segment 包装成 Cursor。
 func NewSegmentCursor(r *segment.Reader) Cursor {

@@ -159,6 +159,75 @@ public final class Aggregates {
             concatBytes += bytes;
         }
 
+        /**
+         * 合并另一个局部累加器(SPEC-P6.1 FR-713 的二次合并)。
+         *
+         * <p>语义与"按行序喂完全部行"一致:</p>
+         * <ul>
+         *   <li>COUNT / SUM / AVG 累加计数与两种和(整数和与浮点和);</li>
+         *   <li>MIN / MAX 取极值,COUNT(DISTINCT) 取并集;</li>
+         *   <li>VARIANCE / STDDEV 用 Welford 的并行合并公式(总体口径不变);</li>
+         *   <li>GROUP_CONCAT 按调用方的合并顺序追加,仍受 1MB 上限约束。</li>
+         * </ul>
+         */
+        public void mergeFrom(Accumulator other) {
+            if (other == null || other == this) {
+                return;
+            }
+            if (distinct == null) {
+                count += other.count;
+            }
+            hasValue = hasValue || other.hasValue;
+            anyDouble = anyDouble || other.anyDouble;
+            longSum += other.longSum;
+            doubleSum += other.doubleSum;
+            if (other.min != null && (min == null || ValueOps.compare(other.min, min) < 0)) {
+                min = other.min;
+            }
+            if (other.max != null && (max == null || ValueOps.compare(other.max, max) > 0)) {
+                max = other.max;
+            }
+            if (distinct != null && other.distinct != null) {
+                distinct.addAll(other.distinct);
+                count = distinct.size(); // COUNT(DISTINCT):计数取并集大小,不是各片计数之和
+            }
+            if (other.statCount > 0) {
+                if (statCount == 0) {
+                    statCount = other.statCount;
+                    statMean = other.statMean;
+                    statM2 = other.statM2;
+                } else {
+                    long total = statCount + other.statCount;
+                    double delta = other.statMean - statMean;
+                    statMean += delta * other.statCount / total;
+                    statM2 += other.statM2
+                            + delta * delta * statCount * other.statCount / total;
+                    statCount = total;
+                }
+            }
+            mergeConcat(other);
+        }
+
+        private void mergeConcat(Accumulator other) {
+            if (concat == null || other.concat == null || other.concat.length() == 0) {
+                return;
+            }
+            int separatorBytes = concat.length() == 0 ? 0 : 1;
+            if (concatBytes + separatorBytes + other.concatBytes > GROUP_CONCAT_LIMIT_BYTES) {
+                if (!concatTruncated) {
+                    concatTruncated = true;
+                    warnings.warn("GROUP_CONCAT 结果超过 1MB 上限,已截断");
+                }
+                return;
+            }
+            if (separatorBytes > 0) {
+                concat.append(',');
+                concatBytes++;
+            }
+            concat.append(other.concat);
+            concatBytes += other.concatBytes;
+        }
+
         /** 取聚合结果。 */
         public Object result() {
             return switch (name) {

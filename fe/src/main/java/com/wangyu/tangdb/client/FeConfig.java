@@ -60,6 +60,20 @@ public final class FeConfig {
     public static final int DEFAULT_SUBQUERY_CACHE_MAX_ENTRIES = 4096;
     public static final int DEFAULT_STATS_STALE_ROW_CHANGE_PERCENT = 20;
 
+    // ---- SPEC-P6.1 §5.2(9 项中的 FE 6 项) ----
+    /** 扫描与算子的并行度,默认 min(8, CPU)(FR-711 / K153)。 */
+    public static final int DEFAULT_QUERY_PARALLELISM = Math.min(8, Runtime.getRuntime().availableProcessors());
+    /** 列投影 + 谓词下推总开关(默认开,K153)。 */
+    public static final boolean DEFAULT_PUSHDOWN_ENABLED = true;
+    /** 扫描批行数(自适应上限 8192,FR-708)。 */
+    public static final int DEFAULT_SCAN_BATCH_ROWS = 4096;
+    /** 普通读写/事务期限(秒,FR-722)。 */
+    public static final int DEFAULT_RPC_DEADLINE_SECONDS = 5;
+    /** 批量导入 / 索引回填 / ANALYZE 期限(秒,FR-722)。 */
+    public static final int DEFAULT_RPC_BULK_DEADLINE_SECONDS = 60;
+    /** 范围扫描 / 分片扫描期限(秒,FR-722)。 */
+    public static final int DEFAULT_RPC_SCAN_DEADLINE_SECONDS = 60;
+
     private final String beHost;
     private final int bePort;
     private final int heartbeatListenPort;
@@ -78,6 +92,12 @@ public final class FeConfig {
     private final String sortTmpDir;
     private final int csvImportBatchRows;
     private final com.wangyu.tangdb.planner.OptimizerConfig optimizer;
+    private final int queryParallelism;
+    private final boolean pushdownEnabled;
+    private final int scanBatchRows;
+    private final int rpcDeadlineSeconds;
+    private final int rpcBulkDeadlineSeconds;
+    private final int rpcScanDeadlineSeconds;
 
     private FeConfig(String beHost, int bePort, int heartbeatListenPort, int beOfflineCycles,
                      boolean heartbeatEnabled, String mode, int mysqlPort, int sessionMax,
@@ -85,6 +105,22 @@ public final class FeConfig {
                      int indexBackfillBatch, int queryBatchRows, long sortSpillBytes,
                      String sortTmpDir, int csvImportBatchRows,
                      com.wangyu.tangdb.planner.OptimizerConfig optimizer) {
+        this(beHost, bePort, heartbeatListenPort, beOfflineCycles, heartbeatEnabled, mode,
+                mysqlPort, sessionMax, sessionIdleTimeout, shutdownGraceSeconds, user, password,
+                indexBackfillBatch, queryBatchRows, sortSpillBytes, sortTmpDir,
+                csvImportBatchRows, optimizer, DEFAULT_QUERY_PARALLELISM,
+                DEFAULT_PUSHDOWN_ENABLED, DEFAULT_SCAN_BATCH_ROWS, DEFAULT_RPC_DEADLINE_SECONDS,
+                DEFAULT_RPC_BULK_DEADLINE_SECONDS, DEFAULT_RPC_SCAN_DEADLINE_SECONDS);
+    }
+
+    private FeConfig(String beHost, int bePort, int heartbeatListenPort, int beOfflineCycles,
+                     boolean heartbeatEnabled, String mode, int mysqlPort, int sessionMax,
+                     int sessionIdleTimeout, int shutdownGraceSeconds, String user, String password,
+                     int indexBackfillBatch, int queryBatchRows, long sortSpillBytes,
+                     String sortTmpDir, int csvImportBatchRows,
+                     com.wangyu.tangdb.planner.OptimizerConfig optimizer,
+                     int queryParallelism, boolean pushdownEnabled, int scanBatchRows,
+                     int rpcDeadlineSeconds, int rpcBulkDeadlineSeconds, int rpcScanDeadlineSeconds) {
         this.beHost = beHost;
         this.bePort = bePort;
         this.heartbeatListenPort = heartbeatListenPort;
@@ -104,6 +140,12 @@ public final class FeConfig {
         this.csvImportBatchRows = csvImportBatchRows;
         this.optimizer = optimizer == null
                 ? com.wangyu.tangdb.planner.OptimizerConfig.defaults() : optimizer;
+        this.queryParallelism = queryParallelism;
+        this.pushdownEnabled = pushdownEnabled;
+        this.scanBatchRows = scanBatchRows;
+        this.rpcDeadlineSeconds = rpcDeadlineSeconds;
+        this.rpcBulkDeadlineSeconds = rpcBulkDeadlineSeconds;
+        this.rpcScanDeadlineSeconds = rpcScanDeadlineSeconds;
     }
 
     /** 内置默认配置。 */
@@ -227,6 +269,46 @@ public final class FeConfig {
         return optimizer;
     }
 
+    /** 扫描与算子的并行度(SPEC-P6.1 FR-711)。 */
+    public int queryParallelism() {
+        return queryParallelism;
+    }
+
+    /** 列投影 + 谓词下推总开关(SPEC-P6.1 FR-710 / FR-718)。 */
+    public boolean pushdownEnabled() {
+        return pushdownEnabled;
+    }
+
+    /** 扫描批行数(SPEC-P6.1 FR-708)。 */
+    public int scanBatchRows() {
+        return scanBatchRows;
+    }
+
+    /** 普通读写/事务期限(秒,FR-722)。 */
+    public int rpcDeadlineSeconds() {
+        return rpcDeadlineSeconds;
+    }
+
+    /** 批量导入 / 索引回填 / ANALYZE 期限(秒,FR-722)。 */
+    public int rpcBulkDeadlineSeconds() {
+        return rpcBulkDeadlineSeconds;
+    }
+
+    /** 范围扫描 / 分片扫描期限(秒,FR-722)。 */
+    public int rpcScanDeadlineSeconds() {
+        return rpcScanDeadlineSeconds;
+    }
+
+    /** 程序化覆盖执行层三项(测试与开关对拍用)。 */
+    public FeConfig withExecution(int parallelism, boolean pushdown, int batchRows) {
+        return new FeConfig(beHost, bePort, heartbeatListenPort, beOfflineCycles,
+                heartbeatEnabled, mode, mysqlPort, sessionMax, sessionIdleTimeout,
+                shutdownGraceSeconds, user, password, indexBackfillBatch, queryBatchRows,
+                sortSpillBytes, sortTmpDir, csvImportBatchRows, optimizer,
+                Math.max(1, parallelism), pushdown, Math.max(1, batchRows),
+                rpcDeadlineSeconds, rpcBulkDeadlineSeconds, rpcScanDeadlineSeconds);
+    }
+
     /**
      * 加载配置文件。
      *
@@ -284,6 +366,12 @@ public final class FeConfig {
         int cboTopnLimitRatioPercent = d.optimizer.topnLimitRatioPercent();
         int subqueryCacheMaxEntries = d.optimizer.subqueryCacheMaxEntries();
         int statsStaleRowChangePercent = d.optimizer.statsStaleRowChangePercent();
+        int queryParallelism = d.queryParallelism;
+        boolean pushdownEnabled = d.pushdownEnabled;
+        int scanBatchRows = d.scanBatchRows;
+        int rpcDeadlineSeconds = d.rpcDeadlineSeconds;
+        int rpcBulkDeadlineSeconds = d.rpcBulkDeadlineSeconds;
+        int rpcScanDeadlineSeconds = d.rpcScanDeadlineSeconds;
 
         for (int i = 0; i < lines.size(); i++) {
             String line = lines.get(i);
@@ -353,6 +441,18 @@ public final class FeConfig {
                         subqueryCacheMaxEntries = parseInt(key, value, path, i + 1, 1, 10_000_000);
                 case "stats_stale_row_change_percent" ->
                         statsStaleRowChangePercent = parseInt(key, value, path, i + 1, 1, 1000);
+                // ---- SPEC-P6.1 §5.2 ----
+                case "query_parallelism" ->
+                        queryParallelism = parseParallelism(value, path, i + 1);
+                case "pushdown_enabled" -> pushdownEnabled = parseBoolean(key, value, path, i + 1);
+                case "scan_batch_rows" ->
+                        scanBatchRows = parseInt(key, value, path, i + 1, 1, 8192);
+                case "rpc_deadline_seconds" ->
+                        rpcDeadlineSeconds = parseInt(key, value, path, i + 1, 1, 600);
+                case "rpc_bulk_deadline_seconds" ->
+                        rpcBulkDeadlineSeconds = parseInt(key, value, path, i + 1, 1, 600);
+                case "rpc_scan_deadline_seconds" ->
+                        rpcScanDeadlineSeconds = parseInt(key, value, path, i + 1, 1, 600);
                 default -> throw new IllegalArgumentException(
                         path + " 第 " + (i + 1) + " 行未知配置项: " + key);
             }
@@ -364,7 +464,29 @@ public final class FeConfig {
                 new com.wangyu.tangdb.planner.OptimizerConfig(optimizerEnabled, cboJoinEnumMaxTables,
                         cboHashAggregateDistinctMax, cboTopnLimitRatioPercent, subqueryCacheMaxEntries,
                         statsStaleRowChangePercent, analyzeFullScanMaxRows, analyzeSampleStride,
-                        analyzeHistogramBuckets, analyzeExactDistinctMaxRows, analyzeHllPrecision));
+                        analyzeHistogramBuckets, analyzeExactDistinctMaxRows, analyzeHllPrecision),
+                queryParallelism, pushdownEnabled, scanBatchRows, rpcDeadlineSeconds,
+                rpcBulkDeadlineSeconds, rpcScanDeadlineSeconds);
+    }
+
+    /**
+     * 解析并行度:必须 ≥ 1;超过 CPU×4 视为配置非法并给出建议上限(SPEC-P6.1 §8 #115/#116)。
+     */
+    private static int parseParallelism(String raw, String path, int lineNo) {
+        int max = Math.max(1, Runtime.getRuntime().availableProcessors() * 4);
+        int value;
+        try {
+            value = Integer.parseInt(raw.trim());
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException(path + " 第 " + lineNo
+                    + " 行 query_parallelism 无效: " + raw + "（应为 1-" + max + "）");
+        }
+        if (value < 1 || value > max) {
+            throw new IllegalArgumentException(path + " 第 " + lineNo
+                    + " 行 query_parallelism 无效: " + raw + "（应为 1-" + max
+                    + "，建议不超过 CPU 核数×4=" + max + "）");
+        }
+        return value;
     }
 
     private static String parseMode(String raw, String path, int lineNo) {
