@@ -183,12 +183,12 @@ public final class Fed implements AutoCloseable {
                         sessions, catalog, metrics, consoleMetrics));
                 consoleServer.start();
             } catch (IOException e) {
-                if (heartbeatServer != null) {
-                    heartbeatServer.close();
-                }
-                client.close();
-                throw new FeStartupException("控制台端口 " + config.p8().consolePort()
-                        + " 无法监听(可能已被占用):" + e.getMessage(), e);
+                // 控制台是附加能力:端口被占用(同机多 fed 实例、或别的进程占了 console_port)
+                // 只告警降级,不阻断 SQL 服务 —— 否则一台机器上起第二个 fed 就起不来
+                // (实测 P8 回归:p3 的 nohb fed 因 8080 被主 fed 占用而启动失败)。
+                LOG.log(Level.WARNING, "控制台端口 " + config.p8().consolePort()
+                        + " 无法监听,已跳过控制台(不影响 SQL 服务): {0}", e.getMessage());
+                consoleServer = null;
             }
         }
 
