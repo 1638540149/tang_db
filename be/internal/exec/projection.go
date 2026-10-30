@@ -23,6 +23,8 @@ import (
 //	2 INT32   : 4 字节小端有符号整数(比较时翻转符号位后按大端)
 //	3 INT64   : 8 字节小端有符号整数(同上)
 //	4 FLOAT64 : 8 字节小端 IEEE754(比较时做保序变换)
+//	6 VECTOR_FIXED : 定长 4n 字节(SPEC-P7 §5.1)。宽度超过 u8,主槽表 width 记 0,
+//	                 真实宽度在槽表末尾的宽槽段:[u16 宽槽数] 然后 [u16 ordinal][u32 width]×
 //
 // row_frame 编码:
 //
@@ -39,6 +41,8 @@ const (
 	// Java 的 signed byte(见 ValueOps.compare),所以 BE 必须对每个字节翻最高位,
 	// 让无符号的字节比较得到与 FE 完全一致的结果。
 	SlotVarLenSigned byte = 5
+	// SlotVectorFixed 是 SPEC-P7 的定长向量槽:BE 只按偏移切片,不知道这是向量。
+	SlotVectorFixed byte = 6
 )
 
 // ErrBadProjection 表示 FE 下发的列投影参数不自洽(属于调用方参数错误)。
@@ -74,6 +78,31 @@ func ParseSlots(b []byte) ([]Slot, error) {
 			Ordinal: int(binary.LittleEndian.Uint16(b[base : base+2])),
 			Kind:    b[base+2],
 			Width:   int(b[base+3]),
+		}
+	}
+	// 宽槽段(SPEC-P7 §5.1):仅当存在定长 >255 字节的列(向量)时出现。
+	pos := 2 + n*4
+	if pos+2 <= len(b) {
+		wide := int(binary.LittleEndian.Uint16(b[pos : pos+2]))
+		pos += 2
+		if pos+wide*6 > len(b) {
+			return nil, fmt.Errorf("%w: column_slots wide section truncated (want %d)", ErrBadProjection, wide)
+		}
+		for i := 0; i < wide; i++ {
+			ordinal := int(binary.LittleEndian.Uint16(b[pos : pos+2]))
+			width := int(binary.LittleEndian.Uint32(b[pos+2 : pos+6]))
+			pos += 6
+			found := false
+			for j := range slots {
+				if slots[j].Ordinal == ordinal {
+					slots[j].Width = width
+					found = true
+					break
+				}
+			}
+			if !found {
+				return nil, fmt.Errorf("%w: wide slot ordinal %d not present", ErrBadProjection, ordinal)
+			}
 		}
 	}
 	return slots, nil
@@ -240,6 +269,31 @@ func (l *RowLayout) ProjectRow(row []byte, mask uint32) (frame []byte, selected 
 		out++
 	}
 	return frame, selected, true
+}
+
+// ColumnPayload 直接返回某一列在行值里的载荷字节(不建帧、不复制)。
+//
+// SPEC-P7.1:向量检索要按行读向量列,`ProjectRow` 每行都分配一个帧 —— 未落盘 1 万行时
+// 每查询 5MB 额外分配,是 memtable 暴力段的主要成本。这里只做切片,调用方自己解释字节。
+//
+// 返回值:payload(非 NULL 时的载荷)、null(该列为 NULL)、ok(行/列可解析)。
+func (l *RowLayout) ColumnPayload(row []byte, ordinal int) ([]byte, bool, bool) {
+	if l == nil || ordinal < 0 || ordinal >= len(l.ordered) {
+		return nil, false, false
+	}
+	cols, ok := l.Locate(row)
+	if !ok {
+		return nil, false, false
+	}
+	c := cols[ordinal]
+	if c.Null {
+		return nil, true, true
+	}
+	off, size := columnPayload(l.ordered[ordinal], c)
+	if off < 0 || size < 0 || off+size > len(row) {
+		return nil, false, false
+	}
+	return row[off : off+size], false, true
 }
 
 // payloadLen 返回一列在帧里携带的载荷长度。

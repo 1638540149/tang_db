@@ -22,16 +22,18 @@ import (
 	"sync"
 )
 
-// FormatVersion 是 P3 起的数据目录格式版本(SPEC-P3 §5.4 / FR-335)。
+// FormatVersion 是数据目录格式版本。
 //
-// 2 = 版本段按 ^commit_ts 存放。P2 及以前把版本段固定写成 0x00×8,
-// 两种语义混在一棵 LSM 里会产生静默的可见性错误,因此老目录必须被拒绝。
-const FormatVersion uint64 = 2
+//	2 = P3 起:版本段按 ^commit_ts 存放(P2 及以前固定 0x00×8,混用会静默读错)。
+//	3 = P7 起:MANIFEST 增 vec_indexes[](segment → 图段文件 + 图参数 + 构建水位)。
+//
+// 老目录一律拒绝启动,不静默兼容、不自动迁移(SPEC-P3 K54 / SPEC-P7 FR-745)。
+const FormatVersion uint64 = 3
 
 // Manifest 描述数据库某一时刻的版本状态。
 type Manifest struct {
 	Version       uint64   `json:"version"`
-	FormatVersion uint64   `json:"format_version"` // P3 起固定为 2
+	FormatVersion uint64   `json:"format_version"` // P7 起固定为 3
 	LastCommitTS  uint64   `json:"last_commit_ts"` // 已落盘数据中的最大 commit_ts
 	Segments      []uint64 `json:"segments"`       // 有效 segment 编号(按创建顺序,旧到新;与 Levels 的并集保持一致)
 	// Levels 是 leveled compaction 的分层视图(SPEC-P5 FR-599):Levels[0]=L0(可重叠),
@@ -39,6 +41,49 @@ type Manifest struct {
 	Levels      [][]uint64 `json:"levels,omitempty"`
 	NextSegment uint64     `json:"next_segment"` // 下一个 segment 编号
 	NextWAL     uint64     `json:"next_wal"`     // 下一个 WAL 编号
+	// VecIndexes 是段级图索引记录(SPEC-P7 §5.3 / FR-745):segment → 图文件 + 图参数 + 构建水位。
+	// 只记录"已经 fsync 完成并可被检索使用"的图;半成品图不进 MANIFEST(FR-746)。
+	VecIndexes []VecIndexEntry `json:"vec_indexes,omitempty"`
+	// VecDefs 是 BE 侧的建图/检索参数缓存(FE 的 sys_vec_indexes 才是权威副本)。
+	// 放这里是为了重启后不必等 FE 再注册就能继续建图与检索(SPEC-P7 §5.3)。
+	VecDefs []VecDefEntry `json:"vec_defs,omitempty"`
+}
+
+// VecDefEntry 是"纯字节 + 数字"的建图定义:行键范围 / 列槽表 / 行框架 / 维度 / 度量。
+// 不含表名、列名、类型名、SQL(K161 / INV-16)。
+type VecDefEntry struct {
+	IndexID        uint64 `json:"index_id"`
+	TableID        uint64 `json:"table_id"`
+	StartKey       []byte `json:"start_key"`
+	EndKey         []byte `json:"end_key"`
+	ColumnSlots    []byte `json:"column_slots"`
+	RowFrame       []byte `json:"row_frame"`
+	VectorOrdinal  uint32 `json:"vector_ordinal"`
+	Dim            uint32 `json:"dim"`
+	Metric         uint8  `json:"metric"`
+	M              uint32 `json:"m"`
+	EfConstruction uint32 `json:"ef_construction"`
+}
+
+// 图段状态(与 FE 侧的索引级状态分开:这里是段级)。
+const (
+	VecStateReady   = "READY"
+	VecStatePending = "PENDING" // 标记待重建:该段检索退化暴力(FR-747)
+)
+
+// VecIndexEntry 描述"某 segment 上某向量索引"的图段。
+type VecIndexEntry struct {
+	IndexID        uint64 `json:"index_id"`
+	TableID        uint64 `json:"table_id"`
+	Segment        uint64 `json:"segment"`
+	File           string `json:"file"`
+	Dim            uint32 `json:"dim"`
+	Metric         uint8  `json:"metric"`
+	M              uint32 `json:"m"`
+	EfConstruction uint32 `json:"ef_construction"`
+	NodeCount      uint64 `json:"node_count"`
+	State          string `json:"state"`
+	BuildSeq       uint64 `json:"build_seq"`
 }
 
 // Registry 管理 CURRENT 与 MANIFEST 文件的原子更新。

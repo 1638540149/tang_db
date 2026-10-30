@@ -20,6 +20,7 @@ import com.wangyu.tangdb.storage.KvStore;
 import com.wangyu.tangdb.storage.RowCodec;
 import com.wangyu.tangdb.storage.StoreException;
 import com.wangyu.tangdb.storage.TableMeta;
+import com.wangyu.tangdb.storage.VectorIndexMeta;
 import com.wangyu.tangdb.storage.TransactionStore;
 import com.wangyu.tangdb.storage.Values;
 import com.wangyu.tangdb.txn.ReadView;
@@ -109,6 +110,14 @@ public final class Executor {
     /** 后端注册表(SHOW SEGMENTS 的剪枝计数来自心跳,SPEC-P6.1 FR-706)。 */
     private com.wangyu.tangdb.server.BackendRegistry backends;
 
+    // ---- SPEC-P7:向量检索参数(会话级 exact / path 开关)+ 推理算子 ----
+    private com.wangyu.tangdb.query.P7Options p7 = com.wangyu.tangdb.query.P7Options.defaults();
+    /** 会话级 SET vector_exact / vector_path 生效后,不再被 SqlEngine 的默认值覆盖。 */
+    private boolean p7SessionOverride;
+    /** SPEC-P7.1 K181:SET vector_profile = ON 时打印五段耗时(默认关闭)。 */
+    private boolean vectorProfile;
+    private com.wangyu.tangdb.ai.AiService ai;
+
     public Executor(KvStore kv, Catalog catalog) {
         this.kv = kv;
         this.catalog = catalog;
@@ -159,6 +168,11 @@ public final class Executor {
         return this;
     }
 
+    /** 最近一次 SELECT 的向量规划(SPEC-P7.1 K181 打点 / EXPLAIN 复用)。 */
+    public QueryEngine.VectorPlan lastVectorPlan() {
+        return lastVectorPlan;
+    }
+
     /** 测试用:强制关闭下推 / 并行(等价 P6 对拍档)。 */
     public Executor withLegacyExecution() {
         return withExecution(1, false, queryBatchRows);
@@ -186,6 +200,70 @@ public final class Executor {
     }
 
     /** 注入统计服务(常驻 FE 共享一份;单测里按需创建)。 */
+    /** SPEC-P7 §5.4:注入向量检索参数(门限与会话开关 exact / path)。 */
+    public Executor withP7(com.wangyu.tangdb.query.P7Options options) {
+        if (options != null) {
+            this.p7 = options;
+        }
+        return this;
+    }
+
+    /** 同时注入向量检索参数与推理算子(SqlEngine 的装配入口)。 */
+    public Executor withP7(com.wangyu.tangdb.query.P7Options options,
+                           com.wangyu.tangdb.ai.AiService service) {
+        if (options != null && !p7SessionOverride) {
+            this.p7 = options;
+        }
+        this.ai = service;
+        return this;
+    }
+
+    public com.wangyu.tangdb.query.P7Options p7() {
+        return p7;
+    }
+
+    /** SPEC-P7 FR-760 / SC-422:会话级开关(由 SET vector_exact / SET vector_path 驱动)。 */
+    public Executor setVectorExact(boolean exact) {
+        this.p7 = p7.withExact(exact);
+        this.p7SessionOverride = true;
+        return this;
+    }
+
+    public Executor setVectorPath(String path) {
+        this.p7 = p7.withPath(path);
+        this.p7SessionOverride = true;
+        return this;
+    }
+
+    /** 最近一次 SELECT 的向量规划(SPEC-P7.1 K181)。 */
+    private QueryEngine.VectorPlan lastVectorPlan;
+
+    /** SPEC-P7.1 K181:五段耗时开关(与 exact / path 独立,不受 p7SessionOverride 影响)。 */
+    public Executor setVectorProfile(boolean on) {
+        this.vectorProfile = on;
+        return this;
+    }
+
+    public boolean vectorProfile() {
+        return vectorProfile;
+    }
+
+    /** 清掉会话级覆盖(测试 / 重连时用)。 */
+    public Executor resetP7Overrides() {
+        this.p7SessionOverride = false;
+        return this;
+    }
+
+    /** SPEC-P7 E 组:注入推理算子(端点未配置时为 null,使用 ai_embed 会明确报错)。 */
+    public Executor withAi(com.wangyu.tangdb.ai.AiService service) {
+        this.ai = service;
+        return this;
+    }
+
+    public com.wangyu.tangdb.ai.AiService ai() {
+        return ai;
+    }
+
     public Executor withStats(com.wangyu.tangdb.stats.StatsService service) {
         this.stats = service;
         return this;
@@ -217,7 +295,8 @@ public final class Executor {
     private QueryEngine.Options queryOptions() {
         return new QueryEngine.Options(currentDatabase, queryBatchRows, sortSpillBytes, sortTmpDir,
                 vectorized, optimizer, stats()).withVirtualTables(virtualTables())
-                .withExecution(queryParallelism, pushdownEnabled, scanBatchRows);
+                .withExecution(queryParallelism, pushdownEnabled, scanBatchRows)
+                .withP7(p7.withProfile(vectorProfile));
     }
 
     /** 统计服务(懒创建:单测里 new Executor(kv, catalog) 也能用 ANALYZE)。 */
@@ -302,23 +381,40 @@ public final class Executor {
             requireNoTransaction("CREATE INDEX");
             return createIndex(create);
         }
+        if (statement instanceof Ast.CreateVectorIndex create) {
+            requireNoTransaction("CREATE VECTOR INDEX");
+            return createVectorIndex(create);
+        }
+        if (statement instanceof Ast.RebuildVectorIndex rebuild) {
+            requireNoTransaction("REBUILD VECTOR INDEX");
+            return rebuildVectorIndex(rebuild);
+        }
+        if (statement instanceof Ast.ShowVectorIndexes show) {
+            return showVectorIndexes(show);
+        }
+        if (statement instanceof Ast.ShowAiStats) {
+            return showAiStats();
+        }
         if (statement instanceof Ast.DropIndex drop) {
             requireNoTransaction("DROP INDEX");
             String db = resolveDatabase(drop.database());
-            IndexMeta index = catalog.dropIndex(db, drop.table(), drop.name());
-            return new Result.Message("OK, 索引 " + index.name() + " 已删除(表 "
-                    + drop.table().toLowerCase() + ")");
+            return dropAnyIndex(db, drop.table(), drop.name());
         }
         if (statement instanceof Ast.DropTable drop) {
             requireNoTransaction("DROP TABLE");
             String db = resolveDatabase(drop.database());
+            TableMeta table = catalog.require(db, drop.table());
+            dropTableVectorIndexes(table);   // SC-429:旧图文件随表一起消失
             catalog.dropTable(db, drop.table());
             return new Result.Message("OK, 表 " + drop.table().toLowerCase() + " 已删除");
         }
         if (statement instanceof Ast.TruncateTable truncate) {
             requireNoTransaction("TRUNCATE TABLE");
             String db = resolveDatabase(truncate.database());
+            TableMeta old = catalog.require(db, truncate.table());
             TableMeta table = catalog.truncateTable(db, truncate.table());
+            // TRUNCATE 换来一个新表 ID:旧表上的向量索引连同图段一起作废
+            dropTableVectorIndexes(old);
             return new Result.Message("OK, 表 " + table.name() + " 已清空(新表 ID " + table.id() + ")");
         }
         if (statement instanceof Ast.ShowTables show) {
@@ -381,6 +477,12 @@ public final class Executor {
         if (statement instanceof Ast.SelectQuery query) {
             return selectQuery(query);
         }
+        if (statement instanceof Ast.SelectVectorInfo query) {
+            return selectVectorInfo(query);
+        }
+        if (statement instanceof Ast.InsertSelect insertSelect) {
+            return runDml(() -> insertSelect(insertSelect));
+        }
         if (statement instanceof Ast.SetQuery setQuery) {
             return selectSet(setQuery);
         }
@@ -391,6 +493,359 @@ public final class Executor {
             return selectLiterals(literals);
         }
         throw new CatalogException("不支持的语句");
+    }
+
+    // ------------------------------------------------------------ SPEC-P7:向量索引 DDL / 观测
+
+    /** 表被删/清空时,先把它的向量索引删掉(BE 删图文件 + 元数据标 DROPPED)。 */
+    private void dropTableVectorIndexes(TableMeta table) {
+        for (VectorIndexMeta index : catalog.vectorIndexes(table.id())) {
+            com.wangyu.tangdb.storage.VectorStore store = vectorStore();
+            if (store != null) {
+                try {
+                    store.dropVectorIndex(index.beId());
+                } catch (RuntimeException e) {
+                    // BE 不可用不该阻止删表;图文件由后续启动的孤儿清理兜底
+                    warnings.add("删除表 " + table.name() + " 的向量索引 " + index.name()
+                            + " 图段失败: " + e.getMessage());
+                }
+            }
+            catalog.updateVectorIndexState(index, VectorIndexMeta.STATE_DROPPED);
+        }
+    }
+
+    /** 某向量索引的段级状态(MetaCommands / SHOW VECTOR INDEXES 用)。 */
+    public com.wangyu.tangdb.storage.VectorStore.VectorIndexStatus vectorIndexStatus(long indexId) {
+        com.wangyu.tangdb.storage.VectorStore store = vectorStore();
+        if (store == null) {
+            return com.wangyu.tangdb.storage.VectorStore.VectorIndexStatus.empty();
+        }
+        com.wangyu.tangdb.storage.VectorStore.VectorIndexStatus status = store.vectorIndexStatus(indexId);
+        return status == null
+                ? com.wangyu.tangdb.storage.VectorStore.VectorIndexStatus.empty() : status;
+    }
+
+    /** 向量索引的 BE 通道(内存实现没有该能力 → 元数据照建,图段不可用,检索退化精确)。 */
+    private com.wangyu.tangdb.storage.VectorStore vectorStore() {
+        return kv instanceof com.wangyu.tangdb.storage.VectorStore store ? store : null;
+    }
+
+    /**
+     * SPEC-P7 FR-736:CREATE VECTOR INDEX。
+     *
+     * <p>顺序:元数据(system table 9)→ 把定义下发给 BE(BE 后台为每个 segment 建图)。
+     * 非空表先 BUILDING;空表直接 READY(没有段要建图)。</p>
+     */
+    private Result createVectorIndex(Ast.CreateVectorIndex create) {
+        String db = resolveDatabase(create.database());
+        TableMeta table = catalog.require(db, create.table());
+        VectorIndexMeta index = catalog.createVectorIndex(db, create.table(), create.name(),
+                create.column(), create.metric(), create.m(), create.efConstruction());
+        com.wangyu.tangdb.storage.VectorStore store = vectorStore();
+        if (store != null) {
+            store.registerVectorIndex(definition(table, index));
+            if (index.ready()) {
+                index = catalog.updateVectorIndexState(index, VectorIndexMeta.STATE_READY);
+            }
+        } else if (index.state() == VectorIndexMeta.STATE_BUILDING) {
+            // 没有 BE 通道(单测 / 内存实现):无法建图,明确退化而不是假装 READY。
+            warnings.add("向量索引 " + index.name() + " 已建元数据,但当前存储不支持图段,检索将退化精确暴力");
+        }
+        return new Result.Message("OK, 向量索引 " + index.name() + " 已创建(索引 ID "
+                + index.indexId() + ",列 " + index.columnName() + ",维度 " + index.dim()
+                + ",度量 " + index.metricName() + ",m=" + index.m()
+                + ",ef_construction=" + index.efConstruction()
+                + ",状态 " + index.stateName() + ")");
+    }
+
+    /** 把 FE 的定义翻成"纯字节 + 数字"(BE 不认表名 / 列名 / 类型名,K161)。 */
+    private com.wangyu.tangdb.storage.VectorStore.VectorIndexDefinition definition(
+            TableMeta table, VectorIndexMeta index) {
+        com.wangyu.tangdb.storage.ProjectedCodec.Plan plan =
+                com.wangyu.tangdb.storage.ProjectedCodec.plan(table,
+                        allColumns(table));
+        byte[] slots = com.wangyu.tangdb.storage.ProjectedCodec.encodeSlots(table);
+        byte[] frame = plan == null ? null : plan.rowFrame();
+        if (frame == null) {
+            byte[] raw = new byte[5];
+            raw[0] = (byte) ((table.columnCount() + 7) / 8);
+            raw[1] = (byte) table.columnCount();
+            raw[2] = (byte) (table.columnCount() >>> 8);
+            raw[3] = (byte) com.wangyu.tangdb.storage.ProjectedCodec.ROW_PREFIX_BYTES;
+            frame = raw;
+        }
+        return new com.wangyu.tangdb.storage.VectorStore.VectorIndexDefinition(
+                index.beId(), table.id(),
+                KeyCodec.prefix(table.id(), KeyCodec.INDEX_ID_PRIMARY),
+                KeyCodec.prefix(table.id(), 1),
+                slots, frame, index.columnOrdinal(), index.dim(), index.metric(), index.m(),
+                index.efConstruction());
+    }
+
+    private static boolean[] allColumns(TableMeta table) {
+        boolean[] out = new boolean[table.columnCount()];
+        java.util.Arrays.fill(out, true);
+        return out;
+    }
+
+    /** SPEC-P7 FR-750:REBUILD VECTOR INDEX(旧图删除 + 重新排队建图)。 */
+    private Result rebuildVectorIndex(Ast.RebuildVectorIndex rebuild) {
+        String db = resolveDatabase(rebuild.database());
+        TableMeta table = catalog.require(db, rebuild.table());
+        VectorIndexMeta index = catalog.findVectorIndexByName(table.id(), rebuild.name());
+        if (index == null) {
+            throw new CatalogException("向量索引 " + rebuild.name() + " 不存在(表 "
+                    + table.name() + ")", SqlError.ER_CANT_DROP_FIELD_OR_KEY);
+        }
+        com.wangyu.tangdb.storage.VectorStore store = vectorStore();
+        if (store != null) {
+            store.dropVectorIndex(index.beId());
+            store.registerVectorIndex(definition(table, index));
+        }
+        catalog.updateVectorIndexState(index, VectorIndexMeta.STATE_BUILDING);
+        return new Result.Message("OK, 向量索引 " + index.name() + " 已重新排队建图(表 "
+                + table.name() + ")");
+    }
+
+    /** DROP INDEX:普通索引与向量索引同一命名空间,按名字分派。 */
+    private Result dropAnyIndex(String db, String tableName, String rawName) {
+        TableMeta table = catalog.require(db, tableName);
+        VectorIndexMeta vector = catalog.findVectorIndexByName(table.id(), rawName);
+        if (vector != null) {
+            com.wangyu.tangdb.storage.VectorStore store = vectorStore();
+            if (store != null) {
+                store.dropVectorIndex(vector.beId());
+            }
+            catalog.dropVectorIndex(db, tableName, rawName);
+            return new Result.Message("OK, 向量索引 " + vector.name() + " 已删除(表 "
+                    + table.name() + ",图段文件已清理)");
+        }
+        IndexMeta index = catalog.dropIndex(db, tableName, rawName);
+        return new Result.Message("OK, 索引 " + index.name() + " 已删除(表 "
+                + table.name() + ")");
+    }
+
+    /**
+     * SPEC-P7 FR-787:SHOW VECTOR INDEXES。
+     *
+     * <p>索引级元数据来自 system table 9;段数 / 节点数 / 待重建段数 / 图段字节数来自 BE 的
+     * MANIFEST(单一权威,不双写)。BE 报告待重建段数为 0 时顺手把状态推进到 READY。</p>
+     */
+    private Result showVectorIndexes(Ast.ShowVectorIndexes show) {
+        List<VectorIndexMeta> indexes = new ArrayList<>();
+        if (show.table() != null) {
+            TableMeta table = requireTable(show.database(), show.table());
+            indexes.addAll(catalog.vectorIndexes(table.id()));
+        } else {
+            String db = resolveDatabase(show.database());
+            for (TableMeta table : catalog.tables(db)) {
+                indexes.addAll(catalog.vectorIndexes(table.id()));
+            }
+        }
+        com.wangyu.tangdb.storage.VectorStore store = vectorStore();
+        List<Object[]> rows = new ArrayList<>(indexes.size());
+        for (VectorIndexMeta index : indexes) {
+            TableMeta table = catalog.findById(index.tableId());
+            com.wangyu.tangdb.storage.VectorStore.VectorIndexStatus status =
+                    store == null ? com.wangyu.tangdb.storage.VectorStore.VectorIndexStatus.empty()
+                            : store.vectorIndexStatus(index.beId());
+            if (status == null) {
+                status = com.wangyu.tangdb.storage.VectorStore.VectorIndexStatus.empty();
+            }
+            if (index.state() == VectorIndexMeta.STATE_BUILDING && status.pendingSegments() == 0
+                    && store != null) {
+                index = catalog.updateVectorIndexState(index, VectorIndexMeta.STATE_READY);
+            }
+            rows.add(new Object[]{
+                    table == null ? "" : table.name(),
+                    index.name(),
+                    index.columnName(),
+                    (long) index.dim(),
+                    index.metricName(),
+                    (long) index.m(),
+                    (long) index.efConstruction(),
+                    (long) status.segmentCount(),
+                    status.nodeCount(),
+                    index.stateName(),
+                    (long) status.pendingSegments(),
+                    status.graphBytes()
+            });
+        }
+        return new Result.Table(List.of("table_name", "index_name", "column_name", "dim", "metric",
+                "m", "ef_construction", "segment_count", "node_count", "state",
+                "pending_segments", "graph_bytes"), rows);
+    }
+
+    /** SPEC-P7 FR-780:SHOW AI STATS。 */
+    private Result showAiStats() {
+        com.wangyu.tangdb.ai.AiService service = ai;
+        com.wangyu.tangdb.ai.AiService.Stats stats = service == null
+                ? new com.wangyu.tangdb.ai.AiService.Stats(0, 0, 0, 0, 0, 0, 0, 0, false)
+                : service.stats();
+        com.wangyu.tangdb.ai.AiService.Config config = service == null
+                ? com.wangyu.tangdb.ai.AiService.Config.disabled() : service.config();
+        List<Object[]> rows = new ArrayList<>();
+        rows.add(new Object[]{"ai_endpoint", config.endpoint().isEmpty() ? "(未配置)" : config.endpoint()});
+        rows.add(new Object[]{"ai_model", config.model().isEmpty() ? "(未配置)" : config.model()});
+        rows.add(new Object[]{"ai_dim", (long) config.dim()});
+        rows.add(new Object[]{"calls", stats.calls()});
+        rows.add(new Object[]{"cache_hits", stats.cacheHits()});
+        rows.add(new Object[]{"cache_misses", stats.cacheMisses()});
+        rows.add(new Object[]{"cache_hit_rate", stats.cacheHitRate()});
+        rows.add(new Object[]{"failures", stats.failures()});
+        rows.add(new Object[]{"retries", stats.retries()});
+        rows.add(new Object[]{"average_batch_size", stats.averageBatch()});
+        rows.add(new Object[]{"average_latency_ms", stats.averageLatencyMillis()});
+        rows.add(new Object[]{"cached_entries", (long) stats.cachedEntries()});
+        rows.add(new Object[]{"breaker_open", stats.breakerOpen()});
+        return new Result.Table(List.of("metric", "value"), rows);
+    }
+
+    // ------------------------------------------------------------ SPEC-P7:E 组推理下推
+
+    /**
+     * SELECT ... WITH VECTOR INFO(K164):在结果末尾追加四个自描述列。
+     */
+    private Result selectVectorInfo(Ast.SelectVectorInfo query) {
+        QueryEngine.Options options = queryOptions();
+        QueryEngine engine = new QueryEngine(kv, catalog, currentView(null), options,
+                message -> warnings.add(message));
+        Result.Table table = executeBody(engine, query.body());
+        if (table == null) {
+            table = engine.execute(query.body());
+        }
+        QueryEngine.VectorPlan plan = engine.lastVectorPlan();
+        List<String> columns = new ArrayList<>(table.columns());
+        columns.add("approximate");
+        columns.add("ef_used");
+        columns.add("candidates_examined");
+        columns.add("partial");
+        List<Object[]> rows = new ArrayList<>(table.rows().size());
+        for (Object[] row : table.rows()) {
+            Object[] extended = java.util.Arrays.copyOf(row, row.length + 4);
+            extended[row.length] = plan != null && plan.approximate;
+            extended[row.length + 1] = plan == null ? 0L : (long) plan.efUsed;
+            extended[row.length + 2] = plan == null ? 0L : (long) plan.candidatesExamined;
+            extended[row.length + 3] = plan != null && plan.partial;
+            rows.add(extended);
+        }
+        return new Result.Table(columns, rows);
+    }
+
+    /**
+     * SPEC-P7 FR-772:INSERT ... SELECT。
+     *
+     * <p>先执行查询(投影里的 {@code ai_embed} 按批求值,失败整条语句不写),再按列映射
+     * 走与 VALUES 完全相同的写路径(同一批 WAL 记录,FR-777)。</p>
+     */
+    private Result insertSelect(Ast.InsertSelect select) {
+        TableMeta table = requireTable(select.database(), select.table());
+        QueryEngine.Options options = queryOptions();
+        QueryEngine engine = new QueryEngine(kv, catalog, currentView(null), options,
+                message -> warnings.add(message));
+        Result.Table result = executeBody(engine, select.query());
+        List<String> columns = select.columns();
+        if (columns.isEmpty()) {
+            columns = new ArrayList<>();
+            for (Column column : table.columns()) {
+                columns.add(column.name());
+            }
+            if (result.columns().size() != table.columnCount()) {
+                throw new StoreException("INSERT ... SELECT 的列数(" + result.columns().size()
+                        + ")与表 " + table.name() + " 的列数(" + table.columnCount()
+                        + ")不一致(未给列名列表时按表定义顺序)");
+            }
+        } else if (columns.size() != result.columns().size()) {
+            throw new StoreException("INSERT ... SELECT 的列名个数(" + columns.size()
+                    + ")与查询投影列数(" + result.columns().size() + ")不一致");
+        }
+        List<List<Object>> rows = new ArrayList<>(result.rows().size());
+        for (Object[] row : result.rows()) {
+            rows.add(new ArrayList<>(java.util.Arrays.asList(row)));
+        }
+        Ast.Insert insert = new Ast.Insert(select.database(), select.table(), columns, rows);
+        return insertInternal(insert, false);
+    }
+
+    /**
+     * 执行查询体;若投影里有 {@code ai_embed},走"批量推理前处理"(EmbedOp)。
+     *
+     * @return 含推理的结果;投影里没有 ai_embed 时返回 null(调用方走原路径)
+     */
+    private Result.Table executeBody(QueryEngine engine, Ast.QueryBody body) {
+        List<Integer> embedItems = new ArrayList<>();
+        for (int i = 0; i < body.items().size(); i++) {
+            Ast.SelectItem item = body.items().get(i);
+            if (item.expr() instanceof Ast.Func func
+                    && com.wangyu.tangdb.query.Functions.isAiFunction(func.name())) {
+                embedItems.add(i);
+            }
+        }
+        if (embedItems.isEmpty()) {
+            return null;
+        }
+        // 1) 把 ai_embed(x) 换成 NULL 占位,并把 x 追加成额外投影列(拿回它的取值)
+        List<Ast.SelectItem> items = new ArrayList<>(body.items());
+        List<String> names = new ArrayList<>();
+        for (int i = 0; i < body.items().size(); i++) {
+            Ast.SelectItem item = body.items().get(i);
+            if (embedItems.contains(i)) {
+                Ast.Func func = (Ast.Func) item.expr();
+                if (func.args().size() != 1) {
+                    throw new SqlError(SqlError.ER_NOT_SUPPORTED_YET, "42000",
+                            "ai_embed() 需要且只需要一个文本表达式参数");
+                }
+                names.add(item.alias() != null ? item.alias()
+                        : com.wangyu.tangdb.query.ExprPrinter.print(func));
+                items.set(i, new Ast.SelectItem(new Ast.Lit(null, "NULL"), null, false, null));
+            } else {
+                names.add(item.alias() != null ? item.alias()
+                        : item.expr() == null ? null
+                        : com.wangyu.tangdb.query.ExprPrinter.print(item.expr()));
+            }
+        }
+        for (int k = 0; k < embedItems.size(); k++) {
+            Ast.Func func = (Ast.Func) body.items().get(embedItems.get(k)).expr();
+            items.add(new Ast.SelectItem(func.args().get(0), "__ai_arg_" + k, false, null));
+        }
+        Ast.QueryBody rewritten = new Ast.QueryBody(items, body.from(), body.where(),
+                body.groupBy(), body.having(), body.orderBy(), body.limit(), body.offset(),
+                body.distinct());
+        Result.Table raw = engine.execute(rewritten);
+
+        // 2) 按批求值(缓存 / 幂等键 / 重试 / 熔断都在 AiService 里)
+        com.wangyu.tangdb.ai.AiService service = ai;
+        if (service == null) {
+            throw new SqlError(SqlError.ER_NOT_SUPPORTED_YET, "42000",
+                    "ai_embed() 需要推理端点配置(缺少 ai_endpoint / ai_model / ai_dim,FR-779)");
+        }
+        int base = body.items().size();
+        List<String> texts = new ArrayList<>(raw.rows().size() * embedItems.size());
+        for (Object[] row : raw.rows()) {
+            for (int k = 0; k < embedItems.size(); k++) {
+                Object value = row[base + k];
+                if (!(value instanceof String s)) {
+                    throw new SqlError(SqlError.ER_NOT_SUPPORTED_YET, "42000",
+                            "ai_embed() 的参数必须是文本(实际 " + (value == null ? "NULL"
+                            : value.getClass().getSimpleName()) + ",FR-782)");
+                }
+                texts.add(s);
+            }
+        }
+        List<float[]> vectors = service.embedAll(texts);
+
+        // 3) 把向量填回占位列,丢掉追加的参数列
+        List<String> finalNames = new ArrayList<>(names);
+        List<Object[]> out = new ArrayList<>(raw.rows().size());
+        int at = 0;
+        for (Object[] row : raw.rows()) {
+            Object[] projected = java.util.Arrays.copyOf(row, base);
+            for (int k = 0; k < embedItems.size(); k++) {
+                projected[embedItems.get(k)] = vectors.get(at++);
+            }
+            out.add(projected);
+        }
+        return new Result.Table(finalNames, out);
     }
 
     // ------------------------------------------------------------ 事务控制
@@ -904,6 +1359,23 @@ public final class Executor {
                         scanned
                 });
             }
+            // SPEC-P7 FR-752:图段字节数单独成行(不计入列存压缩率统计)。
+            for (VectorIndexMeta vector : catalog.vectorIndexes(table.id())) {
+                com.wangyu.tangdb.storage.VectorStore.VectorIndexStatus status =
+                        vectorIndexStatus(vector.beId());
+                rows.add(new Object[]{
+                        "vector:" + table.id() + ":" + vector.name(),
+                        "(graph)",
+                        status.nodeCount(),
+                        (long) status.segmentCount(),
+                        0L,
+                        status.graphBytes(),
+                        "-",
+                        "HNSW(" + vector.metricName() + ")",
+                        pruned,
+                        scanned
+                });
+            }
         }
         return new Result.Table(List.of("segment", "column", "rows", "chunks",
                 "raw_bytes", "compressed_bytes", "ratio", "encodings",
@@ -1067,6 +1539,18 @@ public final class Executor {
                 + "(由 FE 按谓词执行)"});
         rows.add(new String[]{"扫描方式: " + describeScan(plan)});
         // SPEC-P6.1 FR-719:执行层参数进 EXPLAIN(既有行不变)
+        // SPEC-P7 FR-784 / SC-435:扫描层并行阈值(与 QueryEngine 同口径)
+        long legacyEstimate = choice.chosen().rows();
+        String scanParallel;
+        if (queryParallelism <= 1) {
+            scanParallel = "未并行(并行度=" + queryParallelism + ")";
+        } else if (legacyEstimate < p7.parallelMinRows()) {
+            scanParallel = "未并行(估算 rows=" + legacyEstimate + " < parallel_min_rows="
+                    + p7.parallelMinRows() + ",FR-784)";
+        } else {
+            scanParallel = "并行(并行度=" + queryParallelism + ",估算 rows=" + legacyEstimate + ")";
+        }
+        rows.add(new String[]{"扫描并行: " + scanParallel});
         rows.add(new String[]{"并行/批/下推: 并行度=" + queryParallelism
                 + ", 扫描批=" + scanBatchRows
                 + ", 下推=" + (pushdownEnabled ? "开(列投影 + 谓词字节码)" : "关(全行回退,P6 行为)")});
@@ -1575,14 +2059,23 @@ public final class Executor {
         QueryEngine.Options options = queryOptions();
         QueryEngine engine = new QueryEngine(kv, catalog, currentView(null), options,
                 message -> warnings.add(message));
-        if (streamingResults) {
-            // SPEC-P6.1 FR-715:简单单表查询直接给流式结果;其余形态退回物化路径
-            Result streamed = engine.stream(query.body());
-            if (streamed != null) {
-                return streamed;
+        try {
+            // SPEC-P7 FR-772:投影里的 ai_embed 走批量推理前处理(EmbedOp)
+            Result.Table withAiResult = executeBody(engine, query.body());
+            if (withAiResult != null) {
+                return withAiResult;
             }
+            if (streamingResults) {
+                // SPEC-P6.1 FR-715:简单单表查询直接给流式结果;其余形态退回物化路径
+                Result streamed = engine.stream(query.body());
+                if (streamed != null) {
+                    return streamed;
+                }
+            }
+            return engine.execute(query.body());
+        } finally {
+            lastVectorPlan = engine.lastVectorPlan();
         }
-        return engine.execute(query.body());
     }
 
     /** 顶层集合运算(SPEC-P6 E 组);计划与执行共用 QueryEngine 的同一套估算。 */

@@ -15,6 +15,15 @@ import com.wangyu.tangdb.proto.PingResponse;
 import com.wangyu.tangdb.proto.PutRequest;
 import com.wangyu.tangdb.proto.PutResponse;
 import com.wangyu.tangdb.proto.RowBatch;
+import com.wangyu.tangdb.proto.DropVectorIndexRequest;
+import com.wangyu.tangdb.proto.DropVectorIndexResponse;
+import com.wangyu.tangdb.proto.RegisterVectorIndexRequest;
+import com.wangyu.tangdb.proto.RegisterVectorIndexResponse;
+import com.wangyu.tangdb.proto.SearchVectorIndexRequest;
+import com.wangyu.tangdb.proto.SearchVectorIndexResponse;
+import com.wangyu.tangdb.proto.VectorCandidate;
+import com.wangyu.tangdb.proto.VectorIndexStatusRequest;
+import com.wangyu.tangdb.proto.VectorIndexStatusResponse;
 import com.wangyu.tangdb.proto.ScanRequest;
 import com.wangyu.tangdb.proto.StatusCode;
 import com.wangyu.tangdb.proto.TangDbGrpc;
@@ -43,7 +52,8 @@ import java.util.concurrent.TimeUnit;
  */
 public class TangDbClient implements AutoCloseable, KvStore, TransactionStore,
         com.wangyu.tangdb.storage.ProjectingStore,
-        com.wangyu.tangdb.storage.CursoredStore {
+        com.wangyu.tangdb.storage.CursoredStore,
+        com.wangyu.tangdb.storage.VectorStore {
 
     /** 默认 BE 地址。 */
     public static final String DEFAULT_HOST = "127.0.0.1";
@@ -129,7 +139,7 @@ public class TangDbClient implements AutoCloseable, KvStore, TransactionStore,
                     .setValue(ByteString.copyFromUtf8(value))
                     .build());
         } catch (StatusRuntimeException e) {
-            throw translate(e, host, port);
+            throw asStoreException(e);
         }
 
         StatusCode status = response.getStatus();
@@ -157,7 +167,7 @@ public class TangDbClient implements AutoCloseable, KvStore, TransactionStore,
                     .setKey(ByteString.copyFromUtf8(key))
                     .build());
         } catch (StatusRuntimeException e) {
-            throw translate(e, host, port);
+            throw asStoreException(e);
         }
 
         StatusCode status = response.getStatus();
@@ -193,7 +203,7 @@ public class TangDbClient implements AutoCloseable, KvStore, TransactionStore,
                     .setSnapshot(Math.max(snapshot, 0))
                     .build());
         } catch (StatusRuntimeException e) {
-            throw translate(e, host, port);
+            throw asStoreException(e);
         }
         if (response.getStatus() == StatusCode.OK) {
             return response.getValue().toByteArray();
@@ -216,7 +226,7 @@ public class TangDbClient implements AutoCloseable, KvStore, TransactionStore,
                     .setValue(ByteString.copyFrom(value == null ? new byte[0] : value))
                     .build());
         } catch (StatusRuntimeException e) {
-            throw translate(e, host, port);
+            throw asStoreException(e);
         }
         if (response.getStatus() != StatusCode.OK) {
             throw fromResponseStatus(response.getStatus(), response.getMessage());
@@ -250,7 +260,7 @@ public class TangDbClient implements AutoCloseable, KvStore, TransactionStore,
                     .setSnapshot(Math.max(snapshot, 0))
                     .build());
         } catch (StatusRuntimeException e) {
-            throw translate(e, host, port);
+            throw asStoreException(e);
         }
 
         try {
@@ -274,7 +284,7 @@ public class TangDbClient implements AutoCloseable, KvStore, TransactionStore,
                 }
             }
         } catch (StatusRuntimeException e) {
-            throw translate(e, host, port);
+            throw asStoreException(e);
         }
         return rows;
     }
@@ -377,7 +387,7 @@ public class TangDbClient implements AutoCloseable, KvStore, TransactionStore,
         try {
             iterator = stubWithDeadline(scanDeadlineSeconds).scan(builder.build());
         } catch (StatusRuntimeException e) {
-            throw translate(e, host, port);
+            throw asStoreException(e);
         }
 
         List<KeyValue> rows = new ArrayList<>();
@@ -407,7 +417,7 @@ public class TangDbClient implements AutoCloseable, KvStore, TransactionStore,
                 }
             }
         } catch (StatusRuntimeException e) {
-            throw translate(e, host, port);
+            throw asStoreException(e);
         }
         return rows;
     }
@@ -703,7 +713,7 @@ public class TangDbClient implements AutoCloseable, KvStore, TransactionStore,
             PingResponse response = stubWithDeadline().ping(PingRequest.getDefaultInstance());
             return response.getVersion();
         } catch (StatusRuntimeException e) {
-            throw translate(e, host, port);
+            throw asStoreException(e);
         }
     }
 
@@ -727,6 +737,161 @@ public class TangDbClient implements AutoCloseable, KvStore, TransactionStore,
         } catch (InterruptedException e) {
             channel.shutdownNow();
             Thread.currentThread().interrupt();
+        }
+    }
+
+    // ------------------------------------------------------------ SPEC-P7:向量索引
+
+    /**
+     * 注册向量索引定义并让 BE 为缺失的 segment 后台建图(FR-736 / FR-748)。
+     * 只传字节与数字:不出现表名 / 列名 / 类型名(K161)。
+     */
+    @Override
+    public void registerVectorIndex(com.wangyu.tangdb.storage.VectorStore.VectorIndexDefinition def) {
+        try {
+            com.wangyu.tangdb.proto.VectorIndexDefinition proto =
+                    com.wangyu.tangdb.proto.VectorIndexDefinition.newBuilder()
+                    .setIndexId(def.indexId())
+                    .setTableId(def.tableId())
+                    .setStartKey(ByteString.copyFrom(def.startKey()))
+                    .setEndKey(ByteString.copyFrom(def.endKey()))
+                    .setColumnSlots(ByteString.copyFrom(def.columnSlots()))
+                    .setRowFrame(ByteString.copyFrom(def.rowFrame()))
+                    .setVectorOrdinal(def.vectorOrdinal())
+                    .setDim(def.dim())
+                    .setMetric(def.metric())
+                    .setM(def.m())
+                    .setEfConstruction(def.efConstruction())
+                    .build();
+            RegisterVectorIndexResponse response = stubWithDeadline()
+                    .registerVectorIndex(RegisterVectorIndexRequest.newBuilder()
+                            .setDefinition(proto).build());
+            if (response.getStatus() != StatusCode.OK) {
+                throw new StoreException("注册向量索引失败: " + response.getMessage());
+            }
+        } catch (StatusRuntimeException e) {
+            throw asStoreException(e);
+        }
+    }
+
+    /** 显式重建(FR-750):BE 侧删旧图,并把同一份定义重新排队。 */
+    @Override
+    public void rebuildVectorIndex(long indexId) {
+        dropVectorIndex(indexId);
+    }
+
+    /** 删除向量索引的全部图文件(FR-737)。 */
+    @Override
+    public void dropVectorIndex(long indexId) {
+        try {
+            DropVectorIndexResponse response = stubWithDeadline()
+                    .dropVectorIndex(DropVectorIndexRequest.newBuilder()
+                            .setIndexId(indexId).build());
+            if (response.getStatus() != StatusCode.OK) {
+                throw new StoreException("删除向量索引失败: " + response.getMessage());
+            }
+        } catch (StatusRuntimeException e) {
+            throw asStoreException(e);
+        }
+    }
+
+    /** 段级状态(SHOW VECTOR INDEXES)。 */
+    @Override
+    public com.wangyu.tangdb.storage.VectorStore.VectorIndexStatus vectorIndexStatus(long indexId) {
+        try {
+            VectorIndexStatusResponse response = stubWithDeadline()
+                    .vectorIndexStatus(VectorIndexStatusRequest.newBuilder()
+                            .setIndexId(indexId).build());
+            if (response.getStatus() != StatusCode.OK) {
+                return com.wangyu.tangdb.storage.VectorStore.VectorIndexStatus.empty();
+            }
+            return new com.wangyu.tangdb.storage.VectorStore.VectorIndexStatus(
+                    response.getSegmentCount(), response.getReadySegments(),
+                    response.getPendingSegments(), response.getNodeCount(),
+                    response.getGraphBytes(), response.getMetric(), response.getDim());
+        } catch (StatusRuntimeException e) {
+            return com.wangyu.tangdb.storage.VectorStore.VectorIndexStatus.empty();
+        }
+    }
+
+    /**
+     * 批量点查(ANN 候选回表,K180):一次 RPC 取多行,返回**与 keys 对齐**的值
+     * (不存在的键给 null),调用方不需要 Map 做中间装配。
+     *
+     * <p>BE 按请求顺序回行;这里仍按 key 建一次索引对齐,因为 stubbed 协议不保证顺序。
+     * 索引只在本方法内使用,且键是同一批候选(≤ ef),规模有界。</p>
+     */
+    @Override
+    public BatchResult batchGetOrdered(List<byte[]> keys, long snapshot, boolean profile) {
+        java.util.List<byte[]> out = new java.util.ArrayList<>();
+        if (keys == null || keys.isEmpty()) {
+            return new BatchResult(out, "");
+        }
+        com.wangyu.tangdb.proto.BatchGetRequest.Builder request =
+                com.wangyu.tangdb.proto.BatchGetRequest.newBuilder()
+                        .setSnapshot(Math.max(snapshot, 0))
+                        .setProfile(profile);
+        for (byte[] key : keys) {
+            request.addKeys(ByteString.copyFrom(key));
+            out.add(null);
+        }
+        java.util.Map<String, Integer> positions = new java.util.HashMap<>();
+        for (int i = 0; i < keys.size(); i++) {
+            positions.putIfAbsent(java.util.Base64.getEncoder().encodeToString(keys.get(i)), i);
+        }
+        try {
+            com.wangyu.tangdb.proto.BatchGetResponse response =
+                    stubWithDeadline(scanDeadlineSeconds).batchGet(request.build());
+            if (response.getStatus() != StatusCode.OK) {
+                throw new StoreException("批量读取失败: " + response.getMessage());
+            }
+            for (com.wangyu.tangdb.proto.Kv kv : response.getRowsList()) {
+                Integer pos = positions.get(java.util.Base64.getEncoder()
+                        .encodeToString(kv.getKey().toByteArray()));
+                if (pos != null) {
+                    out.set(pos, kv.getValue().toByteArray());
+                }
+            }
+            return new BatchResult(out, response.getProfile());
+        } catch (StatusRuntimeException e) {
+            throw asStoreException(e);
+        }
+    }
+
+    /**
+     * 近似检索:BE 每段 top-ef → 归并 → MVCC 过滤,返回候选用户键(FR-754 / FR-757)。
+     */
+    @Override
+    public VectorSearchResult searchVector(long indexId, byte[] query, int ef, int k,
+                                           long snapshot, byte[] allow, boolean bloom,
+                                           boolean profile) {
+        try {
+            SearchVectorIndexRequest.Builder request = SearchVectorIndexRequest.newBuilder()
+                    .setIndexId(indexId)
+                    .setQuery(ByteString.copyFrom(query))
+                    .setEf(ef)
+                    .setK(k)
+                    .setSnapshot(snapshot)
+                    .setProfile(profile);
+            if (allow != null && allow.length > 0) {
+                request.setAllow(ByteString.copyFrom(allow)).setAllowBloom(bloom);
+            }
+            SearchVectorIndexResponse response = stubWithDeadline(scanDeadlineSeconds)
+                    .searchVectorIndex(request.build());
+            if (response.getStatus() != StatusCode.OK) {
+                if (response.getStatus() == StatusCode.NOT_FOUND) {
+                    return VectorSearchResult.empty();
+                }
+                throw new StoreException("向量检索失败: " + response.getMessage());
+            }
+            List<byte[]> keys = new ArrayList<>(response.getCandidatesCount());
+            for (VectorCandidate candidate : response.getCandidatesList()) {
+                keys.add(candidate.getKey().toByteArray());
+            }
+            return new VectorSearchResult(keys, response.getCandidatesExamined(),
+                    response.getPendingSegments(), response.getProfile());
+        } catch (StatusRuntimeException e) {
+            throw asStoreException(e);
         }
     }
 
@@ -772,6 +937,12 @@ public class TangDbClient implements AutoCloseable, KvStore, TransactionStore,
      * 把 gRPC 层的 {@link StatusRuntimeException} 转成面向用户的中文异常。
      * 不把原始堆栈暴露给 CLI，只保留状态码与必要的描述。
      */
+    /** 向量索引 RPC 的异常出口(接口方法不能抛受检异常)。 */
+    private StoreException asStoreException(StatusRuntimeException e) {
+        ClientException translated = translate(e, host, port);
+        return new StoreException(translated.getMessage(), translated);
+    }
+
     static ClientException translate(StatusRuntimeException e, String host, int port) {
         Status status = e.getStatus();
         String address = host + ":" + port;

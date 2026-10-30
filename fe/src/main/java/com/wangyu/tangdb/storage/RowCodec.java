@@ -117,7 +117,7 @@ public final class RowCodec {
             }
             Column column = table.columns().get(i);
             if (needed != null && i < needed.length && !needed[i]) {
-                pos = skipColumn(data, pos, column.type());
+                pos = skipColumn(data, pos, column);
                 continue;
             }
             switch (column.type()) {
@@ -165,6 +165,14 @@ public final class RowCodec {
                     pos += len;
                     break;
                 }
+                case VECTOR: {
+                    // SPEC-P7 §5.1:定长槽 4×n 字节小端 float32(无长度前缀)。
+                    int width = 4 * column.vectorDim();
+                    require(data, pos, width);
+                    values[i] = readFloats(data, pos, column.vectorDim());
+                    pos += width;
+                    break;
+                }
                 default:
                     throw new StoreException("不支持的列类型: " + column.type());
             }
@@ -176,8 +184,8 @@ public final class RowCodec {
     }
 
     /** 跳过一列的字节(列裁剪解码用)。 */
-    private static int skipColumn(byte[] data, int pos, DataType type) {
-        switch (type) {
+    private static int skipColumn(byte[] data, int pos, Column column) {
+        switch (column.type()) {
             case INT, DATE -> {
                 require(data, pos, 4);
                 return pos + 4;
@@ -197,7 +205,12 @@ public final class RowCodec {
                 require(data, pos, len);
                 return pos + len;
             }
-            default -> throw new StoreException("不支持的列类型: " + type);
+            case VECTOR -> {
+                int width = 4 * column.vectorDim();
+                require(data, pos, width);
+                return pos + width;
+            }
+            default -> throw new StoreException("不支持的列类型: " + column.type());
         }
     }
 
@@ -226,6 +239,17 @@ public final class RowCodec {
                 System.arraycopy(raw, 0, buf, pos, raw.length);
                 return pos + raw.length;
             }
+            case VECTOR: {
+                float[] vec = (float[]) value;
+                if (vec.length != column.vectorDim()) {
+                    throw new StoreException("列 " + column.name() + " 的向量维度不符(期望 "
+                            + column.vectorDim() + ",实际 " + vec.length + ")");
+                }
+                for (int i = 0; i < vec.length; i++) {
+                    pos = writeLe4(buf, pos, Float.floatToRawIntBits(vec[i]));
+                }
+                return pos;
+            }
             default:
                 throw new StoreException("不支持的列类型: " + column.type());
         }
@@ -247,6 +271,8 @@ public final class RowCodec {
                 n += 4;
             } else if (v instanceof Boolean) {
                 n += 1;
+            } else if (v instanceof float[] vec) {
+                n += 4 * vec.length;
             }
         }
         return n;
@@ -292,6 +318,15 @@ public final class RowCodec {
 
     private static int readLe2(byte[] buf, int pos) {
         return (buf[pos] & 0xff) | ((buf[pos + 1] & 0xff) << 8);
+    }
+
+    /** 读 n 个小端 float32(SPEC-P7 §5.1)。 */
+    public static float[] readFloats(byte[] data, int pos, int n) {
+        float[] out = new float[n];
+        for (int i = 0; i < n; i++) {
+            out[i] = Float.intBitsToFloat(readLe4Int(data, pos + i * 4));
+        }
+        return out;
     }
 
     private static long readLe8(byte[] buf, int pos) {

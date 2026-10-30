@@ -33,7 +33,7 @@ func TestRejectMissingFormatVersion(t *testing.T) {
 		t.Fatalf("open: %v", err)
 	}
 	rewriteCurrentManifest(t, dir, func(s string) string {
-		return strings.Replace(s, `"format_version": 2,`, "", 1)
+		return strings.Replace(s, `"format_version": 3,`, "", 1)
 	})
 	_, _, err := Open(dir)
 	if err == nil {
@@ -44,21 +44,21 @@ func TestRejectMissingFormatVersion(t *testing.T) {
 	}
 }
 
-// TestRejectFormatVersionOne format_version = 1(P2 及以前)同样拒绝启动。
+// TestRejectFormatVersionOne format_version = 1 / 2(P2~P6.1)同样拒绝启动。
 func TestRejectFormatVersionOne(t *testing.T) {
 	dir := t.TempDir()
 	if _, _, err := Open(dir); err != nil {
 		t.Fatalf("open: %v", err)
 	}
 	rewriteCurrentManifest(t, dir, func(s string) string {
-		return strings.Replace(s, `"format_version": 2`, `"format_version": 1`, 1)
+		return strings.Replace(s, `"format_version": 3`, `"format_version": 1`, 1)
 	})
 	_, _, err := Open(dir)
 	if err == nil {
 		t.Fatal("expected startup failure for format_version = 1")
 	}
-	if !strings.Contains(err.Error(), "数据目录格式版本 1 与本期(2)不兼容") {
-		t.Fatalf("error = %v, want FR-362 message", err)
+	if !strings.Contains(err.Error(), "数据目录格式版本 1 与本期(3)不兼容") {
+		t.Fatalf("error = %v, want FR-362 / FR-745 message", err)
 	}
 	if !strings.Contains(err.Error(), "请清空数据目录后重启") {
 		t.Fatalf("error = %v, want clear-data-dir hint", err)
@@ -100,5 +100,50 @@ func rewriteCurrentManifest(t *testing.T, dir string, transform func(string) str
 	}
 	if err := os.WriteFile(path, []byte(transform(string(body))), 0640); err != nil {
 		t.Fatalf("write manifest: %v", err)
+	}
+}
+
+// TestRejectFormatVersionTwo P6.1 的 format_version = 2 目录必须被拒绝(SPEC-P7 FR-745 / 边界 154)。
+func TestRejectFormatVersionTwo(t *testing.T) {
+	dir := t.TempDir()
+	if _, _, err := Open(dir); err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	rewriteCurrentManifest(t, dir, func(s string) string {
+		return strings.Replace(s, `"format_version": 3`, `"format_version": 2`, 1)
+	})
+	_, _, err := Open(dir)
+	if err == nil {
+		t.Fatal("expected startup failure for format_version = 2")
+	}
+	if !strings.Contains(err.Error(), "数据目录格式版本 2 与本期(3)不兼容") {
+		t.Fatalf("error = %v, want P7 guard message", err)
+	}
+}
+
+// TestVecIndexesRoundTrip vec_indexes[] 必须原样持久化(FR-745)。
+func TestVecIndexesRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	reg, m, err := Open(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	m.VecIndexes = append(m.VecIndexes, VecIndexEntry{
+		IndexID: 7, TableID: 128, Segment: 42, File: "42.hnsw", Dim: 128, Metric: 0,
+		M: 16, EfConstruction: 200, NodeCount: 51200, State: VecStateReady, BuildSeq: 42,
+	})
+	if err := reg.Save(m); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	_, reopened, err := Open(dir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	if len(reopened.VecIndexes) != 1 {
+		t.Fatalf("vec_indexes = %d, want 1", len(reopened.VecIndexes))
+	}
+	got := reopened.VecIndexes[0]
+	if got.IndexID != 7 || got.Segment != 42 || got.NodeCount != 51200 || got.State != VecStateReady {
+		t.Fatalf("vec_indexes round-trip mismatch: %+v", got)
 	}
 }

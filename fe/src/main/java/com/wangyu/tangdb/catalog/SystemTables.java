@@ -55,11 +55,13 @@ public final class SystemTables {
     public static final long SYS_TABLE_STATS = 7;
     /** SPEC-P6 §5.1 / FR-621:列级统计。 */
     public static final long SYS_COLUMN_STATS = 8;
+    /** SPEC-P7 §5.3 / FR-741:向量索引元数据(段级状态在 BE MANIFEST)。 */
+    public static final long SYS_VEC_INDEXES = 9;
 
     /** 系统表 ID 登记表(FR-426 / K70 / FR-473 / SPEC-P5 FR-614 / SPEC-P6 §5.1)。 */
     public static final Set<Long> REGISTERED_IDS =
             Set.of(SYS_TABLES, SYS_COLUMNS, SYS_DATABASES, SYS_COUNTERS, SYS_INDEXES,
-                    SYS_IMPORT_STATE, SYS_TABLE_STATS, SYS_COLUMN_STATS);
+                    SYS_IMPORT_STATE, SYS_TABLE_STATS, SYS_COLUMN_STATS, SYS_VEC_INDEXES);
 
     /** 预留区上界(6~63 预留给后续元数据族,当前未登记)。 */
     public static final long RESERVED_MAX_TABLE_ID = 63;
@@ -201,7 +203,47 @@ public final class SystemTables {
                     new Column("histogram", DataType.JSON, 0, false, false, 8)),
             true);
 
+    /** SPEC-P7 §5.3:向量索引元数据权威副本(段级状态在 MANIFEST)。 */
+    public static final TableMeta VEC_INDEXES = new TableMeta(
+            SYS_VEC_INDEXES, "sys_vec_indexes", TableMeta.STATE_ACTIVE, "",
+            List.of(
+                    new Column("table_id", DataType.BIGINT, 0, false, true, 0),
+                    new Column("index_id", DataType.INT, 0, false, false, 1),
+                    new Column("name", DataType.VARCHAR, 64, false, false, 2),
+                    new Column("column_name", DataType.VARCHAR, 64, false, false, 3),
+                    new Column("column_ordinal", DataType.INT, 0, false, false, 4),
+                    new Column("dim", DataType.INT, 0, false, false, 5),
+                    new Column("metric", DataType.INT, 0, false, false, 6),
+                    new Column("m", DataType.INT, 0, false, false, 7),
+                    new Column("ef_construction", DataType.INT, 0, false, false, 8),
+                    new Column("state", DataType.INT, 0, false, false, 9),
+                    new Column("created_at", DataType.VARCHAR, 64, false, false, 10)),
+            true);
+
     private SystemTables() {
+    }
+
+    /** sys_vec_indexes 的主键编码:table_id 4B 大端 + index_id 4B 大端。 */
+    public static byte[] vecIndexKey(long tableId, int indexId) {
+        return KeyCodec.systemRowKey(SYS_VEC_INDEXES,
+                KeyCodec.concat(KeyCodec.be4(tableId), KeyCodec.be4(indexId)));
+    }
+
+    /** sys_vec_indexes 行(列顺序与 {@link #VEC_INDEXES} 一致)。 */
+    public static byte[] encodeVecIndexRow(com.wangyu.tangdb.storage.VectorIndexMeta index) {
+        return RowCodec.encode(VEC_INDEXES, new Object[]{
+                index.tableId(),
+                index.indexId(),
+                index.name(),
+                index.columnName(),
+                index.columnOrdinal(),
+                index.dim(),
+                index.metric(),
+                index.m(),
+                index.efConstruction(),
+                index.state(),
+                index.createdAt()
+        });
     }
 
     /** 表 ID 是否属于系统表登记表(FR-426:不在登记表内即用户表)。 */

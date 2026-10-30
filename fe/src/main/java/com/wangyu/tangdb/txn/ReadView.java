@@ -38,4 +38,22 @@ public interface ReadView {
     default boolean isLatest() {
         return false;
     }
+
+    /**
+     * 本视图是否支持"列投影帧"返回({@link #scanProjected})。
+     *
+     * <p>事务视图 / 叠加写集的视图要合并"整行"值,帧与整行不能混用,所以它们返回 false;
+     * 查询引擎据此退回全行扫描,避免把整行当成投影帧解码(SPEC-P7 施工中发现)。</p>
+     */
+    default boolean supportsProjection() {
+        return false;
+    }
+
+    /**
+     * 视图固定的快照水位(SPEC-P7 FR-757:向量检索的候选与回表必须同一快照)。
+     * 0 表示"最新已提交"(事务外视图);事务视图返回 BEGIN 时的快照。
+     */
+    default long snapshot() {
+        return 0;
+    }
 }

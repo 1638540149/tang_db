@@ -380,7 +380,7 @@ public final class StatsService {
             this.values = buildHistogram ? new ArrayList<>() : null;
         }
 
-        /** FR-618:INT / BIGINT / DOUBLE / DATE / VARCHAR 建直方图;BOOLEAN / JSON 不建。 */
+        /** FR-618:INT / BIGINT / DOUBLE / DATE / VARCHAR 建直方图;BOOLEAN / JSON / VECTOR 不建。 */
         private static boolean histogramType(DataType type) {
             return type == DataType.INT || type == DataType.BIGINT || type == DataType.DOUBLE
                     || type == DataType.DATE || type == DataType.VARCHAR;
@@ -397,7 +397,8 @@ public final class StatsService {
             } else {
                 hll.add(value);
             }
-            if (column.type() != DataType.JSON) {
+            // SPEC-P7 FR-763:VECTOR / JSON 列不参与 min/max(没有保序比较语义)
+            if (column.type() != DataType.JSON && column.type() != DataType.VECTOR) {
                 if (min == null || Values.compare(value, column, min) < 0) {
                     min = value;
                 }
@@ -419,6 +420,11 @@ public final class StatsService {
             }
             if (value instanceof byte[] raw) {
                 return "json:" + java.util.HexFormat.of().formatHex(raw);
+            }
+            if (value instanceof float[] vec) {
+                // VECTOR 列的 distinct 用向量字节做键(不做距离语义,只是"不同值的个数")
+                return "vec:" + java.util.HexFormat.of().formatHex(
+                        com.wangyu.tangdb.storage.VectorValues.toBytes(vec));
             }
             return value;
         }

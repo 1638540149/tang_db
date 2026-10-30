@@ -11,7 +11,21 @@ public enum DataType {
     DATE(5, "DATE"),
     BOOLEAN(6, "BOOLEAN"),
     /** P5:BSON 式二进制 JSON(FR-609);不能做主键 / 索引(FR-611)。 */
-    JSON(7, "JSON");
+    JSON(7, "JSON"),
+    /**
+     * P7:定长 float32 向量(SPEC-P7 FR-731 / K157 / K158)。
+     *
+     * <p>{@code length} 存的是维度 n(1~4,096),行内定长 4×n 字节小端 float32。
+     * 不能做主键、不能建普通索引(报 1235,K172);只允许距离函数参与比较(FR-734)。</p>
+     */
+    VECTOR(8, "VECTOR");
+
+    /** 向量维度上界(K158):4,096 × 4B = 16KB/行。 */
+    public static final int MAX_VECTOR_DIM = 4096;
+
+    public boolean isVector() {
+        return this == VECTOR;
+    }
 
     private final int code;
     private final String sqlName;

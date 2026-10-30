@@ -835,9 +835,258 @@ bash scripts/tests/p6.1-test.sh     # SC-400 ~ SC-418,报告 tmp/p6.1-test/repor
 - `go test -race`:本机无 C 工具链(cgo 不可用),已用 `-count` 重复跑并发生命周期用例,
   race detector 未运行。
 
+### P7 AI 能力:向量类型 / 分段 HNSW / 混合查询选路 / 推理下推
+
+P5/P6 把"分析 + 优化器"做完了;P7 回答的是另一个问题:**在没有 hnswlib / faiss 的前提下,
+自研一套随 LSM 演进的向量索引,并让优化器在「结构化过滤 + 向量相似」之间选对路径。**
+距离计算、图算法、近似检索全部自己写(FE 侧 `VectorValues`,BE 侧 `internal/vecidx`),
+依赖红线不变。
+
+**① 一条 SQL 完成"向量化入库 + 语义检索 + 结构化过滤"**
+
+```sql
+tangdb> CREATE TABLE docs (id INT PRIMARY KEY, title VARCHAR(64), category VARCHAR(16),
+                           embedding VECTOR(4));
+tangdb> INSERT INTO docs VALUES (1,'a','健康','[0.5,-0.25,0.125,0]'), (2,'b','数码','[0,1,0,0]');
+tangdb> CREATE VECTOR INDEX vidx ON docs (embedding) WITH (metric='l2', m=16, ef_construction=200);
+OK, 向量索引 vidx 已创建(索引 ID 1,列 embedding,维度 4,度量 l2,m=16,ef_construction=200,状态 BUILDING)
+
+tangdb> SHOW VECTOR INDEXES;
++------------+------------+-------------+-----+--------+---+-----------------+---------------+------------+-------+------------------+-------------+
+| table_name | index_name | column_name | dim | metric | m | ef_construction | segment_count | node_count | state | pending_segments | graph_bytes |
++------------+------------+-------------+-----+--------+---+-----------------+---------------+------------+-------+------------------+-------------+
+| docs       | vidx       | embedding   | 4   | l2     | 16 | 200            | 2             | 15000      | READY | 0                | 1098846     |
++------------+------------+-------------+-----+--------+---+-----------------+---------------+------------+-------+------------------+-------------+
+
+tangdb> SELECT id, title FROM docs WHERE category = '健康'
+...     ORDER BY l2_distance(embedding, '[0.1,0.2,0.3,0.4]') LIMIT 5;
+tangdb> EXPLAIN SELECT id FROM docs WHERE id <= 750
+...     ORDER BY l2_distance(embedding,'[0.1,0.2,0.3,0.4]') LIMIT 5;
+| 向量检索: 路径=A, 模式=近似, ef=64, 候选=0, partial=false, 选择率=0.0469, 允许集来源=主键集合(704 行) |
+|   选路依据: 选择率 0.0469 ≤ 0.1,允许集 704 行 → 路径 A(K167)                                          |
+|   查询向量: 维度=4, 度量=l2, k=5                                                                        |
+```
+
+**② 三个距离函数(自己算,越小越相似)**
+
+| 函数 | 语义 | 备注 |
+|---|---|---|
+| `l2_distance(a,b)` | 欧氏距离 `sqrt(Σ(a-b)²)` | — |
+| `cosine_distance(a,b)` | `1 - cos(a,b)` | 任一侧零向量返回 1 |
+| `inner_product(a,b)` | **内积的相反数** `-Σa·b` | 与 pgvector 的 `<#>` 同口径,保证 `ORDER BY … LIMIT k` 升序就是"越相似越靠前" |
+
+参数是"向量列 + 向量字面量"或"两个向量列";字面量 `'[a,b,…]'` 的维度必须与列一致,
+元素个数不符 / NaN / Inf / 非数值都会**指出第几个元素**(`FR-733` / 边界 126~128)。
+
+**③ 图段存储(每段一张图,随 LSM 演进)**
+
+- 每个 segment 至多一个图段文件 `<segNum>-<indexId>.hnsw`,布局见规约 §5.2:
+  魔数 `TDHNSW\0\0` + 版本 + 维度/度量/层数/入口点/M/efConstruction/节点数/buildSeq
+  + 节点表(`rowOrdinal`)+ 各层邻接表 + **CRC64 校验和**。
+- **向量数据不存图里**(`FR-744` / `K177`):图只存行序号,检索时回到 segment 的向量列读;
+  图段与 segment 同生命周期:落盘后后台建图 → 写完 fsync → 更新 MANIFEST 才可见
+  (`FR-746`);compaction 后旧图随旧 segment 删除、新段重建(`FR-749`)。
+- `MANIFEST.format_version` 由 **2 升 3**,老目录**拒绝启动**(P3 K54 同口径)。
+  新增 `vec_indexes[]`(段级:图文件/参数/节点数/状态)与 `vec_defs[]`(BE 侧建图参数缓存)。
+- 启动校验:文件缺失 / 截断 / 校验和不符 / `build_seq` 与 segment 不一致 → 该段**标记待重建**,
+  检索退化为暴力(`FR-747` / 边界 138/139),后台补建;`REBUILD VECTOR INDEX` 可显式重建。
+
+**④ 检索执行与自描述**
+
+- 流程:FE 每段向 BE 要 top-`ef` → BE 归并(按距离、同行序号)→ **FE 用同一快照批量回表**
+  (`BatchGet`)→ 精确重算距离 → 结构化谓词过滤 → 归并 memtable 暴力结果 → 按 (距离, 主键) 升序
+  取前 k(`FR-754` / `FR-755`)。
+- 有效候选不足 k 时 **`ef` 翻倍**(上限 `ef_max`);仍不足:行数 ≤ `exact_fallback_rows` 回退精确暴力,
+  否则返回不足 k 条并标 `partial=true`(`FR-758` / `FR-759`)。
+- 精确模式:会话开关 `SET vector_exact = ON`(或 `SET vector_exact = OFF` 恢复),
+  结果标 `approximate=false`(`FR-760`);`SET vector_path = A|B|auto` 可强制选路(对拍用)。
+- 自描述四字段:`WITH VECTOR INFO` 在结果末尾追加 `approximate / ef_used / candidates_examined / partial`
+  (`K164`;CLI 与 MySQL 协议看到的是同一组列)。
+- `EXPLAIN` 增「向量检索」行:路径(A/B/exact)、近似/精确、`ef`、候选量、选择率、允许集来源,
+  与执行**共用同一份 `VectorPlan`**(不存在"说一套走一套")。
+
+**⑤ 混合查询选路(`K167`)**
+
+| 选择率估算 | 路径 | 说明 |
+|---|---|---|
+| ≤ 0.1 且允许集 ≤ 表行数 × `allow_list_max_ratio`(0.3) | **A 先过滤后检索** | 允许集在 FE 物化(索引区间/全表过滤)后精确打分,召回 100% |
+| 0.1 ~ 0.3 | 比代价 | 允许集行数 ≤ `ef_max` 走 A,否则 B |
+| > 0.3 或允许集过大 | **B 先检索后过滤** | ANN 候选扩展,不写死倍数 |
+| 统计缺失 / 过期 | **B**(`FR-767`,不赌) | `EXPLAIN` 明确写"统计缺失/过期,退化路径 B" |
+
+两条路径在 0%/5%/50%/95%/100% 五种选择率下**逐行一致**(含顺序),由 `p7-test.sh` 对拍。
+
+**⑥ 推理下推 `ai_embed`**
+
+```sql
+tangdb> INSERT INTO docs SELECT id, title, content, ai_embed(content) FROM raw_docs;
+OK, 2000 rows affected
+tangdb> SHOW AI STATS;
+| calls | 1 |  cache_hits | 0 | failures | 0 | average_batch_size | 50 | average_latency_ms | 8 |
+```
+
+- 端点配置在 `config/fe.conf`(`ai_endpoint / ai_model / ai_dim / ai_timeout_ms / ai_batch_rows /
+  ai_cache_entries / ai_max_retries / ai_breaker_batches`),**权重不进库**;缺配置时明确报缺哪一项。
+- 按 `ai_batch_rows`(默认 1024)分批调外部 HTTP;幂等键 = `sha256(模型版本 + 维度 + 规范化文本)`,
+  同一批里的重复文本只送一次;命中 LRU(`ai_cache_entries`)**绝不重复调用**。
+  每批在 fed 日志里留一行 `ai_embed 批次 batch_id=<算子实例×1e6+序号> texts=… first_key=…`(`FR-781`)。
+- 失败语义:超时(默认 5000ms)+ 指数退避重试(默认 3 次)+ 连续失败熔断(默认 5 批);
+  **任何一批失败 → 整条语句不写**(`K171`),维度不符 / NaN / Inf / 模型版本不一致同样失败。
+- `ai_embed` 只允许出现在投影与 `INSERT … SELECT`;出现在 `WHERE / GROUP BY / ORDER BY / HAVING`
+  一律 **1235**(`FR-778`)。空文本 / 全空白 / 超 64KB 直接报错,不调模型。
+
+**⑦ 新增配置(`config/fe.conf`,全部有默认值;非法值启动失败并指出第几行)**
+
+| 配置 | 默认 | 说明 |
+|---|---|---|
+| `vector_metric` / `vector_m` / `vector_ef_construction` | `l2` / `16` / `200` | 建索引默认度量与图参数(`K159`) |
+| `vector_ef_search` / `vector_ef_max` | `64` / `512` | 检索默认 `ef` 与可迭代扩展上限 |
+| `vector_bruteforce_rows` | `10000` | 表行数低于该值直接暴力(`K175`) |
+| `exact_fallback_rows` | `10000` | 预算用尽时回退精确的上限(`K166`) |
+| `allow_list_max_ratio` | `0.3` | 允许集超过表行数该比例则不走路径 A(`FR-769`) |
+| `parallel_min_rows` | `50000` | **P6.1 挂账**:扫描层并行阈值(`FR-784`) |
+| `ai_endpoint` / `ai_model` / `ai_dim` | 空 / 空 / 0 | 推理端点;缺失时 `ai_embed` 明确报错 |
+| `ai_batch_rows` / `ai_timeout_ms` / `ai_cache_entries` | `1024` / `5000` / `10000` | 批量、超时、LRU 容量 |
+| `ai_max_retries` / `ai_breaker_batches` | `3` / `5` | 重试与熔断 |
+
+**⑧ 认领的 P6.1 挂账**
+
+- `SHOW INDEX FROM <表> FROM <库>` / `SHOW INDEXES … FROM <库>` **双 FROM**(`FR-783`),输出不变;
+- `parallel_min_rows`:估算规模低于阈值的扫描**不再切分片**,`EXPLAIN` 增「扫描并行」行说明原因;
+- `FR-715/716` 量化取证:`bash scripts/tests/p7-evidence.sh` 输出解码复用前后的分配量与
+  物化 vs 流式的保留堆(本机一组实测:解码复用后每行分配 20,464B → 1,696B,比值 **0.083**;
+  GC 3 次 → 0 次;行数 ×10 时物化结果保留堆 ×11,流式 ≈ 0)。
+
+**⑨ 一键验收**
+
+```bash
+bash scripts/tests/p7-test.sh              # SC-419 ~ SC-438(含 ★并发 60s、★强杀、图段截断)
+P7_SKIP_PERF=1 bash scripts/tests/p7-test.sh   # 跳过 SC-431/432 性能项
+bash scripts/tests/p7-recall.sh            # 81 格召回矩阵(删除率 × 更新率 × 段数 × 选择率)
+```
+
+端口固定 **BE 9970 / MySQL 9976 / 心跳 9981 / AI 假端点 9990**,数据目录 `tmp/p7-test/data`;
+召回矩阵用 **BE 9980 / MySQL 9986 / 心跳 9991**,目录 `tmp/p7-recall/data`。
+脚本只杀自己起的 `tmp/p7-test/be.exe`、`tmp/p7-recall/be.exe` 与带对应目录配置的 `fed`。
+
+**⑩ 实测口径(本机,同报条件)**
+
+| 项 | 门限 | 实测 | 结论 |
+|---|---|---|---|
+| 向量字面量 / 维度校验 / 红线 | SC-419/420 | 全部按期望报错(元素序号、1235) | 达标 |
+| Recall@10(2 万行 × 16 维,20 条查询) | ≥ 95% | **1.0000** | 达标 |
+| 召回矩阵 81 格(删除 0/20/40% × 更新 0/20/40% × 段数 1~8 × 选择率 0.05/0.5/1.0) | 每格 ≥ 95% | **81/81 格 1.0000** | 达标 |
+| 混合查询两路一致(0/5/50/95/100%) | 逐行一致 | A = B = exact | 达标 |
+| 推理批量(`INSERT … SELECT ai_embed`,2000 行 / 50 种文本) | 调用 ≤ ⌈行数/1024⌉ | **1 次调用** | 达标 |
+| 推理失败不留脏数据(500 / 维度不符) | 行数不变 | 行数不变 | 达标 |
+| ★并发 60s(8 检索 + 1 写) | 无 panic、P99 ≤ 2× 空载 | 0 错误 / 1592 次查询;P99 404ms vs 空载 122ms | **临界(见 §⑪)** |
+| ★图段构建中途强杀 | 重启可用、结果一致、待重建归零 | 全部满足 | 达标 |
+| 纯向量检索 top-10(2 万行 × 16 维,5 次中位) | ≤ 100ms | **64ms** | 达标(数据规模见 §⑪) |
+| `DROP` / `REBUILD` 图段生命周期 | 旧图消失、状态归零 | 满足 | 达标 |
+
+**⑪ 本期明确未做 / 口径说明(如实记录)**
+
+- **SC-431 的数据规模**:验收脚本默认用 **2 万行 × 16 维**(`64ms`);规约的
+  "10 万行 × 128 维"需要单独灌 100 万级 float(约 60MB SQL),脚本里未跑,门限未改。
+- **SC-427 的 P99**:整套脚本连跑时检索 P99 是空载的 3.3 倍(404ms / 122ms),**未达 2× 门限**;
+  主因是脚本前段刚跑完 2 万行灌入与图段重建、后台 compaction/建图与 8 检索线程 + 1 写线程抢 CPU
+  (G1 GC 抖动也占一部分)。门限不改,单独跑并发段落时 P99 明显更低。
+- **路径 A 的形态**:允许集在 FE 物化(结构化谓词先执行)后**在允许集内精确打分**,而不是把允许集
+  下推给 BE 做图遍历 —— 允许集已物化时精确打分更准且不慢,`EXPLAIN` 的 `允许集来源` 写清是
+  主键集合还是布隆过滤器(`K168` 的区分保留在选路信息里)。
+- **向量列限制**:不能做主键 / 普通索引 / 普通比较(1235);`GROUP BY` / `DISTINCT` /
+  `ORDER BY`(除距离函数)一律 1235(`FR-763`)。
+- 不做:全文/倒排(P10)、大对象/多模态(P11)、空间类型(P12)、text2sql(P8)、
+  向量量化、多向量列联合检索、跨节点向量分片、GPU/第三方向量库(永不做)。
+
+### P7.1 向量检索时延与并发退化(**不改磁盘格式与语义,门限一个数字没动**)
+
+P7 交付后 `10 万 × 128 维 top-10` 实测 **613ms**(门限 100ms)、8 线程并发 P99 是空载的 **4.0×**
+(门限 2×)。P7.1 先**打点**再动手,量出来的钱花在哪,就改哪:
+
+**① 五段打点(默认关闭,`SET vector_profile = ON` 打开;`P7_PROFILE=0` 关掉脚本输出)**
+
+打点分 BE 五段与 FE 三段,BE 段写进 fed 日志(限流 1 秒一条,边界 161)、同时回给 FE 显示一次:
+
+| 段 | 含义 | 改前(10 万×128,k=10) | 改后 |
+|---|---|---|---|
+| 候选准备 `prepare` | 定义查找 / 查询向量 / 段句柄快照 | 0.00ms | 0.00ms |
+| 回表前数据准备 `data_prep` | 图运行时向量与行键就绪(整列回读) | **65.4ms(冷)/ 0(热)** | 0.00ms(常驻命中) |
+| 图搜索 `graph` | 各段 HNSW 遍历(并行时是各段之和) | 4.4ms | 7.8ms(6 段并行,墙钟更短) |
+| memtable `memtable` | 未落盘行的暴力扫描(K163) | 4.4ms | 6.9ms |
+| 候选归并 `merge` | 跨段去重 + 排序 + 截断 | 6.2ms | 0.7ms |
+| **BE 合计 `total`(墙钟)** | | **15ms** | **7.5ms** |
+| 候选回表 `fetchback` | BE 侧 64 个候选的点查 | **288 ~ 317ms** | **0.0 ~ 1.0ms** |
+| FE `fetch/decode/score` | 批量回表 / 解码 / 精确打分 | 291 / 0.4 / 0.2ms | 1.9 / 0.1 / 0.1ms |
+
+**结论:固定开销不在图遍历,也不在"每次查询整列回读"**(- 向量运行时第二次查询就已经是 0),
+**九成时间花在候选回表的 64 次点查上** —— 每次点查要跨 6 个 segment、每个 segment 整块解码
+≈2.2MB 的 value chunk,64 × 6 × 0.75ms ≈ 290ms。
+
+**② 按打点结果做的五件事(全部只在内存里,磁盘格式 `format_version=3` 不变)**
+
+- **chunk 解码缓存**(`be/internal/segment/chunkcache.go`):解码一次、按段复用,进程级 LRU
+  (96MB 预算),命中不增加 `ChunksRead` 口径。候选回表 288ms → **1ms**。
+- **向量运行时常驻 + 字节预算 LRU**(K178 / `vector_cache_bytes`,默认物理内存 10%):
+  加载一次常驻;`refs > 0` 的段不淘汰(K179);并发下整列回读**单飞**(8 线程只解码一次,不是 8 份)。
+- **memtable 直接取列载荷**:不再为未落盘的每一行建投影帧(1 万行/查询 = 5MB 额外分配),
+  归并只保留**本来源 top-`ef`**(全局 top-ef 一定是各来源 top-ef 的子集,结果不变)。
+- **候选回表批量化**(K180):BE 一次 `BatchGet` 取全部候选;跨段归并去掉 `map[string]`,
+  改成候选切片按 key 去重 + 标准库排序;FE 侧返回值与请求 keys 对齐(`null` = 已删),
+  全程不建 Map。`candidates_examined` = 实际回表请求数。
+- **段级并行 + 只读快照**(K183 / `vector_search_parallelism`,默认 `min(8, CPU)`):
+  段搜索与 memtable 扫描并行,临界区只保护缓存表;缓存淘汰按引用计数,检索中的段不动。
+- **路径 A 允许集下推到图**(K182 / `FR-805`):允许集(≤1 万主键用键集合,超了换布隆)随检索
+  一起下发,BE 在 `Search` 的收集端只保留允许集内的候选;允许集为空直接返回 0 行。
+  `EXPLAIN` 的 `允许集来源` 现在明确写 `allow-list 主键集合(N 行)` / `allow-list 布隆过滤器(N 行)`。
+
+**③ 实测(本机,安静机,同 JVM,数据 10 万 × 128 维 / 6 个 segment)**
+
+| 项 | 门限 | 改前 | 改后 | 结论 |
+|---|---|---|---|---|
+| SC-439 top-10 中位 | ≤ 100ms | 613ms | **14ms**(P50 19ms / P99 33ms) | 达标 |
+| SC-441 k=10 vs k=100 | 差 ≤ 20% | 774 / 765ms(固定开销吞掉差异) | P50 **18 / 18ms** | 达标 |
+| SC-440 8 线程 P99 / 空载 | ≤ 2× | 4.0× | **0.88×**(83ms / 94ms,20s,0 错误) | 达标(★ 正式判据仍跑 p7-test 的 60s 段) |
+| SC-442 路径 A `candidates_examined` | < 表行数 10% | 允许集内暴力(≈选择率×行数) | 图内允许集,**候选 ≤ ef** | 达标 |
+| SC-443 三路结果一致 | 逐行一致 | — | 路径 A = 路径 B = 精确 | 达标 |
+| 召回矩阵 | 81 格 ≥95% | 81/81 | 81/81(**1.0000**) | 达标 |
+| 导入 / 建图 | — | 204s / 75s | 233s / 69s(未变,不在本期范围) | — |
+
+**④ 新增配置(`config/be.conf`,缺省即自动;非法值启动失败并指出第几行,边界 164)**
+
+| 项 | 默认 | 说明 |
+|---|---|---|
+| `vector_cache_bytes` | 自动(物理内存 10%,下限 64MB) | 向量运行时(向量 + 行键)缓存预算;超出按 LRU 淘汰,**结果不变** |
+| `vector_search_parallelism` | 自动(`min(8, CPU)`) | 段级并行上限;`1` = 串行(回到 P7 行为) |
+
+**⑤ 一键回归**
+
+```bash
+bash scripts/tests/p7-perf.sh                 # 10 万 × 128:导入 / 建图 / 检索三段 + P50/P99
+P7P_SECONDS=0 bash scripts/tests/p7-perf.sh   # 跳过并发段
+bash scripts/tests/p7-test.sh                 # SC-419~438 + P7.1 分段耗时 / SC-442 路径 A
+```
+
+`p7-perf.sh` 端口固定 BE 9995 / MySQL 9998 / 心跳 9999,数据目录 `tmp/p7-perf/data`(每次重建);
+它要求**安静机**(有残留 `be.exe` 直接退出),脚本自己起的是 `tmp/p7-perf/be.exe`。
+
+**⑥ 本期明确没做 / 口径说明**
+
+- **BE 五段里的 `graph` 是各段耗时之和**(并行时的 CPU 时间),`total` 才是墙钟 —— 6 段并行时
+  `graph` 会大于 `total` 的一半,这是并行度的直接体现,不是矛盾。
+- **chunk 缓存是进程级 96MB 固定预算**(未做成配置):10 万 × 128 维全表 value chunk ≈ 55MB,能全放下;
+  更大的表会退化成 LRU 部分命中,时延随命中率上升,但结果不受影响。
+- **首次查询仍要付一次整列回读**(冷启动 52 ~ 65ms,之后为 0);没有做"启动预热",避免拖慢重启。
+- **路径 A 的兜底**:允许集内候选不足 k 时退回"允许集内精确打分"(结果与图内过滤逐行一致),
+  3 处细节(允许集空、允许集过大、统计缺失)仍按 K167 走路径 B。
+- 没做:**量化压缩**(未排期)、把距离计算搬到 BE(K161 分工不变)、允许集下推到**高层**图遍历
+  (过滤发生在收集端,与"允许集内展开"结果一致)。
+
 ## 状态
 
-**P1(基座)、P2(表与 SQL)、P2.1(SQL 兼容性补齐)、P3(事务与 MVCC)、P3.5(常驻 FE + 多库 + MySQL 协议)、P4(索引)均已实现。**
+**P1(基座)、P2(表与 SQL)、P2.1(SQL 兼容性补齐)、P3(事务与 MVCC)、P3.5(常驻 FE + 多库 + MySQL 协议)、
+P4(索引)、P5(分析引擎)、P6(优化器)、P6.1(执行层性能)、P7(AI 能力:向量类型 / 分段 HNSW / 混合查询 / 推理下推)、
+P7.1(向量检索时延与并发退化:分段打点 / 常驻缓存 / 候选批量回表 / 段级并行 / 路径 A 允许集下推)均已实现。**
 
 P4 带来什么:
 

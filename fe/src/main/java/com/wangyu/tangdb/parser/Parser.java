@@ -68,6 +68,7 @@ public final class Parser {
         }
         return switch (t.text().toUpperCase()) {
             case "CREATE" -> parseCreate();
+            case "REBUILD" -> parseRebuild();
             case "DROP" -> parseDrop();
             case "TRUNCATE" -> parseTruncate();
             case "SHOW" -> parseShow();
@@ -102,6 +103,11 @@ public final class Parser {
         }
         if (matchKeyword("INDEX")) {
             return parseCreateIndex(false);
+        }
+        if (matchKeyword("VECTOR")) {
+            // SPEC-P7 FR-736:CREATE VECTOR INDEX <名> ON <表>(<向量列>) WITH (...)
+            expectKeyword("INDEX");
+            return parseCreateVectorIndex();
         }
         expectKeyword("TABLE");
         Ref ref = parseTableRef("表名");
@@ -187,6 +193,73 @@ public final class Parser {
     }
 
     /**
+     * SPEC-P7 FR-736:CREATE VECTOR INDEX <名> ON [db.]<表>(<向量列>)
+     * [WITH (metric='l2', m=16, ef_construction=200)]。
+     */
+    private Ast.Statement parseCreateVectorIndex() {
+        String name = expectIdentifier("向量索引名");
+        expectKeyword("ON");
+        Ref ref = parseTableRef("表名");
+        expect(TokenType.LPAREN, "向量索引列的 '('");
+        String column = expectIdentifier("向量列名");
+        if (match(TokenType.COMMA)) {
+            throw new ParseException("语法错误: 一个向量索引只建在一个向量列上(FR-738)", 0, 0, 1235);
+        }
+        expect(TokenType.RPAREN, "向量索引列的 ')'");
+        java.util.Map<String, String> options = new java.util.LinkedHashMap<>();
+        if (matchKeyword("WITH")) {
+            expect(TokenType.LPAREN, "WITH 的 '('");
+            do {
+                String key = expectIdentifier("WITH 参数名").toLowerCase(java.util.Locale.ROOT);
+                expect(TokenType.EQ, "WITH 参数的 '='");
+                Token value = current();
+                if (value.type() != TokenType.STRING && value.type() != TokenType.INTEGER
+                        && value.type() != TokenType.IDENT) {
+                    throw error(value, "WITH 参数 " + key + " 的取值非法");
+                }
+                advance();
+                Object literal = value.type() == TokenType.STRING ? value.text() : value.text();
+                options.put(key, String.valueOf(literal));
+            } while (match(TokenType.COMMA));
+            expect(TokenType.RPAREN, "WITH 的 ')'");
+        }
+        int metric = com.wangyu.tangdb.storage.VectorValues.metricCode(
+                options.getOrDefault("metric", "l2"));
+        if (metric < 0) {
+            throw new ParseException("语法错误: metric 只支持 'l2' / 'cosine' / 'inner_product'(实际 "
+                    + options.get("metric") + ")", 0, 0, 1235);
+        }
+        int m = parseIntOption(options, "m", 16);
+        int efc = parseIntOption(options, "ef_construction", 200);
+        return new Ast.CreateVectorIndex(ref.database(), ref.table(), name, column, metric, m, efc);
+    }
+
+    private static int parseIntOption(java.util.Map<String, String> options, String key,
+                                      int fallback) {
+        String raw = options.get(key);
+        if (raw == null) {
+            return fallback;
+        }
+        try {
+            return Integer.parseInt(raw.trim());
+        } catch (NumberFormatException e) {
+            throw new ParseException("语法错误: WITH 参数 " + key + " 必须是整数(实际 " + raw + ")",
+                    0, 0, 1235);
+        }
+    }
+
+    /** SPEC-P7 FR-750:REBUILD VECTOR INDEX <名> ON [db.]<表>。 */
+    private Ast.Statement parseRebuild() {
+        expectKeyword("REBUILD");
+        expectKeyword("VECTOR");
+        expectKeyword("INDEX");
+        String name = expectIdentifier("向量索引名");
+        expectKeyword("ON");
+        Ref ref = parseTableRef("表名");
+        return new Ast.RebuildVectorIndex(ref.database(), ref.table(), name);
+    }
+
+    /**
      * 建表内联约束:`UNIQUE[(KEY)] [name](<col>)` / `INDEX|KEY [name](<col>)`。
      * 名字可省略(FR-463 自动命名);带名字的形式用于 SHOW CREATE TABLE round-trip(K96)。
      */
@@ -269,21 +342,34 @@ public final class Parser {
         String name = expectIdentifier("列名");
         DataType type = parseDataType();
         int length = 0;
-        if (type == DataType.VARCHAR) {
+        if (type == DataType.VARCHAR || type == DataType.VECTOR) {
+            boolean vector = type == DataType.VECTOR;
+            String what = vector ? "VECTOR 的维度" : "VARCHAR 的长度";
             if (!match(TokenType.LPAREN)) {
-                throw error("VARCHAR 必须给出长度,例如 VARCHAR(32)");
+                throw error(vector ? "VECTOR 必须给出维度,例如 VECTOR(128)"
+                        : "VARCHAR 必须给出长度,例如 VARCHAR(32)");
             }
-            Token lenToken = expect(TokenType.INTEGER, "VARCHAR 的长度");
+            boolean negative = match(TokenType.MINUS);
+            Token lenToken = expect(TokenType.INTEGER, what);
             long len;
             try {
                 len = Long.parseLong(lenToken.text());
             } catch (NumberFormatException e) {
-                throw error(lenToken, "VARCHAR 长度非法: " + lenToken.text());
+                throw error(lenToken, (vector ? "VECTOR 维度" : "VARCHAR 长度") + "非法: " + lenToken.text());
             }
-            if (len < 1 || len > 65535) {
+            if (negative) {
+                len = -len;
+            }
+            if (vector) {
+                // SPEC-P7 FR-731 / 边界 125:维度 1~4,096,越界报合法范围。
+                if (len < 1 || len > DataType.MAX_VECTOR_DIM) {
+                    throw error(lenToken, "VECTOR 维度必须在 1-" + DataType.MAX_VECTOR_DIM
+                            + " 之间: " + len);
+                }
+            } else if (len < 1 || len > 65535) {
                 throw error(lenToken, "VARCHAR 长度必须在 1-65535 之间: " + len);
             }
-            expect(TokenType.RPAREN, "VARCHAR 长度的 ')'");
+            expect(TokenType.RPAREN, (vector ? "VECTOR 维度的 ')'" : "VARCHAR 长度的 ')'"));
             length = (int) len;
         }
         boolean primaryKey = false;
@@ -327,7 +413,8 @@ public final class Parser {
         DataType type = DataType.parse(t.text());
         if (type == null) {
             throw error(t, "未知的列类型: " + t.text()
-                    + "(支持 INT / BIGINT / DOUBLE / VARCHAR(n) / DATE / BOOLEAN)");
+                    + "(支持 INT / BIGINT / DOUBLE / VARCHAR(n) / DATE / BOOLEAN / JSON"
+                    + " / VECTOR(n))");
         }
         return type;
     }
@@ -455,17 +542,43 @@ public final class Parser {
                 Ref ref = parseTableRef("表名");
                 db = ref.database();
                 table = ref.table();
+                // FR-783:SHOW INDEXES FROM <表> FROM <库> 双 FROM(Connector/J 依赖)
+                if (matchKeyword("FROM") || matchKeyword("IN")) {
+                    db = expectIdentifier("库名");
+                }
             }
             Ast.Condition where = matchKeyword("WHERE") ? parseCondition() : null;
             return new Ast.ShowIndexes(db, table, where);
+        }
+        if (matchKeyword("VECTOR")) {
+            // SPEC-P7 FR-787:SHOW VECTOR INDEXES [FROM [db.]t]
+            expectKeyword("INDEXES");
+            String vdb = null;
+            String vtable = null;
+            if (matchKeyword("FROM") || matchKeyword("IN")) {
+                Ref vref = parseTableRef("表名");
+                vdb = vref.database();
+                vtable = vref.table();
+            }
+            return new Ast.ShowVectorIndexes(vdb, vtable);
+        }
+        if (matchKeyword("AI")) {
+            // SPEC-P7 FR-780:SHOW AI STATS
+            expectKeyword("STATS");
+            return new Ast.ShowAiStats();
         }
         if (matchKeyword("INDEX") || matchKeyword("KEYS")) {
             if (!matchKeyword("FROM") && !matchKeyword("IN")) {
                 throw error("SHOW INDEX / SHOW KEYS 需要 FROM <表>");
             }
             Ref ref = parseTableRef("表名");
+            String db = ref.database();
+            // FR-783:SHOW INDEX FROM <表> FROM <库> 双 FROM(Connector/J getIndexInfo 依赖)
+            if (matchKeyword("FROM") || matchKeyword("IN")) {
+                db = expectIdentifier("库名");
+            }
             Ast.Condition where = matchKeyword("WHERE") ? parseCondition() : null;
-            return new Ast.ShowIndexDetails(ref.database(), ref.table(), where);
+            return new Ast.ShowIndexDetails(db, ref.table(), where);
         }
         if (matchKeyword("TABLE")) {
             expectKeyword("STATUS");
@@ -669,6 +782,12 @@ public final class Parser {
             } while (match(TokenType.COMMA));
             expect(TokenType.RPAREN, "列名列表的 ')'");
         }
+        if (peekKeyword("SELECT")) {
+            // SPEC-P7 FR-772:INSERT ... SELECT
+            expectKeyword("SELECT");
+            Ast.QueryBody query = parseQueryBody();
+            return new Ast.InsertSelect(ref.database(), ref.table(), columns, query);
+        }
         expectKeyword("VALUES");
 
         List<List<Object>> rows = new ArrayList<>();
@@ -740,11 +859,29 @@ public final class Parser {
             index = save;
         }
         Ast.QueryExpr expr = parseSetExpression(true);
+        boolean vectorInfo = false;
+        if (peekKeyword("WITH")) {
+            // SPEC-P7 K164:WITH VECTOR INFO 尾缀(只对单支 SELECT 生效)
+            advance(); // WITH
+            expectKeyword("VECTOR");
+            expectKeyword("INFO");
+            vectorInfo = true;
+        }
+        if (vectorInfo && !(expr instanceof Ast.BodyExpr)) {
+            throw new ParseException("语法错误: WITH VECTOR INFO 只支持单条 SELECT", 0, 0, 1235);
+        }
         if (expr instanceof Ast.BodyExpr bodyExpr) {
             Ast.QueryBody body = bodyExpr.body();
             if (isLiteralOnly(body.items())) {
                 throw new ParseException("语法错误: 带 FROM 的常量投影不支持(边界 39);"
                         + "请显式给出列或表达式", 0, 0);
+            }
+            if (vectorInfo) {
+                if (canLegacy(body)) {
+                    // 老窄子集没有"向量检索"概念,但仍能返回四列自描述(全 false/0)
+                    return toLegacy(body);
+                }
+                return new Ast.SelectVectorInfo(body);
             }
             if (canLegacy(body)) {
                 return toLegacy(body);

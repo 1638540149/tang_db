@@ -37,6 +37,11 @@ public final class ReadViews {
             }
 
             @Override
+            public boolean supportsProjection() {
+                return kv instanceof ProjectingStore;
+            }
+
+            @Override
             public List<KeyValue> scanProjected(byte[] start, byte[] end, int limit,
                                                 ScanOptions options) {
                 if (kv instanceof ProjectingStore projecting) {
@@ -63,6 +68,16 @@ public final class ReadViews {
             public List<KeyValue> scan(byte[] start, byte[] end, int limit) {
                 return kv.scan(start, end, snapshot, limit);
             }
+
+            @Override
+            public long snapshot() {
+                return snapshot;
+            }
+
+            @Override
+            public boolean supportsProjection() {
+                return kv instanceof ProjectingStore;
+            }
         };
     }
 
@@ -82,6 +97,11 @@ public final class ReadViews {
             public List<KeyValue> scan(byte[] start, byte[] end, int limit) {
                 List<KeyValue> base = kv.scan(start, end, txn.snapshot(), 0);
                 return merge(base, txn.writes().range(start, end), limit);
+            }
+
+            @Override
+            public long snapshot() {
+                return txn.snapshot();
             }
         };
     }

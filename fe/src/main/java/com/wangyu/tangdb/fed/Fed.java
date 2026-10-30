@@ -105,8 +105,20 @@ public final class Fed implements AutoCloseable {
                 config.queryBatchRows(), config.sortSpillBytes(), config.sortTmpDir(),
                 config.optimizer())
                 .withExecution(config.queryParallelism(), config.pushdownEnabled(),
-                        config.scanBatchRows());
+                        config.scanBatchRows())
+                // SPEC-P7 §5.4:E 组推理算子 + 向量检索门限
+                .withP7(config.p7(), new com.wangyu.tangdb.ai.AiService(config.ai()));
         // FR-724:启动日志必须写明本次使用的期限与并行度。
+        System.err.println("信息: P7 向量/推理配置 vector_m=" + config.p7().vectorM()
+                + " ef_construction=" + config.p7().vectorEfConstruction()
+                + " ef_search=" + config.p7().vectorEfSearch()
+                + " ef_max=" + config.p7().vectorEfMax()
+                + " bruteforce_rows=" + config.p7().vectorBruteforceRows()
+                + " parallel_min_rows=" + config.p7().parallelMinRows()
+                + " ai_endpoint=" + (config.ai().endpoint().isEmpty() ? "(未配置)"
+                        : config.ai().endpoint())
+                + " ai_model=" + (config.ai().model().isEmpty() ? "(未配置)" : config.ai().model())
+                + " ai_dim=" + config.ai().dim());
         System.err.println("信息: 执行层配置 parallelism=" + config.queryParallelism()
                 + " pushdown=" + config.pushdownEnabled()
                 + " scan_batch_rows=" + config.scanBatchRows()

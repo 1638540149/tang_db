@@ -82,6 +82,10 @@ type Options struct {
 	WALBufferBytes      int64 // WAL 追加缓冲大小,默认 1MB
 	GroupCommitMaxBatch int   // 一次 fsync 最多合并的提交数,默认 64
 	GroupCommitMaxWait  int   // 攒批最长等待(毫秒),默认 5
+
+	// ---- SPEC-P7.1(向量检索)----
+	VectorCacheBytes        int64 // 向量运行时缓存预算;<=0 = 自动(内存的 10%)
+	VectorSearchParallelism int   // 段级并行上限;<=0 = 自动(min(8, CPU))
 }
 
 // Write 是提交写集里的一条:key 为用户键(不含版本段)。
@@ -127,6 +131,9 @@ type Engine struct {
 
 	// compactionMu 串行化后台合并(同一时刻只跑一个)。
 	compactionMu sync.Mutex
+
+	// SPEC-P7:分段 HNSW 图索引(定义 / 图运行时 / 后台建图队列)。
+	vec *vectorState
 
 	lastCommitTS atomic.Uint64
 	// visibleTS 是所有 commit_ts <= 它的写入都已完成 memtable 应用的水位。
@@ -239,6 +246,13 @@ func OpenWithOptions(dataDir string, opts Options) (*Engine, *Stats, error) {
 		walBufferSize:      int(walBuffer),
 		flushCh:            make(chan struct{}, 1),
 		closeCh:            make(chan struct{}),
+		vec:                newVectorState(),
+	}
+	if opts.VectorCacheBytes > 0 {
+		e.vec.budget = opts.VectorCacheBytes
+	}
+	if opts.VectorSearchParallelism > 0 {
+		e.vec.parallelism = opts.VectorSearchParallelism
 	}
 	e.flushCond = sync.NewCond(&e.mu)
 	e.groupCond = sync.NewCond(&e.groupMu)
@@ -277,6 +291,9 @@ func OpenWithOptions(dataDir string, opts Options) (*Engine, *Stats, error) {
 		}
 	}
 	e.rebuildViewLocked()
+
+	// ①.6 SPEC-P7:恢复向量索引定义,并校验已有图段(损坏 → 待重建,不阻塞启动)。
+	e.loadVectorDefs()
 
 	// ③ 重放 WAL(按编号升序)。整条记录完整 + CRC 通过 = 已提交。
 	mem := memtable.New()
@@ -364,6 +381,11 @@ func OpenWithOptions(dataDir string, opts Options) (*Engine, *Stats, error) {
 	e.wg.Add(1)
 	go e.flushWorker()
 
+	// SPEC-P7:后台建图 worker(segment 落盘后建图,不阻塞前台写读,FR-748)。
+	e.vec.wg.Add(1)
+	go e.vecBuildWorker()
+	e.loadVectorGraphs()
+
 	// 启动后补一次合并(老目录可能 L0 文件已经超阈值)。
 	if !e.disableCompaction {
 		select {
@@ -386,6 +408,9 @@ func (e *Engine) Close() error {
 
 	close(e.closeCh)
 	e.wg.Wait()
+	// SPEC-P7:停后台建图 worker(已在建的图会在当前任务结束后退出)
+	close(e.vec.stop)
+	e.vec.wg.Wait()
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -687,6 +712,8 @@ func (e *Engine) flushOne(table *memtable.MemTable, segNum uint64) error {
 	e.mu.Unlock()
 
 	e.gcWAL()
+	// SPEC-P7 FR-748:segment 落盘后后台建图(不阻塞前台)
+	e.onSegmentFlushed(segNum)
 	return nil
 }
 

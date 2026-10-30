@@ -38,7 +38,23 @@ public final class Functions {
         return LATER_PHASE.contains(name.toUpperCase(Locale.ROOT));
     }
 
+    /** SPEC-P7 FR-735:三个距离函数(自己实现,不引第三方向量/数学库,K157)。 */
+    public static boolean isDistance(String name) {
+        return switch (name.toUpperCase(Locale.ROOT)) {
+            case "L2_DISTANCE", "COSINE_DISTANCE", "INNER_PRODUCT" -> true;
+            default -> false;
+        };
+    }
+
+    /** SPEC-P7 E 组:推理算子名(只能出现在投影 / INSERT ... SELECT,FR-778)。 */
+    public static boolean isAiFunction(String name) {
+        return "AI_EMBED".equalsIgnoreCase(name);
+    }
+
     public static boolean exists(String name) {
+        if (isDistance(name) || isAiFunction(name)) {
+            return true;
+        }
         return switch (name.toUpperCase(Locale.ROOT)) {
             case "ABS", "ROUND", "CEIL", "CEILING", "FLOOR", "MOD", "POWER", "SQRT",
                     "LENGTH", "CHAR_LENGTH", "UPPER", "LOWER", "SUBSTR", "SUBSTRING", "CONCAT",
@@ -51,6 +67,16 @@ public final class Functions {
     /** 标量函数求值;参数已求值(可能含 null)。 */
     public static Object call(String rawName, Object[] args) {
         String name = rawName.toUpperCase(Locale.ROOT);
+        if (isDistance(name)) {
+            return distance(name, args);
+        }
+        if (isAiFunction(name)) {
+            // ai_embed 是"算子",必须在投影批次里被 EmbedOp 替换掉;走到这里说明
+            // 它出现在了不允许的位置,或者是没经过批量前处理的路径(FR-778)。
+            throw new SqlError(SqlError.ER_NOT_SUPPORTED_YET, "42000",
+                    "ai_embed() 只能出现在投影与 INSERT ... SELECT 中(不能出现在 WHERE / "
+                            + "GROUP BY / ORDER BY / HAVING,FR-778)");
+        }
         if (LATER_PHASE.contains(name)) {
             throw new SqlError(SqlError.ER_NOT_SUPPORTED_YET, "42000",
                     name + "() 归 P12(本期只做 YEAR/MONTH/DAY,FR-613)");
@@ -279,10 +305,46 @@ public final class Functions {
                 case BOOLEAN -> value instanceof Boolean b ? b
                         : (value instanceof Number n ? n.doubleValue() != 0 : null);
                 case JSON -> value instanceof byte[] b ? b : JsonCodec.encode(value);
+                // FR-731:VECTOR 不是可 CAST 的目标类型(只从字面量/推理算子产生)。
+                case VECTOR -> null;
             };
         } catch (RuntimeException e) {
             return null;
         }
+    }
+
+    /**
+     * 距离函数求值(SPEC-P7 FR-735):参数可以是"一列 + 一个字面量"或"两列"。
+     *
+     * <p>维度以已知一侧为准;字面量元素个数不符时报出期望/实际个数(边界 126),
+     * NaN / Inf / 非数值在第 N 个元素处报错(边界 127)。</p>
+     */
+    public static double distance(String rawName, Object[] args) {
+        String name = rawName.toUpperCase(Locale.ROOT);
+        requireArgs(name, args, 2);
+        if (args[0] == null || args[1] == null) {
+            throw new SqlError(SqlError.ER_NOT_SUPPORTED_YET, "42000",
+                    name + "() 的入参不能为 NULL");
+        }
+        float[] a = com.wangyu.tangdb.storage.VectorValues.toVector(args[0], 0, name + " 的第 1 个参数");
+        float[] b = com.wangyu.tangdb.storage.VectorValues.toVector(args[1], a.length,
+                name + " 的第 2 个参数");
+        int metric = switch (name) {
+            case "COSINE_DISTANCE" -> com.wangyu.tangdb.storage.VectorValues.METRIC_COSINE;
+            case "INNER_PRODUCT" -> com.wangyu.tangdb.storage.VectorValues.METRIC_INNER_PRODUCT;
+            default -> com.wangyu.tangdb.storage.VectorValues.METRIC_L2;
+        };
+        return com.wangyu.tangdb.storage.VectorValues.distance(metric, a, b);
+    }
+
+    /** 距离函数名 → 度量操作码(向量检索选路用);不是距离函数返回 -1。 */
+    public static int distanceMetric(String name) {
+        return switch (name.toUpperCase(Locale.ROOT)) {
+            case "COSINE_DISTANCE" -> com.wangyu.tangdb.storage.VectorValues.METRIC_COSINE;
+            case "INNER_PRODUCT" -> com.wangyu.tangdb.storage.VectorValues.METRIC_INNER_PRODUCT;
+            case "L2_DISTANCE" -> com.wangyu.tangdb.storage.VectorValues.METRIC_L2;
+            default -> -1;
+        };
     }
 
     /** 函数名表(给 EXPLAIN / 测试用)。 */
@@ -290,6 +352,7 @@ public final class Functions {
         return List.of("ABS", "ROUND", "CEIL", "CEILING", "FLOOR", "MOD", "POWER", "SQRT",
                 "LENGTH", "CHAR_LENGTH", "UPPER", "LOWER", "SUBSTR", "SUBSTRING", "CONCAT",
                 "TRIM", "LTRIM", "RTRIM", "REPLACE", "COALESCE", "IFNULL", "NULLIF",
-                "CAST", "YEAR", "MONTH", "DAY", "DAYOFMONTH", "JSON_EXTRACT");
+                "CAST", "YEAR", "MONTH", "DAY", "DAYOFMONTH", "JSON_EXTRACT",
+                "L2_DISTANCE", "COSINE_DISTANCE", "INNER_PRODUCT", "AI_EMBED");
     }
 }

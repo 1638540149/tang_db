@@ -99,6 +99,32 @@ public final class FeConfig {
     private final int rpcBulkDeadlineSeconds;
     private final int rpcScanDeadlineSeconds;
 
+    // ---- SPEC-P7 §5.4(向量检索门限 / 扫描并行阈值 / 推理端点) ----
+    // 这两项在 parse() 末尾一次性装配;其余构造路径(测试 / 程序化)取默认值。
+    private com.wangyu.tangdb.query.P7Options p7 = com.wangyu.tangdb.query.P7Options.defaults();
+    private com.wangyu.tangdb.ai.AiService.Config ai = com.wangyu.tangdb.ai.AiService.Config.disabled();
+
+    /** 分配 SPEC-P7 的向量/推理参数(只由 {@link #parse(String)} 调用)。 */
+    void applyP7(com.wangyu.tangdb.query.P7Options options,
+                 com.wangyu.tangdb.ai.AiService.Config aiConfig) {
+        if (options != null) {
+            this.p7 = options;
+        }
+        if (aiConfig != null) {
+            this.ai = aiConfig;
+        }
+    }
+
+    /** SPEC-P7 §5.4:向量检索门限 + parallel_min_rows。 */
+    public com.wangyu.tangdb.query.P7Options p7() {
+        return p7;
+    }
+
+    /** SPEC-P7 E 组:推理端点配置(缺失时 configured()=false)。 */
+    public com.wangyu.tangdb.ai.AiService.Config ai() {
+        return ai;
+    }
+
     private FeConfig(String beHost, int bePort, int heartbeatListenPort, int beOfflineCycles,
                      boolean heartbeatEnabled, String mode, int mysqlPort, int sessionMax,
                      int sessionIdleTimeout, int shutdownGraceSeconds, String user, String password,
@@ -372,6 +398,23 @@ public final class FeConfig {
         int rpcDeadlineSeconds = d.rpcDeadlineSeconds;
         int rpcBulkDeadlineSeconds = d.rpcBulkDeadlineSeconds;
         int rpcScanDeadlineSeconds = d.rpcScanDeadlineSeconds;
+        int vectorMetric = d.p7.vectorMetric();
+        int vectorM = d.p7.vectorM();
+        int vectorEfConstruction = d.p7.vectorEfConstruction();
+        int vectorEfSearch = d.p7.vectorEfSearch();
+        int vectorEfMax = d.p7.vectorEfMax();
+        int vectorBruteforceRows = d.p7.vectorBruteforceRows();
+        int exactFallbackRows = d.p7.exactFallbackRows();
+        double allowListMaxRatio = d.p7.allowListMaxRatio();
+        int parallelMinRows = d.p7.parallelMinRows();
+        String aiEndpoint = d.ai.endpoint();
+        String aiModel = d.ai.model();
+        int aiDim = d.ai.dim();
+        int aiBatchRows = d.ai.batchRows();
+        int aiTimeoutMs = d.ai.timeoutMs();
+        int aiCacheEntries = d.ai.cacheEntries();
+        int aiMaxRetries = d.ai.maxRetries();
+        int aiBreakerBatches = d.ai.breakerBatches();
 
         for (int i = 0; i < lines.size(); i++) {
             String line = lines.get(i);
@@ -453,12 +496,42 @@ public final class FeConfig {
                         rpcBulkDeadlineSeconds = parseInt(key, value, path, i + 1, 1, 600);
                 case "rpc_scan_deadline_seconds" ->
                         rpcScanDeadlineSeconds = parseInt(key, value, path, i + 1, 1, 600);
+                case "vector_metric" -> {
+                    vectorMetric = com.wangyu.tangdb.storage.VectorValues.metricCode(value);
+                    if (vectorMetric < 0) {
+                        throw new IllegalArgumentException(path + " 第 " + (i + 1)
+                                + " 行 vector_metric 无效: " + value
+                                + "(应为 l2 / cosine / inner_product)");
+                    }
+                }
+                case "vector_m" -> vectorM = parseInt(key, value, path, i + 1, 4, 64);
+                case "vector_ef_construction" ->
+                        vectorEfConstruction = parseInt(key, value, path, i + 1, 16, 1024);
+                case "vector_ef_search" -> vectorEfSearch = parseInt(key, value, path, i + 1, 1, 4096);
+                case "vector_ef_max" -> vectorEfMax = parseInt(key, value, path, i + 1, 1, 8192);
+                case "vector_bruteforce_rows" ->
+                        vectorBruteforceRows = parseInt(key, value, path, i + 1, 1, 100_000_000);
+                case "exact_fallback_rows" ->
+                        exactFallbackRows = parseInt(key, value, path, i + 1, 1, 100_000_000);
+                case "allow_list_max_ratio" -> allowListMaxRatio = parseRatio(key, value, path, i + 1);
+                case "parallel_min_rows" ->
+                        parallelMinRows = parseInt(key, value, path, i + 1, 0, 100_000_000);
+                case "ai_endpoint" -> aiEndpoint = value;
+                case "ai_model" -> aiModel = value;
+                case "ai_dim" -> aiDim = parseInt(key, value, path, i + 1, 0, 4096);
+                case "ai_batch_rows" -> aiBatchRows = parseInt(key, value, path, i + 1, 1, 65536);
+                case "ai_timeout_ms" -> aiTimeoutMs = parseInt(key, value, path, i + 1, 1, 600_000);
+                case "ai_cache_entries" ->
+                        aiCacheEntries = parseInt(key, value, path, i + 1, 0, 10_000_000);
+                case "ai_max_retries" -> aiMaxRetries = parseInt(key, value, path, i + 1, 0, 10);
+                case "ai_breaker_batches" ->
+                        aiBreakerBatches = parseInt(key, value, path, i + 1, 1, 1000);
                 default -> throw new IllegalArgumentException(
                         path + " 第 " + (i + 1) + " 行未知配置项: " + key);
             }
         }
 
-        return new FeConfig(host, port, heartbeatPort, offlineCycles, heartbeatEnabled,
+        FeConfig config = new FeConfig(host, port, heartbeatPort, offlineCycles, heartbeatEnabled,
                 mode, mysqlPort, sessionMax, sessionIdleTimeout, shutdownGraceSeconds, user, password,
                 indexBackfillBatch, queryBatchRows, sortSpillBytes, sortTmpDir, csvImportBatchRows,
                 new com.wangyu.tangdb.planner.OptimizerConfig(optimizerEnabled, cboJoinEnumMaxTables,
@@ -467,6 +540,27 @@ public final class FeConfig {
                         analyzeHistogramBuckets, analyzeExactDistinctMaxRows, analyzeHllPrecision),
                 queryParallelism, pushdownEnabled, scanBatchRows, rpcDeadlineSeconds,
                 rpcBulkDeadlineSeconds, rpcScanDeadlineSeconds);
+        config.applyP7(new com.wangyu.tangdb.query.P7Options(vectorMetric, vectorM,
+                        vectorEfConstruction, vectorEfSearch, vectorEfMax, vectorBruteforceRows,
+                        exactFallbackRows, allowListMaxRatio, parallelMinRows,
+                        com.wangyu.tangdb.query.P7Options.PATH_AUTO, false, false),
+                new com.wangyu.tangdb.ai.AiService.Config(aiEndpoint, aiModel, aiDim, aiTimeoutMs,
+                        aiBatchRows, aiCacheEntries, aiMaxRetries, aiBreakerBatches));
+        return config;
+    }
+
+    /** 解析 0~1 的比例(allow_list_max_ratio)。 */
+    private static double parseRatio(String key, String raw, String path, int lineNo) {
+        try {
+            double value = Double.parseDouble(raw.trim());
+            if (value > 0 && value <= 1) {
+                return value;
+            }
+        } catch (NumberFormatException ignored) {
+            // fallthrough
+        }
+        throw new IllegalArgumentException(path + " 第 " + lineNo + " 行 " + key
+                + " 无效: " + raw + "(应为 0~1 之间的小数)");
     }
 
     /**

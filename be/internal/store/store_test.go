@@ -812,7 +812,7 @@ func TestFormatVersionGuard(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 	rewriteManifest(t, dir, func(s string) string {
-		return strings.Replace(s, `"format_version": 2`, `"format_version": 1`, 1)
+		return strings.Replace(s, `"format_version": 3`, `"format_version": 2`, 1)
 	})
 	if _, _, err := Open(dir, 64*1024*1024); err == nil {
 		t.Fatal("expected startup failure for old format")

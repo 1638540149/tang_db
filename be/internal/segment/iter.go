@@ -177,6 +177,14 @@ func (it *Iterator) advanceChunk() {
 
 func (it *Iterator) loadChunk(idx int) error {
 	entry := it.r.index[idx]
+	// SPEC-P7.1:已解码的 chunk 直接复用(点查回表的热点就是重复解码同一批 chunk)。
+	if cached := it.r.cachedRows(idx); cached != nil {
+		it.pf = nil
+		it.chunk = idx
+		it.keys = cached.keys
+		it.values = cached.values
+		return nil
+	}
 	var keyChunk, valueChunk []byte
 	if pf, ok := it.takePrefetch(idx); ok {
 		keyChunk, valueChunk = pf.keyChunk, pf.valueChunk
@@ -215,6 +223,7 @@ func (it *Iterator) loadChunk(idx int) error {
 		}
 	}
 	it.r.AddReadChunk()
+	it.r.cacheRows(idx, keys, values)
 	it.chunk = idx
 	it.keys = keys
 	it.values = values

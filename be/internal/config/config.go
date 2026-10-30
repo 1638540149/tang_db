@@ -97,6 +97,13 @@ type Config struct {
 	WALBufferBytes      int64 // WAL 追加缓冲池大小
 	GroupCommitMaxBatch int   // 一次 fsync 最多合并的提交数
 	GroupCommitMaxWait  int   // 攒批最长等待(毫秒);0 = 不等待
+
+	// ---- SPEC-P7.1(向量检索)----
+	// VectorCacheBytes 是向量运行时缓存预算;0 = 自动(物理内存的 10%)。
+	// 配置里**显式写 0 或负数启动失败**(边界 164)。
+	VectorCacheBytes int64
+	// VectorSearchParallelism 是段级并行的并发上限;0 = 自动(min(8, CPU))。
+	VectorSearchParallelism int
 }
 
 // Default 返回内置默认配置。
@@ -264,6 +271,23 @@ func Parse(r io.Reader) (Config, error) {
 				return Config{}, fmt.Errorf("第 %d 行 group_commit_max_batch 无效:%q(应为 1-65536)", lineNo, value)
 			}
 			cfg.GroupCommitMaxBatch = n
+		case "vector_cache_bytes":
+			size, err := ParseSize(value)
+			if err != nil {
+				return Config{}, fmt.Errorf("第 %d 行 vector_cache_bytes 无效:%v", lineNo, err)
+			}
+			if size < 1<<20 || size > 16<<30 {
+				return Config{}, fmt.Errorf(
+					"第 %d 行 vector_cache_bytes 无效:%q(应为 1MB-16GB,边界 164)", lineNo, value)
+			}
+			cfg.VectorCacheBytes = size
+		case "vector_search_parallelism":
+			n, err := strconv.Atoi(value)
+			if err != nil || n < 1 || n > 256 {
+				return Config{}, fmt.Errorf(
+					"第 %d 行 vector_search_parallelism 无效:%q(应为 1-256)", lineNo, value)
+			}
+			cfg.VectorSearchParallelism = n
 		case "group_commit_max_wait_ms":
 			n, err := strconv.Atoi(value)
 			if err != nil || n < 0 || n > 1000 {

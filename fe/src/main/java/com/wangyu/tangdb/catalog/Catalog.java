@@ -11,6 +11,7 @@ import com.wangyu.tangdb.storage.KvStore;
 import com.wangyu.tangdb.storage.RowCodec;
 import com.wangyu.tangdb.storage.StoreException;
 import com.wangyu.tangdb.storage.TableMeta;
+import com.wangyu.tangdb.storage.VectorIndexMeta;
 
 import java.time.LocalDateTime;
 import java.util.ArrayList;
@@ -49,6 +50,8 @@ public final class Catalog {
     private final Map<Long, List<IndexMeta>> indexesByTable = new LinkedHashMap<>();
     /** 表 ID → 下一个可用索引 ID(每表从 1 起,只增不复用,FR-464 / K75)。 */
     private final Map<Long, Integer> nextIndexIds = new LinkedHashMap<>();
+    /** SPEC-P7 §5.3:向量索引元数据(与普通索引共用每表索引 ID 计数器)。 */
+    private final Map<Long, List<VectorIndexMeta>> vecIndexesByTable = new LinkedHashMap<>();
     private long nextTableId;
 
     private Catalog(KvStore kv) {
@@ -239,6 +242,277 @@ public final class Catalog {
             }
         }
         return null;
+    }
+
+    // ------------------------------------------------------------ 向量索引(SPEC-P7 §5.3)
+
+    /** 某表全部"元数据可见"的向量索引(不含 DROPPED),按索引 ID 升序。 */
+    public List<VectorIndexMeta> vectorIndexes(long tableId) {
+        lock.readLock().lock();
+        try {
+            List<VectorIndexMeta> all = vecIndexesByTable.get(tableId);
+            if (all == null) {
+                return List.of();
+            }
+            List<VectorIndexMeta> visible = new ArrayList<>(all.size());
+            for (VectorIndexMeta index : all) {
+                if (!index.dropped()) {
+                    visible.add(index);
+                }
+            }
+            return visible;
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    /** 全部向量索引元数据(含 DROPPED),按 (table_id, index_id) 升序。 */
+    public List<VectorIndexMeta> allVectorIndexes() {
+        lock.readLock().lock();
+        try {
+            List<VectorIndexMeta> out = new ArrayList<>();
+            for (List<VectorIndexMeta> list : vecIndexesByTable.values()) {
+                out.addAll(list);
+            }
+            out.sort(Comparator.comparingLong(VectorIndexMeta::tableId)
+                    .thenComparingInt(VectorIndexMeta::indexId));
+            return out;
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    /** 某向量列上的向量索引(不含 DROPPED);不存在返回 null。 */
+    public VectorIndexMeta vectorIndexOnColumn(long tableId, String columnName) {
+        if (columnName == null) {
+            return null;
+        }
+        String want = columnName.trim().toLowerCase();
+        for (VectorIndexMeta index : vectorIndexes(tableId)) {
+            if (index.columnName().equals(want)) {
+                return index;
+            }
+        }
+        return null;
+    }
+
+    /** 按表 + 名字找向量索引(不含 DROPPED)。 */
+    public VectorIndexMeta findVectorIndexByName(long tableId, String name) {
+        if (name == null) {
+            return null;
+        }
+        String want = name.trim().toLowerCase();
+        for (VectorIndexMeta index : vectorIndexes(tableId)) {
+            if (index.name().equals(want)) {
+                return index;
+            }
+        }
+        return null;
+    }
+
+    /** 索引名在表内是否已被普通索引占用(向量索引与普通索引同一命名空间,FR-737)。 */
+    public boolean indexNameTaken(long tableId, String name) {
+        return findIndexByName(tableId, name) != null;
+    }
+
+    /**
+     * 建向量索引(SPEC-P7 FR-736 ~ FR-739):空表直接 READY,非空表先 BUILDING 由 BE 后台建图。
+     */
+    public VectorIndexMeta createVectorIndex(String database, String tableName, String rawName,
+                                             String rawColumn, int metric, int m,
+                                             int efConstruction) {
+        lock.writeLock().lock();
+        try {
+            String db = requireDbForWrite(database);
+            TableMeta table = requireTableInDb(db, tableName);
+            if (rawColumn == null || rawColumn.isBlank()) {
+                throw new CatalogException("建向量索引必须指定列");
+            }
+            Column column = table.column(rawColumn.trim());
+            if (column == null) {
+                throw new CatalogException("列 " + rawColumn + " 不存在(表 " + table.name() + ")",
+                        SqlError.ER_BAD_FIELD_ERROR);
+            }
+            if (column.type() != DataType.VECTOR) {
+                throw new CatalogException("列 " + column.name() + " 不是 VECTOR 列(实际 "
+                        + column.typeName() + "),不能建向量索引(FR-736 / 边界 131)",
+                        SqlError.ER_NOT_SUPPORTED_YET);
+            }
+            if (m < 4 || m > 64) {
+                throw new CatalogException("m 必须在 4-64 之间(实际 " + m + ",K159)",
+                        SqlError.ER_NOT_SUPPORTED_YET);
+            }
+            if (efConstruction < 16 || efConstruction > 1024) {
+                throw new CatalogException("ef_construction 必须在 16-1024 之间(实际 "
+                        + efConstruction + ",K159)", SqlError.ER_NOT_SUPPORTED_YET);
+            }
+            VectorIndexMeta existing = vectorIndexOnColumn(table.id(), column.name());
+            if (existing != null) {
+                // FR-738 / 边界 152:一个向量列只允许一个向量索引。
+                throw new CatalogException("列 " + column.name() + " 上已有向量索引 "
+                        + existing.name() + ",一个向量列只允许一个向量索引(FR-738)",
+                        SqlError.ER_NOT_SUPPORTED_YET);
+            }
+            String name = (rawName == null || rawName.isBlank())
+                    ? autoIndexName(table.name(), column.name(), "_vidx",
+                    usedIndexNames(table.id()))
+                    : normalizeIndexName(rawName);
+            if (indexNameTaken(table.id(), name) || findVectorIndexByName(table.id(), name) != null) {
+                throw new CatalogException("索引 " + name + " 已存在(表 " + table.name() + ")",
+                        SqlError.ER_DUP_KEYNAME);
+            }
+            int indexId = nextIndexIdFor(table.id());
+            boolean hasRows = hasLiveRows(table);
+            int state = hasRows ? VectorIndexMeta.STATE_BUILDING : VectorIndexMeta.STATE_READY;
+            VectorIndexMeta index = new VectorIndexMeta(table.id(), indexId, name, column.name(),
+                    column.ordinal(), column.vectorDim(), metric, m, efConstruction, state, now());
+
+            List<KeyValue> batch = new ArrayList<>();
+            batch.add(new KeyValue(SystemTables.vecIndexKey(table.id(), indexId),
+                    SystemTables.encodeVecIndexRow(index)));
+            batch.add(new KeyValue(SystemTables.indexCounterKey(table.id()),
+                    SystemTables.encodeCounterRow(SystemTables.indexCounterName(table.id()),
+                            indexId + 1)));
+            kv.writeBatch(batch);
+            nextIndexIds.merge(table.id(), indexId + 1, Math::max);
+            vecIndexesByTable.computeIfAbsent(table.id(), k -> new ArrayList<>()).add(index);
+            vecIndexesByTable.get(table.id()).sort(Comparator.comparingInt(VectorIndexMeta::indexId));
+            return index;
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    /** 删向量索引(FR-737 / 边界 153):元数据标 DROPPED,并通知 BE 删图文件。 */
+    public VectorIndexMeta dropVectorIndex(String database, String tableName, String rawName) {
+        lock.writeLock().lock();
+        try {
+            String db = requireDbForWrite(database);
+            TableMeta table = requireTableInDb(db, tableName);
+            String name = normalizeIndexName(rawName);
+            VectorIndexMeta index = findVectorIndexByName(table.id(), name);
+            if (index == null) {
+                throw new CatalogException("向量索引 " + name + " 不存在(表 " + table.name() + ")",
+                        SqlError.ER_CANT_DROP_FIELD_OR_KEY);
+            }
+            return writeVectorIndexState(index, VectorIndexMeta.STATE_DROPPED);
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    /** 向量索引状态流转(BUILDING → READY / DROPPED)。 */
+    public VectorIndexMeta updateVectorIndexState(VectorIndexMeta index, int newState) {
+        lock.writeLock().lock();
+        try {
+            return writeVectorIndexState(index, newState);
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    private VectorIndexMeta writeVectorIndexState(VectorIndexMeta index, int newState) {
+        VectorIndexMeta updated = index.withState(newState);
+        kv.put(SystemTables.vecIndexKey(index.tableId(), index.indexId()),
+                SystemTables.encodeVecIndexRow(updated));
+        List<VectorIndexMeta> list = vecIndexesByTable.computeIfAbsent(index.tableId(),
+                k -> new ArrayList<>());
+        for (int i = 0; i < list.size(); i++) {
+            if (list.get(i).indexId() == index.indexId()) {
+                list.set(i, updated);
+                break;
+            }
+        }
+        return updated;
+    }
+
+    /**
+     * 从 sys_vec_indexes 重建向量索引缓存(FR-741):指向不存在的表/列、类型不对、
+     * 索引 ID 与普通索引冲突都中止启动并指名对象。
+     */
+    private void loadVecIndexes() {
+        List<KeyValue> kvs = kv.scan(KeyCodec.tableRangeStart(SystemTables.SYS_VEC_INDEXES),
+                KeyCodec.tableRangeEnd(SystemTables.SYS_VEC_INDEXES), 0);
+        for (KeyValue kvRow : kvs) {
+            Object[] v;
+            try {
+                RowCodec.Decoded decoded = RowCodec.decode(SystemTables.VEC_INDEXES, kvRow.value());
+                if (decoded.tombstone()) {
+                    continue;
+                }
+                v = decoded.values();
+            } catch (StoreException e) {
+                throw new CatalogException("元数据损坏:sys_vec_indexes 中有一行无法解析("
+                        + e.getMessage() + ")", e);
+            }
+            long tableId = ((Number) v[0]).longValue();
+            int indexId = ((Number) v[1]).intValue();
+            String name = (String) v[2];
+            String columnName = (String) v[3];
+            int ordinal = ((Number) v[4]).intValue();
+            int dim = ((Number) v[5]).intValue();
+            int metric = ((Number) v[6]).intValue();
+            int m = ((Number) v[7]).intValue();
+            int efc = ((Number) v[8]).intValue();
+            int state = ((Number) v[9]).intValue();
+            String createdAt = v[10] == null ? "" : (String) v[10];
+
+            TableMeta table = byId.get(tableId);
+            if (table == null) {
+                throw new CatalogException("元数据非法:向量索引 " + name + "(表 ID " + tableId
+                        + ")指向不存在的表");
+            }
+            Column column = table.column(columnName);
+            if (column == null || column.type() != DataType.VECTOR) {
+                throw new CatalogException("元数据非法:向量索引 " + name + "(表 " + table.name()
+                        + ")指向的列 " + columnName + " 不存在或不是 VECTOR");
+            }
+            if (indexId <= 0) {
+                throw new CatalogException("元数据非法:向量索引 " + name + "(表 " + table.name()
+                        + ")的索引 ID " + indexId + " 必须 ≥1");
+            }
+            if (state != VectorIndexMeta.STATE_BUILDING && state != VectorIndexMeta.STATE_READY
+                    && state != VectorIndexMeta.STATE_DROPPED) {
+                throw new CatalogException("元数据非法:向量索引 " + name + "(表 " + table.name()
+                        + ")的状态值 " + state + " 无法识别");
+            }
+            if (dim != column.vectorDim()) {
+                throw new CatalogException("元数据非法:向量索引 " + name + "(表 " + table.name()
+                        + ")的维度 " + dim + " 与列维度 " + column.vectorDim() + " 不一致");
+            }
+            if (ordinal != column.ordinal()) {
+                throw new CatalogException("元数据非法:向量索引 " + name + "(表 " + table.name()
+                        + ")的列序号 " + ordinal + " 与列定义 " + column.ordinal() + " 不一致");
+            }
+            VectorIndexMeta index = new VectorIndexMeta(tableId, indexId, name, column.name(),
+                    ordinal, dim, metric, m, efc, state, createdAt);
+            List<VectorIndexMeta> list = vecIndexesByTable.computeIfAbsent(tableId,
+                    k -> new ArrayList<>());
+            for (VectorIndexMeta existing : list) {
+                if (existing.indexId() == indexId) {
+                    throw new CatalogException("元数据非法:表 " + table.name() + " 内索引 ID "
+                            + indexId + " 重复(" + existing.name() + " 与 " + name + ")");
+                }
+                if (!existing.dropped() && !index.dropped() && existing.name().equals(index.name())) {
+                    throw new CatalogException("元数据非法:表 " + table.name() + " 内向量索引名 "
+                            + index.name() + " 重复");
+                }
+                if (!existing.dropped() && !index.dropped()
+                        && existing.columnName().equals(index.columnName())) {
+                    throw new CatalogException("元数据非法:表 " + table.name() + " 的列 "
+                            + column.name() + " 上有两个向量索引");
+                }
+            }
+            // 普通索引与向量索引共用同一命名空间与计数器(§5.3)
+            IndexMeta plain = findIndex(tableId, indexId);
+            if (plain != null) {
+                throw new CatalogException("元数据非法:表 " + table.name() + " 的索引 ID "
+                        + indexId + " 同时属于普通索引 " + plain.name() + " 与向量索引 " + name);
+            }
+            list.add(index);
+            list.sort(Comparator.comparingInt(VectorIndexMeta::indexId));
+            nextIndexIds.merge(tableId, indexId + 1, Math::max);
+        }
     }
 
     // ------------------------------------------------------------ 库查询
@@ -488,6 +762,12 @@ public final class Catalog {
                         + " 已有主键索引,不能在其上再建索引(表 " + table.name() + ")");
             }
             if (!IndexCodec.indexable(column.type())) {
+                if (column.type() == DataType.VECTOR) {
+                    // SPEC-P7 FR-732 / K172:向量列不建普通索引,只建向量索引,报 1235。
+                    throw new CatalogException("列 " + column.name()
+                            + " 是 VECTOR 列,不能建普通索引(请用 CREATE VECTOR INDEX,FR-732 / K172)",
+                            SqlError.ER_NOT_SUPPORTED_YET);
+                }
                 throw new CatalogException("列 " + column.name() + " 的类型 " + column.typeName()
                         + (column.type() == DataType.JSON
                         ? " 不支持索引(JSON 列不建任何索引,FR-611)"
@@ -784,6 +1064,8 @@ public final class Catalog {
         // SPEC-P6 §5.1:统计信息两张系统表(老目录启动时幂等创建,不需要数据迁移)。
         ensureTable(SystemTables.TABLE_STATS);
         ensureTable(SystemTables.COLUMN_STATS);
+        // SPEC-P7 §5.3:向量索引系统表(新目录 format_version=3 才有;老目录已在 BE 侧拒绝)。
+        ensureTable(SystemTables.VEC_INDEXES);
         if (kv.get(SystemTables.counterKey(SystemTables.COUNTER_NEXT_TABLE_ID)) == null) {
             kv.put(SystemTables.counterKey(SystemTables.COUNTER_NEXT_TABLE_ID),
                     SystemTables.encodeCounterRow(SystemTables.COUNTER_NEXT_TABLE_ID,
@@ -817,6 +1099,7 @@ public final class Catalog {
             activeByDb.clear();
             databases.clear();
             indexesByTable.clear();
+            vecIndexesByTable.clear();
             nextIndexIds.clear();
 
             List<Object[]> tableRows = readTableRows();
@@ -898,6 +1181,7 @@ public final class Catalog {
 
             loadCounter();
             loadIndexes();
+            loadVecIndexes();
 
             long maxUserId = byId.keySet().stream()
                     .filter(id -> !SystemTables.isSystemTable(id))
@@ -1164,14 +1448,23 @@ public final class Catalog {
             if (c.type() == DataType.VARCHAR && (c.length() < 1 || c.length() > 65535)) {
                 throw new CatalogException("列 " + c.name() + " 的 VARCHAR 长度必须在 1-65535 之间");
             }
+            if (c.type() == DataType.VECTOR
+                    && (c.length() < 1 || c.length() > DataType.MAX_VECTOR_DIM)) {
+                // SPEC-P7 FR-731 / 边界 125
+                throw new CatalogException("列 " + c.name() + " 的 VECTOR 维度必须在 1-"
+                        + DataType.MAX_VECTOR_DIM + " 之间: " + c.length(),
+                        SqlError.ER_NOT_SUPPORTED_YET);
+            }
             if (c.primaryKey()) {
                 pkCount++;
                 if (!c.type().canBePrimaryKey()) {
-                    int code = c.type() == DataType.JSON
+                    int code = c.type() == DataType.JSON || c.type() == DataType.VECTOR
                             ? SqlError.ER_NOT_SUPPORTED_YET : 0;
                     throw new CatalogException("主键类型不支持: " + c.typeName()
                             + (c.type() == DataType.JSON
                             ? "(JSON 列不得做主键,FR-611)"
+                            : c.type() == DataType.VECTOR
+                            ? "(VECTOR 列不得做主键,FR-732 / K172)"
                             : "(只允许 INT / BIGINT / VARCHAR / DATE)"), code);
                 }
             }

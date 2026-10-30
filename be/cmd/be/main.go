@@ -104,6 +104,8 @@ func run() error {
 		WALBufferBytes:          cfg.WALBufferBytes,
 		GroupCommitMaxBatch:     cfg.GroupCommitMaxBatch,
 		GroupCommitMaxWait:      cfg.GroupCommitMaxWait,
+		VectorCacheBytes:        cfg.VectorCacheBytes,
+		VectorSearchParallelism: cfg.VectorSearchParallelism,
 	})
 	if err != nil {
 		return fmt.Errorf("打开存储引擎失败: %w", err)

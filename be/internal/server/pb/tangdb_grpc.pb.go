@@ -36,13 +36,18 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	TangDb_Ping_FullMethodName      = "/tangdb.v1.TangDb/Ping"
-	TangDb_Put_FullMethodName       = "/tangdb.v1.TangDb/Put"
-	TangDb_Get_FullMethodName       = "/tangdb.v1.TangDb/Get"
-	TangDb_Scan_FullMethodName      = "/tangdb.v1.TangDb/Scan"
-	TangDb_BeginTxn_FullMethodName  = "/tangdb.v1.TangDb/BeginTxn"
-	TangDb_CommitTxn_FullMethodName = "/tangdb.v1.TangDb/CommitTxn"
-	TangDb_AbortTxn_FullMethodName  = "/tangdb.v1.TangDb/AbortTxn"
+	TangDb_Ping_FullMethodName                = "/tangdb.v1.TangDb/Ping"
+	TangDb_Put_FullMethodName                 = "/tangdb.v1.TangDb/Put"
+	TangDb_Get_FullMethodName                 = "/tangdb.v1.TangDb/Get"
+	TangDb_Scan_FullMethodName                = "/tangdb.v1.TangDb/Scan"
+	TangDb_BeginTxn_FullMethodName            = "/tangdb.v1.TangDb/BeginTxn"
+	TangDb_CommitTxn_FullMethodName           = "/tangdb.v1.TangDb/CommitTxn"
+	TangDb_AbortTxn_FullMethodName            = "/tangdb.v1.TangDb/AbortTxn"
+	TangDb_RegisterVectorIndex_FullMethodName = "/tangdb.v1.TangDb/RegisterVectorIndex"
+	TangDb_DropVectorIndex_FullMethodName     = "/tangdb.v1.TangDb/DropVectorIndex"
+	TangDb_SearchVectorIndex_FullMethodName   = "/tangdb.v1.TangDb/SearchVectorIndex"
+	TangDb_VectorIndexStatus_FullMethodName   = "/tangdb.v1.TangDb/VectorIndexStatus"
+	TangDb_BatchGet_FullMethodName            = "/tangdb.v1.TangDb/BatchGet"
 )
 
 // TangDbClient is the client API for TangDb service.
@@ -63,6 +68,13 @@ type TangDbClient interface {
 	BeginTxn(ctx context.Context, in *BeginTxnRequest, opts ...grpc.CallOption) (*BeginTxnResponse, error)
 	CommitTxn(ctx context.Context, in *CommitTxnRequest, opts ...grpc.CallOption) (*CommitTxnResponse, error)
 	AbortTxn(ctx context.Context, in *AbortTxnRequest, opts ...grpc.CallOption) (*AbortTxnResponse, error)
+	// ---- SPEC-P7:分段 HNSW 图段 ----
+	RegisterVectorIndex(ctx context.Context, in *RegisterVectorIndexRequest, opts ...grpc.CallOption) (*RegisterVectorIndexResponse, error)
+	DropVectorIndex(ctx context.Context, in *DropVectorIndexRequest, opts ...grpc.CallOption) (*DropVectorIndexResponse, error)
+	SearchVectorIndex(ctx context.Context, in *SearchVectorIndexRequest, opts ...grpc.CallOption) (*SearchVectorIndexResponse, error)
+	VectorIndexStatus(ctx context.Context, in *VectorIndexStatusRequest, opts ...grpc.CallOption) (*VectorIndexStatusResponse, error)
+	// ANN 候选回表:一次取多行,避免逐候选一次 RPC(向量检索时延的关键)
+	BatchGet(ctx context.Context, in *BatchGetRequest, opts ...grpc.CallOption) (*BatchGetResponse, error)
 }
 
 type tangDbClient struct {
@@ -152,6 +164,56 @@ func (c *tangDbClient) AbortTxn(ctx context.Context, in *AbortTxnRequest, opts .
 	return out, nil
 }
 
+func (c *tangDbClient) RegisterVectorIndex(ctx context.Context, in *RegisterVectorIndexRequest, opts ...grpc.CallOption) (*RegisterVectorIndexResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RegisterVectorIndexResponse)
+	err := c.cc.Invoke(ctx, TangDb_RegisterVectorIndex_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *tangDbClient) DropVectorIndex(ctx context.Context, in *DropVectorIndexRequest, opts ...grpc.CallOption) (*DropVectorIndexResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DropVectorIndexResponse)
+	err := c.cc.Invoke(ctx, TangDb_DropVectorIndex_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *tangDbClient) SearchVectorIndex(ctx context.Context, in *SearchVectorIndexRequest, opts ...grpc.CallOption) (*SearchVectorIndexResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SearchVectorIndexResponse)
+	err := c.cc.Invoke(ctx, TangDb_SearchVectorIndex_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *tangDbClient) VectorIndexStatus(ctx context.Context, in *VectorIndexStatusRequest, opts ...grpc.CallOption) (*VectorIndexStatusResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(VectorIndexStatusResponse)
+	err := c.cc.Invoke(ctx, TangDb_VectorIndexStatus_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *tangDbClient) BatchGet(ctx context.Context, in *BatchGetRequest, opts ...grpc.CallOption) (*BatchGetResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(BatchGetResponse)
+	err := c.cc.Invoke(ctx, TangDb_BatchGet_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // TangDbServer is the server API for TangDb service.
 // All implementations must embed UnimplementedTangDbServer
 // for forward compatibility.
@@ -170,6 +232,13 @@ type TangDbServer interface {
 	BeginTxn(context.Context, *BeginTxnRequest) (*BeginTxnResponse, error)
 	CommitTxn(context.Context, *CommitTxnRequest) (*CommitTxnResponse, error)
 	AbortTxn(context.Context, *AbortTxnRequest) (*AbortTxnResponse, error)
+	// ---- SPEC-P7:分段 HNSW 图段 ----
+	RegisterVectorIndex(context.Context, *RegisterVectorIndexRequest) (*RegisterVectorIndexResponse, error)
+	DropVectorIndex(context.Context, *DropVectorIndexRequest) (*DropVectorIndexResponse, error)
+	SearchVectorIndex(context.Context, *SearchVectorIndexRequest) (*SearchVectorIndexResponse, error)
+	VectorIndexStatus(context.Context, *VectorIndexStatusRequest) (*VectorIndexStatusResponse, error)
+	// ANN 候选回表:一次取多行,避免逐候选一次 RPC(向量检索时延的关键)
+	BatchGet(context.Context, *BatchGetRequest) (*BatchGetResponse, error)
 	mustEmbedUnimplementedTangDbServer()
 }
 
@@ -200,6 +269,21 @@ func (UnimplementedTangDbServer) CommitTxn(context.Context, *CommitTxnRequest) (
 }
 func (UnimplementedTangDbServer) AbortTxn(context.Context, *AbortTxnRequest) (*AbortTxnResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method AbortTxn not implemented")
+}
+func (UnimplementedTangDbServer) RegisterVectorIndex(context.Context, *RegisterVectorIndexRequest) (*RegisterVectorIndexResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RegisterVectorIndex not implemented")
+}
+func (UnimplementedTangDbServer) DropVectorIndex(context.Context, *DropVectorIndexRequest) (*DropVectorIndexResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DropVectorIndex not implemented")
+}
+func (UnimplementedTangDbServer) SearchVectorIndex(context.Context, *SearchVectorIndexRequest) (*SearchVectorIndexResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SearchVectorIndex not implemented")
+}
+func (UnimplementedTangDbServer) VectorIndexStatus(context.Context, *VectorIndexStatusRequest) (*VectorIndexStatusResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method VectorIndexStatus not implemented")
+}
+func (UnimplementedTangDbServer) BatchGet(context.Context, *BatchGetRequest) (*BatchGetResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method BatchGet not implemented")
 }
 func (UnimplementedTangDbServer) mustEmbedUnimplementedTangDbServer() {}
 func (UnimplementedTangDbServer) testEmbeddedByValue()                {}
@@ -341,6 +425,96 @@ func _TangDb_AbortTxn_Handler(srv interface{}, ctx context.Context, dec func(int
 	return interceptor(ctx, in, info, handler)
 }
 
+func _TangDb_RegisterVectorIndex_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RegisterVectorIndexRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TangDbServer).RegisterVectorIndex(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: TangDb_RegisterVectorIndex_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TangDbServer).RegisterVectorIndex(ctx, req.(*RegisterVectorIndexRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _TangDb_DropVectorIndex_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DropVectorIndexRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TangDbServer).DropVectorIndex(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: TangDb_DropVectorIndex_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TangDbServer).DropVectorIndex(ctx, req.(*DropVectorIndexRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _TangDb_SearchVectorIndex_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SearchVectorIndexRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TangDbServer).SearchVectorIndex(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: TangDb_SearchVectorIndex_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TangDbServer).SearchVectorIndex(ctx, req.(*SearchVectorIndexRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _TangDb_VectorIndexStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(VectorIndexStatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TangDbServer).VectorIndexStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: TangDb_VectorIndexStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TangDbServer).VectorIndexStatus(ctx, req.(*VectorIndexStatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _TangDb_BatchGet_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(BatchGetRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TangDbServer).BatchGet(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: TangDb_BatchGet_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TangDbServer).BatchGet(ctx, req.(*BatchGetRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // TangDb_ServiceDesc is the grpc.ServiceDesc for TangDb service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -371,6 +545,26 @@ var TangDb_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "AbortTxn",
 			Handler:    _TangDb_AbortTxn_Handler,
+		},
+		{
+			MethodName: "RegisterVectorIndex",
+			Handler:    _TangDb_RegisterVectorIndex_Handler,
+		},
+		{
+			MethodName: "DropVectorIndex",
+			Handler:    _TangDb_DropVectorIndex_Handler,
+		},
+		{
+			MethodName: "SearchVectorIndex",
+			Handler:    _TangDb_SearchVectorIndex_Handler,
+		},
+		{
+			MethodName: "VectorIndexStatus",
+			Handler:    _TangDb_VectorIndexStatus_Handler,
+		},
+		{
+			MethodName: "BatchGet",
+			Handler:    _TangDb_BatchGet_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

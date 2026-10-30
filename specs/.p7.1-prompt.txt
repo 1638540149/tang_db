@@ -1,0 +1,60 @@
+# 施工提示词 · P7.1 向量检索时延与并发退化(补丁)
+
+> 唯一施工依据:`specs/P7.1-vector-latency.md`(**v0.1a Approved**)。
+> 只修三条:①检索固定开销 ②并发退化 ③路径 A 走图。**门限不动、磁盘格式不动、语义不动。**
+
+## 0. 必读
+
+1. `AGENTS.md`
+2. `specs/P7.1-vector-latency.md` —— 全文,尤其 §1 事实、§2 范围、§4 SC、§6 兼容性、§7 ★回归
+3. `docs/验收报告/P7-验收报告.md` §5 / §7 —— 核验方测得的事实与偏差
+4. 现状代码(先读再改):
+   - `be/internal/store/vector.go`(960 行,重点 `SearchVectorIndex:525`、`runtimeFor:734`、`extractVectors`、`bruteForceMemtables:625`、`needsColumns:840`)
+   - `be/internal/vecidx/{search,build,graph,codec}.go`
+   - `be/internal/server/vector.go`(`SearchVectorIndex:65`、`BatchGet:119`)
+   - `fe/.../query/QueryEngine.java`(`vectorPlan:3264`、`runVectorExact:3603`、`runVectorPathA`)
+   - `fe/.../client/TangDbClient.java`(候选回表调用点)
+   - `scripts/tests/p7-test.sh`、`p7-recall.sh`、`p7-evidence.sh`
+
+## 1. 已知事实(核验方实测,不要重新论证,直接用)
+
+```
+10 万行 × 128 维 top-10:  RUNS=[1019, 579, 613]  中位 613ms(门限 100ms)
+k=10 → 774ms;k=100 → 765ms;k=500 → 2993ms   ← k 变小不变,说明有 ~700ms 与候选数无关的固定开销
+8 线程并发 P99 575ms vs 空载 144ms = 4.0×(门限 2×)
+BE 日志无"退化为暴力" → 图有被用
+```
+
+## 2. 实现顺序(六步,每步自证)
+
+| 步 | 内容 | 自证 |
+|---|---|---|
+| 1 | **先打点,不许先改**:在 `SearchVectorIndex` 里分五段计时(候选准备 / 图搜索 / memtable 暴力 / 候选归并 / 回表前的数据准备),`SET vector_profile = ON` 时打印,默认关闭 | 同一查询开打点跑一次,贴出五段耗时 |
+| 2 | **按打点结果消除固定开销**:K178 向量运行时缓存常驻 + `vector_cache_bytes` 预算 LRU;预算不足时走"按 rowOrdinal 点读候选行向量";memtable 只扫可见未落盘行 | 打点显示固定段耗时降到 <20ms;总时延 ≤100ms |
+| 3 | **候选回表批量化**(K180):一次 `BatchGet` 带全部候选 key;归并用紧凑结构(不要 `map[string]`) | 同查询 `candidates_examined` 与实际请求数一致,且只发 1 次批请求 |
+| 4 | **并发收敛**(K183):段级并行、只读快照、临界区只保护缓存表;淘汰按引用计数 | 8 线程 60 秒:P99 ≤ 2× 空载,无 >3× 中位 的尖刺 |
+| 5 | **路径 A 走图**(K182):允许集(≤1 万主键,超了布隆)下推到图检索;空集直接返回 | 5% 选择率下 `EXPLAIN` 标 `allow-list`,且 `candidates_examined` < 表行数 10%;三路结果逐行一致 |
+| 6 | **脚本与文档**:新增 `scripts/tests/p7-perf.sh`(固定 10 万×128,输出导入/建图/检索三段 + P50/P99);`p7-test.sh` 加可关的分段耗时输出;README 性能一节更新 | 脚本真跑,贴输出 |
+
+## 3. 硬约束
+
+- **门限不动**:SC-431 ≤100ms、SC-427 ≤2×,一个数字都不许改。
+- **磁盘格式不动**:`format_version` 仍 3、图段布局不变、老目录照旧可启动。
+- **语义不动**:`pushdown` / `vector_exact` / `vector_path` 三开关行为不变;三路结果逐行一致。
+- **依赖红线**:BE 只用 grpc + protobuf;FE 不引任何第三方库(缓存、LRU 都自己写)。
+- **边界不可穿透**:BE 不出现表名/列名/类型名;FE 不写 BE 数据目录。
+- 不 `git commit`、不改 `specs/`、不写 `docs/验收报告`。
+
+## 4. 工作方式(踩过的坑)
+
+- **禁止派子代理**;禁止 `nohup` / `disown` / 裸 `&` 起服务(会把 bash 工具卡死);起服务只用仓库脚本;单条命令超 90 秒换写法。
+- **环境独占**:同一时刻只跑一个脚本;跑前确认没有残留 `be.exe` / `tangdb.fed.Fed`。
+- **IDE 可能抢 `fe/target/classes`**:看到 `ClassNotFoundException: com.wangyu.tangdb.fed.Fed` 就等 10 秒重试,别改代码去"修"。
+- 每步做完立刻:`cd be && go build ./... && go vet ./... && go test ./...` 与 `cd fe && mvn.cmd test`。
+- **跑性能必须安静机**:跑 `p7-perf.sh` 前确认没有别的脚本/编译在跑,三次取中位数。
+
+## 5. 交付
+
+- 代码 + 单测 + `scripts/tests/p7-perf.sh` + README 性能一节
+- 交付说明里逐条给出:五段打点前后耗时、SC-439/440/441 的实测数字、路径 A 的 `candidates_examined`、以及**没做到的部分**
+- 卡住超过 30 分钟没进展:写清卡点与试过什么,停下 —— 不许改门限、不许改断言、不许把"标 NOTE"当通过

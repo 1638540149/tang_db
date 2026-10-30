@@ -10,6 +10,7 @@ import com.wangyu.tangdb.storage.Column;
 import com.wangyu.tangdb.storage.DataType;
 import com.wangyu.tangdb.storage.IndexMeta;
 import com.wangyu.tangdb.storage.TableMeta;
+import com.wangyu.tangdb.storage.VectorIndexMeta;
 import com.wangyu.tangdb.storage.Values;
 
 import java.nio.charset.StandardCharsets;
@@ -102,6 +103,16 @@ public final class MetaCommands {
             rows.add(new Object[]{index.name(), index.columnName(), index.unique(),
                     index.stateName(), index.indexId(), index.buildCursor()});
         }
+        // SPEC-P7 FR-739 / FR-787:向量索引同表展示(度量 / 维度 / 图参数写在 build_cursor 位)
+        for (VectorIndexMeta index : catalog.vectorIndexes(table.id())) {
+            rows.add(new Object[]{index.name(), index.columnName(), false,
+                    index.stateName(), index.indexId(), describeVector(index)});
+        }
+    }
+
+    private static String describeVector(VectorIndexMeta index) {
+        return "vector(dim=" + index.dim() + ",metric=" + index.metricName() + ",m=" + index.m()
+                + ",ef_construction=" + index.efConstruction() + ")";
     }
 
     /** SHOW INDEX / SHOW KEYS FROM <t>(FR-532,MySQL 13 列)。 */
@@ -119,6 +130,11 @@ public final class MetaCommands {
                     index.columnName(), "A", null, null, null,
                     column != null && column.nullable() ? "YES" : "",
                     "BTREE", "", ""});
+        }
+        for (VectorIndexMeta vector : catalog.vectorIndexes(table.id())) {
+            // SPEC-P7 FR-739:Index_type = HNSW,Comment 带维度 / 度量 / 图参数
+            rows.add(new Object[]{table.name(), 1L, vector.name(), 1L, vector.columnName(), "A",
+                    null, null, null, "YES", "HNSW", describeVector(vector), ""});
         }
         return filter(List.of("Table", "Non_unique", "Key_name", "Seq_in_index",
                 "Column_name", "Collation", "Cardinality", "Sub_part", "Packed", "Null",
@@ -584,6 +600,7 @@ public final class MetaCommands {
             case "tables" -> tablesTable();
             case "columns" -> columnsTable();
             case "statistics" -> statistics();
+            case "vector_indexes" -> vectorIndexesTable();
             case "key_column_usage" -> keyColumnUsage();
             case "table_constraints" -> tableConstraints();
             case "processlist" -> processlistTable();
@@ -707,6 +724,32 @@ public final class MetaCommands {
                 c("COLUMN_KEY"), c("EXTRA")), rows);
     }
 
+    /** SPEC-P7 §2.1 / FR-741:information_schema.VECTOR_INDEXES(基于系统表 9)。 */
+    private VTable vectorIndexesTable() {
+        List<Object[]> rows = new ArrayList<>();
+        for (String db : catalog.databases()) {
+            for (TableMeta table : catalog.tables(db)) {
+                for (VectorIndexMeta index : catalog.vectorIndexes(table.id())) {
+                    com.wangyu.tangdb.storage.VectorStore.VectorIndexStatus status =
+                            executor == null ? null : executor.vectorIndexStatus(index.beId());
+                    rows.add(new Object[]{
+                            "def", db, table.name(), index.name(), index.columnName(),
+                            (long) index.dim(), index.metricName(), (long) index.m(),
+                            (long) index.efConstruction(), index.stateName(),
+                            (long) (status == null ? 0 : status.segmentCount()),
+                            status == null ? 0L : status.nodeCount(),
+                            (long) (status == null ? 0 : status.pendingSegments()),
+                            status == null ? 0L : status.graphBytes()
+                    });
+                }
+            }
+        }
+        return new VTable("VECTOR_INDEXES", cols(c("TABLE_CATALOG"), c("TABLE_SCHEMA"),
+                c("TABLE_NAME"), c("INDEX_NAME"), c("COLUMN_NAME"), n("DIM"), c("METRIC"),
+                n("M"), n("EF_CONSTRUCTION"), c("STATE"), n("SEGMENT_COUNT"), n("NODE_COUNT"),
+                n("PENDING_SEGMENTS"), n("GRAPH_BYTES")), rows);
+    }
+
     private VTable statistics() {
         List<Object[]> rows = new ArrayList<>();
         for (String db : catalog.databases()) {
@@ -723,6 +766,11 @@ public final class MetaCommands {
                             index.name(), 1L, index.columnName(), "A", null, null, null,
                             column != null && column.nullable() ? "YES" : "",
                             "BTREE", "", ""});
+                }
+                for (VectorIndexMeta vector : catalog.vectorIndexes(table.id())) {
+                    rows.add(new Object[]{"def", db, table.name(), 1L, db, vector.name(), 1L,
+                            vector.columnName(), "A", null, null, null, "YES", "HNSW",
+                            describeVector(vector), ""});
                 }
             }
         }
@@ -745,6 +793,10 @@ public final class MetaCommands {
                 for (IndexMeta index : catalog.indexes(table.id())) {
                     rows.add(new Object[]{"def", db, index.name(), "def", db, table.name(),
                             index.columnName(), 1L, null, null, null, null});
+                }
+                for (VectorIndexMeta vector : catalog.vectorIndexes(table.id())) {
+                    rows.add(new Object[]{"def", db, vector.name(), "def", db, table.name(),
+                            vector.columnName(), 1L, null, null, null, null});
                 }
             }
         }
@@ -824,6 +876,8 @@ public final class MetaCommands {
             case DATE -> "date";
             case BOOLEAN -> "tinyint";
             case JSON -> "json";
+            // P7:MySQL 没有向量类型,information_schema 里报 vector(客户端只当未知类型展示)。
+            case VECTOR -> "vector";
         };
     }
 

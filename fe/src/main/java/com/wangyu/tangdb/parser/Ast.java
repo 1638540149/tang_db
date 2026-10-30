@@ -22,7 +22,9 @@ public final class Ast {
             ShowSegments, ShowCreateTable, ShowCreateDatabase, ShowColumns, Describe,
             Insert, Update, Delete, Select, SelectLiterals, Explain, Kill,
             Begin, Commit, Rollback, CreateDatabase, DropDatabase, Use,
-            CreateIndex, DropIndex, SelectQuery, ShowImportTasks, Analyze, ShowStats, SetQuery {
+            CreateIndex, DropIndex, SelectQuery, ShowImportTasks, Analyze, ShowStats, SetQuery,
+            CreateVectorIndex, RebuildVectorIndex, ShowVectorIndexes, ShowAiStats,
+            SelectVectorInfo, InsertSelect {
     }
 
     // ------------------------------------------------------------ P3.5:库
@@ -80,6 +82,35 @@ public final class Ast {
     /** CREATE [UNIQUE] INDEX <idx> ON [db.]<tbl>(<col>)。 */
     public record CreateIndex(String database, String table, String name, String column,
                               boolean unique) implements Statement {
+    }
+
+    /**
+     * SPEC-P7 FR-736:CREATE VECTOR INDEX &lt;名&gt; ON &lt;表&gt;(&lt;向量列&gt;)
+     * WITH (metric='l2', m=16, ef_construction=200)。
+     */
+    public record CreateVectorIndex(String database, String table, String name, String column,
+                                    int metric, int m, int efConstruction)
+            implements Statement {
+    }
+
+    /** SPEC-P7 FR-750:REBUILD VECTOR INDEX &lt;名&gt; ON &lt;表&gt;(显式重建图段)。 */
+    public record RebuildVectorIndex(String database, String table, String name)
+            implements Statement {
+    }
+
+    /** SPEC-P7 FR-787:SHOW VECTOR INDEXES [FROM [db.]t]。 */
+    public record ShowVectorIndexes(String database, String table) implements Statement {
+    }
+
+    /** SPEC-P7 FR-780:SHOW AI STATS(推理调用次数 / 缓存命中率 / 失败 / 批量 / 延迟)。 */
+    public record ShowAiStats() implements Statement {
+    }
+
+    /**
+     * 带 {@code WITH VECTOR INFO} 尾缀的查询(SPEC-P7 K164):在结果末尾追加
+     * {@code approximate / ef_used / candidates_examined / partial} 四列。
+     */
+    public record SelectVectorInfo(QueryBody body) implements Statement {
     }
 
     /** DROP INDEX <idx> ON [db.]<tbl>。 */
@@ -186,6 +217,16 @@ public final class Ast {
 
     public record Insert(String database, String table, List<String> columns, List<List<Object>> rows)
             implements Statement {
+    }
+
+    /**
+     * SPEC-P7 FR-772:INSERT ... SELECT(推理下推的载体)。
+     *
+     * <p>{@code columns} 为空表示按表定义顺序;{@code query} 是完整查询体
+     * (可以含 {@code ai_embed(...)} 投影)。</p>
+     */
+    public record InsertSelect(String database, String table, List<String> columns,
+                               QueryBody query) implements Statement {
     }
 
     public record Assignment(String column, Object value) {

@@ -53,6 +53,10 @@ public final class SqlEngine {
     private int queryParallelism = 1;
     private boolean pushdownEnabled = false;
     private int scanBatchRows = 4096;
+    /** SPEC-P7 §5.4:向量检索门限 + 会话开关(默认值即规约门限)。 */
+    private com.wangyu.tangdb.query.P7Options p7 = com.wangyu.tangdb.query.P7Options.defaults();
+    /** SPEC-P7 E 组:推理算子(未注入 = 端点未配置,使用 ai_embed 会明确报错)。 */
+    private com.wangyu.tangdb.ai.AiService ai;
 
     public SqlEngine(KvStore kv, Catalog catalog, SessionManager sessions,
                      BackendRegistry backends, boolean heartbeatEnabled, String user) {
@@ -83,6 +87,16 @@ public final class SqlEngine {
         if (scanBatchRows > 0) {
             this.scanBatchRows = scanBatchRows;
         }
+        return this;
+    }
+
+    /** SPEC-P7:注入向量检索参数与推理算子(由常驻 FE 按配置装配)。 */
+    public SqlEngine withP7(com.wangyu.tangdb.query.P7Options options,
+                            com.wangyu.tangdb.ai.AiService service) {
+        if (options != null) {
+            this.p7 = options;
+        }
+        this.ai = service;
         return this;
     }
 
@@ -317,6 +331,7 @@ public final class SqlEngine {
                     .withExecution(queryParallelism, pushdownEnabled, scanBatchRows)
                     .withStreamingResults(true)
                     .withBackends(backends)
+                    .withP7(p7, ai)
                     .attachServer(sessions, user, 0, indexBackfillBatch);
         }
         return session.executor()
@@ -326,6 +341,7 @@ public final class SqlEngine {
                 .withExecution(queryParallelism, pushdownEnabled, scanBatchRows)
                 .withStreamingResults(true)
                 .withBackends(backends)
+                .withP7(p7, ai)
                 .attachServer(sessions, user, session.id(), indexBackfillBatch);
     }
 
@@ -335,6 +351,24 @@ public final class SqlEngine {
     private Result handleCompat(Session session, String statement, String upper) {
         // SET ...(全部接受并给 OK;K65:autocommit 语义不改变)
         if (upper.startsWith("SET ")) {
+            // SPEC-P7 FR-760 / SC-422:两个会话开关真正生效(其余 SET 仍按 K65 接受)
+            String knob = upper.substring(4).replace(" ", "");
+            if (knob.startsWith("VECTOR_EXACT=")) {
+                boolean on = isOn(knob.substring("VECTOR_EXACT=".length()));
+                executor(session).setVectorExact(on);
+                return new Result.Message("OK, vector_exact=" + (on ? "ON" : "OFF"));
+            }
+            if (knob.startsWith("VECTOR_PATH=")) {
+                String path = knob.substring("VECTOR_PATH=".length()).replace("'", "");
+                executor(session).setVectorPath(path);
+                return new Result.Message("OK, vector_path=" + path);
+            }
+            // SPEC-P7.1 K181:五段耗时开关(SET vector_profile = ON|OFF)
+            if (knob.startsWith("VECTOR_PROFILE=")) {
+                boolean on = isOn(knob.substring("VECTOR_PROFILE=".length()));
+                executor(session).setVectorProfile(on);
+                return new Result.Message("OK, vector_profile=" + (on ? "ON" : "OFF"));
+            }
             return new Result.Message("OK");
         }
         // USE 也走 Parser(库语义),这里只处理纯兼容层。
@@ -357,6 +391,11 @@ public final class SqlEngine {
             return informationSchema(session, statement, upper);
         }
         return null;
+    }
+
+    private static boolean isOn(String raw) {
+        String v = raw.trim().replace("'", "");
+        return "ON".equalsIgnoreCase(v) || "TRUE".equalsIgnoreCase(v) || "1".equals(v);
     }
 
     private static Result emptyTwoColumn(String colA, String colB) {

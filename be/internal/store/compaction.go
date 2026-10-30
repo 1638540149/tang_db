@@ -261,6 +261,12 @@ func (e *Engine) runCompaction(inputs []uint64, outLevel int) error {
 	e.mu.Unlock()
 
 	e.injectCrash(CrashCompactionAfterManifest)
+	// SPEC-P7 FR-749:旧图随旧 segment 删除,受影响的新段重建
+	outputs := []uint64{}
+	if written {
+		outputs = append(outputs, segNum)
+	}
+	e.onCompactionDone(inputs, outputs)
 	slog.Info("compaction 完成", "level", outLevel, "inputs", inputs,
 		"out_segment", segNum, "rows", stats.rows, "dropped_versions", stats.dropped,
 		"watermark", watermark)

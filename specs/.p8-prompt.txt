@@ -1,0 +1,66 @@
+# 施工提示词 · P8 生产化(协议收口 / 监控 / 慢查询 / 备份恢复 / Web 控制台)
+
+> 唯一施工依据:`specs/P8-production.md`(**v0.1a Approved**)。
+> 本期体量大,**按下面顺序做,每完成一组就自证一次**,不要攒到最后。
+
+## 0. 必读
+
+1. `AGENTS.md`(护栏与构建命令)
+2. `specs/P8-production.md` —— 全文:§2 范围、§3 BDD、§4 FR-813~870、§5 数据与格式、§6 K185~200、§7 SC-446~465、§8 边界 166~190
+3. `docs/读代码地图/读代码地图-P6.1.md`、`docs/读代码地图/读代码地图-P7.md`(执行层与向量层现状)
+4. 现状代码:
+   - `fe/src/main/java/com/wangyu/tangdb/protocol/mysql/{Protocol,ConnectionHandler,MysqlServer,ResultSetEncoder,PacketIO}.java`
+   - `fe/src/main/java/com/wangyu/tangdb/fed/Fed.java`(常驻服务、心跳、配置注入)
+   - `fe/src/main/java/com/wangyu/tangdb/execute/SqlEngine.java`(语句入口、SHOW 家族)
+   - `fe/src/main/java/com/wangyu/tangdb/catalog/SystemTables.java`(系统表登记,当前 1~9)
+   - `be/internal/store/engine.go`(flush/compaction/MANIFEST)、`be/internal/manifest/manifest.go`
+   - `be/internal/server/server.go`(心跳、注册)
+   - `config/fe.conf`、`config/be.conf`
+
+## 1. 技术栈硬性要求(所有者指定)
+
+- 控制台前端:**Vue 3 + Element Plus + Vite**;源码在 `console/`,构建产物 `console/dist/` **要提交入库**。
+- 控制台后端:**FE 内置 JDK `com.sun.net.httpserver`**,**禁止**引入 Spring / Javalin / Vert.x / Netty HTTP 等任何 Java Web 框架。
+- 监控:**禁止**引入 Prometheus Java 客户端或任何指标库,文本格式手写。
+- 前端依赖只允许 `vue`、`element-plus`、`vite`(及其必需的构建期依赖)。npm 已配 npmmirror 源。
+- 若 `npm install` 超过 10 分钟没成功:先把后端 API 与 `dist/` 占位页面做完,把前端构建写进 README 的"待补",**不要卡在这里**。
+
+## 2. 实现顺序(七步)
+
+| 步 | 内容 | 自证 |
+|---|---|---|
+| 1 | **协议收口(A 组 FR-813~822)**:命令白名单、`COM_STMT_*` 返回明确错误不断连、`SHOW TABLE STATUS`/`COLLATION`/`CHARSET`/`SHOW VARIABLES LIKE`、`information_schema` 补 4 张、错误包对齐、`mysql_max_connections`/`wait_timeout`/`mysql_ssl` | 手打 `mysql` 容器连接 + 探测语句清单逐条 `CODE=0` |
+| 2 | **监控(B 组 FR-823~830)**:`/metrics` + `SHOW METRICS`;查询/事务/BE/向量四族;滑动窗口分位 | `curl /metrics` 与 `SHOW METRICS` 数值一致 |
+| 3 | **慢查询(C 组 FR-831~840)**:系统表 **10** `sys_slow_query`、指纹、`SHOW SLOW QUERIES`、诊断建议(带证据)、上限淘汰 | 造一条 300ms 查询,看记录与建议 |
+| 4 | **备份恢复(D 组 FR-841~850)**:`BACKUP TO`/`RESTORE FROM`/增量、`BACKUP_META` 校验和、系统表 **11** `sys_backup_jobs`、不阻塞写 | 备份→删库→恢复→校验行数 checksum |
+| 5 | **控制台后端(E 组 API 部分 FR-852~862)**:`/api/login`、`/api/tree`、`/api/query`、`/api/explain`、`/api/status`、静态托管;token 内存态;写操作二次确认 + 审计 | `curl` 五个接口全部 200 |
+| 6 | **控制台前端(FR-851、854~860)**:Vue3 + Element Plus 四块内容(库表树/SQL 输入/结果表格/状态区);分页、排序、NULL 显示、复制 CSV、EXPLAIN 按钮 | `npm run build` 成功、`dist/` 存在;`curl /` 返回 HTML |
+| 7 | **脚本与文档(F 组 FR-863~870)**:`scripts/tests/p8-test.sh`(覆盖 SC-446~465,含 ★备份中强杀、★备份期间写入、★控制台并发)、JMeter 纳入、README 的 P8 章节(指标名表/备份用法/控制台说明) | 脚本真跑,贴输出 |
+
+## 3. 硬约束
+
+- **依赖红线**:BE 只允许 grpc + protobuf;FE 不得新增任何第三方 Java 库(HTTP 服务、JSON 序列化、指标全部用 JDK 自带;JSON 手写或复用现有工具)。
+- **边界不可穿透**:FE 不读写 BE 数据目录(备份由 BE 执行,FE 只下发命令);BE 不出现表名/列名/SQL。
+- **先日志后数据**不变;段文件不可变不变;`format_version` 仍为 3(备份不改它)。
+- 系统表新增 10、11 必须登记进 `SystemTables.REGISTERED_IDS`,`next_table_id` 下限不变。
+- 门限不许改;`specs/`、`docs/` 不许改;不 `git commit`。
+
+## 4. 工作方式(踩过的坑)
+
+- **禁止派子代理**;禁止 `nohup` / `disown` / 裸 `&` 起服务(会把 bash 工具卡死);起服务只用仓库脚本;单条命令超 90 秒换写法。
+- 每个步骤做完立刻 `cd fe && mvn.cmd test` 与 `cd be && go build ./... && go vet ./... && go test ./...`。
+- **IDE 会抢 `fe/target/classes`**:遇到 `ClassNotFoundException: com.wangyu.tangdb.fed.Fed` 等 10 秒重试,不要改代码去"修"。
+- 独占环境:同一时刻只跑一个脚本;跑前确认无残留 `be.exe` / `tangdb.fed.Fed`。
+- 控制台端口 8080 与 MySQL 3406 冲突时改 `console_port`,不要强占。
+
+## 5. 测试优先级(所有者明确要求)
+
+1. **先把 P8 自己做的功能测通**(协议探测清单、指标、慢查询、备份恢复、控制台 API 冒烟),确保没 bug;
+2. 时间够再跑全量回归(`p3`/`p4`/`p5`/`p6`/`p6.1`/`p7`/`p7.1` 逐个单跑);
+3. 跑不完就**明说哪几项没跑**,不许写"应该没问题"。
+
+## 6. 交付
+
+- 代码 + 单测 + `scripts/tests/p8-test.sh` + `console/`(源码 + dist)+ README 的 P8 章节
+- 交付说明里逐条给出:每组 FR 落点(文件+行号)、真实命令与回显、SC-446~465 的实测结果、**没做到的部分**
+- 卡住超 30 分钟没进展,写清卡点与试过什么后停下;不许改门限、不许改断言、不许把 NOTE 当通过

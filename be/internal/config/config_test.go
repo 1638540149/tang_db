@@ -226,3 +226,41 @@ group_commit_max_wait_ms = 0
 		})
 	}
 }
+
+// TestParseP71Fields SPEC-P7.1:向量缓存预算与段级并行(K178 / 边界 164)。
+func TestParseP71Fields(t *testing.T) {
+	src := `vector_cache_bytes = 32MB
+vector_search_parallelism = 4
+`
+	cfg, err := Parse(strings.NewReader(src))
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	if cfg.VectorCacheBytes != 32*1024*1024 {
+		t.Fatalf("vector_cache_bytes = %d", cfg.VectorCacheBytes)
+	}
+	if cfg.VectorSearchParallelism != 4 {
+		t.Fatalf("vector_search_parallelism = %d", cfg.VectorSearchParallelism)
+	}
+	// 未配置 = 自动(0):预算取内存 10%、并行度取 min(8, CPU)。
+	def := Default()
+	if def.VectorCacheBytes != 0 || def.VectorSearchParallelism != 0 {
+		t.Fatalf("P7.1 默认值应为自动(0): %+v", def)
+	}
+	for name, bad := range map[string]string{
+		"预算为零":  "vector_cache_bytes = 0",
+		"预算为负":  "vector_cache_bytes = -1MB",
+		"预算过小":  "vector_cache_bytes = 1KB",
+		"预算超大":  "vector_cache_bytes = 17GB",
+		"预算非数字": "vector_cache_bytes = abc",
+		"并行零":   "vector_search_parallelism = 0",
+		"并行越界":  "vector_search_parallelism = 1024",
+		"并行非数字": "vector_search_parallelism = x",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Parse(strings.NewReader(bad)); err == nil {
+				t.Fatalf("期望报错,实际通过了: %q", bad)
+			}
+		})
+	}
+}

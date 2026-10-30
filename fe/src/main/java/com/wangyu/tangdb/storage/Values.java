@@ -83,6 +83,13 @@ public final class Values {
                 return com.wangyu.tangdb.query.JsonCodec.encode(
                         com.wangyu.tangdb.query.JsonCodec.parseText(s));
             }
+            case VECTOR: {
+                // SPEC-P7 FR-732 / FR-733:向量列写入接受 float[] 或 '[a,b,…]' 字面量,
+                // 维度必须等于列维度(错误信息指出期望/实际个数)。
+                float[] vec = VectorValues.toVector(literal, column.vectorDim(), "列 " + column.name());
+                VectorValues.checkFinite(vec, "列 " + column.name() + " 的向量");
+                return vec;
+            }
             default:
                 throw typeMismatch(column);
         }
@@ -206,6 +213,11 @@ public final class Values {
                 throw typeMismatch(column);
             case JSON:
                 return; // JSON 只允许通过 json_extract 使用;直接比较不参与路径选择
+            case VECTOR:
+                // FR-734 / K172:向量列只能出现在距离函数里,普通比较一律 1235。
+                throw new StoreException("列 " + column.name()
+                        + " 是 VECTOR 列,不支持普通比较(只允许 l2_distance / cosine_distance / "
+                        + "inner_product)", 1235);
             default:
                 throw typeMismatch(column);
         }
@@ -256,6 +268,9 @@ public final class Values {
                 return Boolean.compare((Boolean) columnValue, b);
             case JSON:
                 throw typeMismatch(column);
+            case VECTOR:
+                throw new StoreException("列 " + column.name()
+                        + " 是 VECTOR 列,不支持普通比较(只允许距离函数)", 1235);
             default:
                 throw typeMismatch(column);
         }
@@ -313,6 +328,9 @@ public final class Values {
         if (value instanceof byte[] raw) {
             return com.wangyu.tangdb.query.JsonCodec.toText(
                     com.wangyu.tangdb.query.JsonCodec.decode(raw));
+        }
+        if (value instanceof float[] vec) {
+            return VectorValues.format(vec);
         }
         return value.toString();
     }

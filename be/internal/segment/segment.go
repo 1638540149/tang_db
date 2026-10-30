@@ -389,6 +389,9 @@ type Reader struct {
 	// SPEC-P6.1 FR-706:chunk 解码次数 / 因 key 范围被跳过的 chunk 数(SHOW SEGMENTS 用)。
 	chunksRead    atomic.Uint64
 	chunksSkipped atomic.Uint64
+
+	// SPEC-P7.1:chunk 解码缓存的读者标识(见 chunkcache.go)。
+	cacheID uint64
 }
 
 type zoneEntry struct { // 仅 v1
@@ -419,7 +422,8 @@ func Open(path string) (*Reader, error) {
 		f.Close()
 		return nil, err
 	}
-	r := &Reader{path: path, file: f, footer: footer, format: format}
+	r := &Reader{path: path, file: f, footer: footer, format: format,
+		cacheID: readerSeq.Add(1)}
 	if format == formatV1 {
 		if err := r.loadIndexV1(); err != nil {
 			r.Close()
@@ -443,6 +447,7 @@ func (r *Reader) Close() error {
 	if r.file == nil {
 		return nil
 	}
+	globalChunkCache.drop(r.cacheID)
 	err := r.file.Close()
 	r.file = nil
 	return err

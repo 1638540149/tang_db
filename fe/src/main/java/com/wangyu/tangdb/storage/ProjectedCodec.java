@@ -11,7 +11,10 @@ import java.util.List;
  * <pre>
  * column_slots: [u16 槽数] 然后每列 [u16 列序号][u8 kind][u8 width]
  *   kind 0 FIXED(BOOLEAN 等本身保序) / 1 VARLEN(JSON) / 5 VARLEN_SIGNED(VARCHAR) /
- *        2 INT32 / 3 INT64 / 4 FLOAT64(数值列比较时做保序变换)
+ *        2 INT32 / 3 INT64 / 4 FLOAT64(数值列比较时做保序变换) /
+ *        6 VECTOR_FIXED(SPEC-P7:定长 4n 字节,宽度放不进 u8,见下面的宽槽段)
+ *   宽槽段(仅当存在 VECTOR_FIXED 时追加在槽表末尾):
+ *        [u16 宽槽数] 然后每项 [u16 列序号][u32 宽度]
  * row_frame:    [u8 nullmap 字节数][u16 列数][u16 NULL 位图前的前缀字节数]
  * 投影帧:       [nullmap][len u32][载荷] × 选中列数
  * columnar_block: [u32 行数][u32 偏移×(行数+1)][帧…],每帧 = [u32 keyLen][key][投影帧]
@@ -28,6 +31,11 @@ public final class ProjectedCodec {
     public static final byte SLOT_FLOAT64 = 4;
     /** 变长、按有符号字节序比较(与 FE 的 ValueOps.compare 一致)。 */
     public static final byte SLOT_VARLEN_SIGNED = 5;
+    /**
+     * P7:定长向量槽(SPEC-P7 §5.1 / FR-732 / K161)。宽度 = 4×dim,超过 u8 表示范围,
+     * 因此主槽表里 width 恒 0、真实宽度在末尾的宽槽段里。BE 只按偏移切片。
+     */
+    public static final byte SLOT_VECTOR_FIXED = 6;
 
     /** 行值里 NULL 位图之前的前缀:版本 1 + 表 ID 4 + 列数 2。 */
     public static final int ROW_PREFIX_BYTES = 7;
@@ -80,19 +88,47 @@ public final class ProjectedCodec {
     /** 生成列槽表(BE 用它跳过它不关心的列)。 */
     public static byte[] encodeSlots(TableMeta table) {
         int n = table.columnCount();
-        byte[] out = new byte[2 + n * 4];
-        putLe2(out, 0, n);
+        int wide = 0;
         for (int i = 0; i < n; i++) {
-            DataType type = table.columns().get(i).type();
+            if (slotKind(table.columns().get(i)) == SLOT_VECTOR_FIXED) {
+                wide++;
+            }
+        }
+        byte[] out = new byte[2 + n * 4 + (wide == 0 ? 0 : 2 + wide * 6)];
+        putLe2(out, 0, n);
+        int widePos = 2 + n * 4;
+        if (wide > 0) {
+            putLe2(out, widePos, wide);
+            widePos += 2;
+        }
+        for (int i = 0; i < n; i++) {
+            Column column = table.columns().get(i);
             int base = 2 + i * 4;
             putLe2(out, base, i);
-            out[base + 2] = slotKind(type);
-            out[base + 3] = (byte) slotWidth(type);
+            byte kind = slotKind(column);
+            out[base + 2] = kind;
+            if (kind == SLOT_VECTOR_FIXED) {
+                out[base + 3] = 0; // 真实宽度见宽槽段
+                putLe2(out, widePos, i);
+                putLe4(out, widePos + 2, slotWidth(column));
+                widePos += 6;
+            } else {
+                out[base + 3] = (byte) slotWidth(column);
+            }
         }
         return out;
     }
 
     public static byte slotKind(DataType type) {
+        return slotKind(new Column("c", type, 1, true, false, 0));
+    }
+
+    /** 列级槽种类:VECTOR 需要维度(宽度 4n),所以必须看列而不只看类型。 */
+    public static byte slotKind(Column column) {
+        DataType type = column.type();
+        if (type == DataType.VECTOR) {
+            return SLOT_VECTOR_FIXED;
+        }
         return switch (type) {
             case INT, DATE -> SLOT_INT32;
             case BIGINT -> SLOT_INT64;
@@ -100,15 +136,21 @@ public final class ProjectedCodec {
             case VARCHAR -> SLOT_VARLEN_SIGNED;
             case JSON -> SLOT_VARLEN;
             case BOOLEAN -> SLOT_FIXED;
+            case VECTOR -> SLOT_VECTOR_FIXED;
         };
     }
 
     public static int slotWidth(DataType type) {
-        return switch (type) {
+        return slotWidth(new Column("c", type, 1, true, false, 0));
+    }
+
+    public static int slotWidth(Column column) {
+        return switch (column.type()) {
             case INT, DATE -> 4;
             case BIGINT, DOUBLE -> 8;
             case VARCHAR, JSON -> 4; // 4 字节长度前缀
             case BOOLEAN -> 1;
+            case VECTOR -> 4 * column.vectorDim();
         };
     }
 
@@ -203,10 +245,11 @@ public final class ProjectedCodec {
                 int len = readLe4(frame, pos);
                 pos += 4;
                 if (len < 0 || pos + len > frame.length) {
-                    throw new StoreException("投影帧被截断(载荷)");
+                    throw new StoreException("投影帧被截断(载荷):列序号 " + ordinal
+                            + ",长度 " + len + ",位置 " + pos + ",帧长 " + frame.length);
                 }
                 Column column = table.columns().get(ordinal);
-                target[ordinal] = decodeColumn(column.type(), frame, pos, len);
+                target[ordinal] = decodeColumn(column, frame, pos, len);
                 pos += len;
             }
             if (pos != frame.length) {
@@ -215,7 +258,8 @@ public final class ProjectedCodec {
             return target;
         }
 
-        private Object decodeColumn(DataType type, byte[] data, int pos, int len) {
+        private Object decodeColumn(Column column, byte[] data, int pos, int len) {
+            DataType type = column.type();
             switch (type) {
                 case INT -> {
                     require(data, pos, 4, len);
@@ -244,6 +288,14 @@ public final class ProjectedCodec {
                     byte[] raw = new byte[len];
                     System.arraycopy(data, pos, raw, 0, len);
                     return raw;
+                }
+                case VECTOR -> {
+                    int width = 4 * column.vectorDim();
+                    if (len != width) {
+                        throw new StoreException("投影帧里的向量宽度非法(期望 " + width
+                                + ",实际 " + len + ")");
+                    }
+                    return RowCodec.readFloats(data, pos, width / 4);
                 }
                 default -> throw new StoreException("不支持的列类型: " + type);
             }
@@ -422,6 +474,13 @@ public final class ProjectedCodec {
     private static void putLe2(byte[] buf, int pos, int v) {
         buf[pos] = (byte) v;
         buf[pos + 1] = (byte) (v >>> 8);
+    }
+
+    private static void putLe4(byte[] buf, int pos, int v) {
+        buf[pos] = (byte) v;
+        buf[pos + 1] = (byte) (v >>> 8);
+        buf[pos + 2] = (byte) (v >>> 16);
+        buf[pos + 3] = (byte) (v >>> 24);
     }
 
     private static void putBe4(byte[] buf, int pos, int v) {

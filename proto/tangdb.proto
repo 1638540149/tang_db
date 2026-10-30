@@ -154,6 +154,105 @@ message AbortTxnResponse {
   string     message = 2;
 }
 
+// ---------------------------------------------------------------- SPEC-P7:向量索引
+//
+// 边界:这里只有"行键范围 + 列槽表 + 行框架 + 维度 + 度量操作码 + float32 字节",
+// 不出现表名 / 列名 / 类型名 / SQL(K161 / INV-16)。建图与图内距离由 BE 计算;
+// 查询侧的精确打分仍由 FE 完成。
+
+message VectorIndexDefinition {
+  uint64 index_id        = 1;
+  uint64 table_id        = 2;   // 仅用于 MANIFEST 记账,BE 不解释
+  bytes  start_key       = 3;   // 主键行的用户键范围 [start, end)
+  bytes  end_key         = 4;
+  bytes  column_slots    = 5;   // 与 ScanRequest.column_slots 同一套编码
+  bytes  row_frame       = 6;
+  uint32 vector_ordinal  = 7;   // 向量列在行里的序号
+  uint32 dim             = 8;
+  uint32 metric          = 9;   // 0=L2 1=Cosine 2=InnerProduct
+  uint32 m               = 10;
+  uint32 ef_construction = 11;
+}
+
+message RegisterVectorIndexRequest {
+  VectorIndexDefinition definition = 1;
+}
+
+message RegisterVectorIndexResponse {
+  StatusCode status         = 1;
+  string     message        = 2;
+  uint32     pending_segments = 3;
+}
+
+message DropVectorIndexRequest {
+  uint64 index_id = 1;
+}
+
+message DropVectorIndexResponse {
+  StatusCode status  = 1;
+  string     message = 2;
+}
+
+message SearchVectorIndexRequest {
+  uint64 index_id   = 1;
+  bytes  query      = 2;   // 定长 float32 小端(4 × dim)
+  uint32 ef         = 3;
+  uint32 k          = 4;
+  uint64 snapshot   = 5;   // 0 = 最新已提交
+  // SPEC-P7.1 K181:开启五段计时(默认关闭,只在 SET vector_profile = ON 时为 true)
+  bool   profile    = 6;
+  // SPEC-P7.1 K182:允许集(路径 A 下推)。keys=true 时是按 [u32 长度][key] 拼接的
+  // 主键集合;bloom=true 时是布隆过滤器位图。空 = 路径 B(不过滤)。
+  bytes  allow      = 7;
+  bool   allow_bloom = 8;
+}
+
+message VectorCandidate {
+  bytes  key          = 1;   // 用户键(不含版本段)
+  float  distance     = 2;
+  uint64 row_ordinal  = 3;   // segment 内行序号(诊断用)
+}
+
+message SearchVectorIndexResponse {
+  StatusCode status            = 1;
+  string     message           = 2;
+  repeated VectorCandidate candidates = 3;
+  uint32     candidates_examined = 4;
+  uint32     pending_segments    = 5;
+  // SPEC-P7.1 K181:五段耗时(KEY=VALUE);未开启 profile 时为空
+  string     profile           = 6;
+}
+
+// 批量点查(SPEC-P7:ANN 候选回表用;只有 key 与快照,没有任何表/列语义)
+message BatchGetRequest {
+  repeated bytes keys = 1;   // 用户键(不含版本段)
+  uint64         snapshot = 2;
+  bool           profile  = 3;  // SPEC-P7.1 K181:返回候选回表的分段耗时
+}
+
+message BatchGetResponse {
+  StatusCode status  = 1;
+  string     message = 2;
+  repeated Kv rows   = 3;     // 不存在的键不出现
+  string     profile = 4;     // SPEC-P7.1 K181:KEY=VALUE 文本;未开启时为空
+}
+
+message VectorIndexStatusRequest {
+  uint64 index_id = 1;
+}
+
+message VectorIndexStatusResponse {
+  StatusCode status          = 1;
+  string     message         = 2;
+  uint32     segment_count   = 3;
+  uint32     ready_segments  = 4;
+  uint32     pending_segments = 5;
+  uint64     node_count      = 6;
+  uint64     graph_bytes     = 7;
+  uint32     metric          = 8;
+  uint32     dim             = 9;
+}
+
 // ---------------------------------------------------------------- 服务
 
 service TangDb {
@@ -175,6 +274,14 @@ service TangDb {
   rpc BeginTxn(BeginTxnRequest) returns (BeginTxnResponse);
   rpc CommitTxn(CommitTxnRequest) returns (CommitTxnResponse);
   rpc AbortTxn(AbortTxnRequest) returns (AbortTxnResponse);
+
+  // ---- SPEC-P7:分段 HNSW 图段 ----
+  rpc RegisterVectorIndex(RegisterVectorIndexRequest) returns (RegisterVectorIndexResponse);
+  rpc DropVectorIndex(DropVectorIndexRequest) returns (DropVectorIndexResponse);
+  rpc SearchVectorIndex(SearchVectorIndexRequest) returns (SearchVectorIndexResponse);
+  rpc VectorIndexStatus(VectorIndexStatusRequest) returns (VectorIndexStatusResponse);
+  // ANN 候选回表:一次取多行,避免逐候选一次 RPC(向量检索时延的关键)
+  rpc BatchGet(BatchGetRequest) returns (BatchGetResponse);
 }
 
 // ---------------------------------------------------------------- BE → FE:注册与心跳

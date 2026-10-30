@@ -1,0 +1,72 @@
+# 施工提示词 · P7 AI 能力(向量类型 / 分段 HNSW / 混合查询选路 / 推理下推)
+
+> 唯一施工依据:`specs/P7-ai-vector-inference.md`(**v0.1b Approved**)。本文件只讲"怎么落地",不扩范围。
+> 范围边界以规约 §2.1(做)与 §2.2(不做)为准;**§2.2 里的东西一条都不许做**。
+
+## 0. 必读(按顺序)
+
+1. `AGENTS.md` —— 护栏、构建命令、提交纪律
+2. `specs/P7-ai-vector-inference.md` —— 全文,尤其 §2 范围、§4 FR-731~790、§5 数据与格式、§6 K157~177、§7 SC-419~438、§8 边界 125~154
+3. `.specify/memory/constitution.md` —— 项目宪法
+4. `docs/读代码地图/读代码地图-P6.1.md` —— 当前执行层(列投影 / 谓词下推 / 并行扫描 / 流式)怎么长的,新代码要接着它写
+5. 现状代码(动之前先读):
+   - `fe/src/main/java/com/wangyu/tangdb/storage/DataType.java`(类型枚举 1~7)
+   - `fe/src/main/java/com/wangyu/tangdb/parser/{Lexer,Parser,Ast}.java`(加 `VECTOR(n)`、向量字面量、距离函数、`CREATE VECTOR INDEX`)
+   - `fe/src/main/java/com/wangyu/tangdb/catalog/{Catalog,SystemTables,TableMeta}.java`(系统表 9)
+   - `fe/src/main/java/com/wangyu/tangdb/query/{QueryEngine,Parallel}.java`(扫描/并行/EXPLAIN)
+   - `fe/src/main/java/com/wangyu/tangdb/storage/{ProjectedCodec,ProjectingStore,ScanOptions}.java`
+   - `be/internal/manifest/manifest.go`(format_version=2、Manifest 结构)
+   - `be/internal/store/{engine,snapshot,mvcc}.go`(落盘、compaction、扫描)
+   - `be/internal/segment/{segment,iter}.go`(段文件与 chunk)
+   - `be/internal/exec/{projection,predicate}.go`(P6.1 的行框架与字节码)
+   - `proto/tangdb.proto`(先看,再决定要不要加字段)
+
+## 1. 实现顺序(九步,每步做完立刻自证)
+
+| 步 | 内容 | 自证 |
+|---|---|---|
+| 1 | **`VECTOR(n)` 类型**:DataType 追加 `VECTOR(8)`;建表/`DESC`/行列定义解析;`canBePrimaryKey`=false;向量列不允许普通索引(1235) | `mvn.cmd compile` + 单测 |
+| 2 | **向量字面量与距离函数**:`'[a,b,…]'` 解析、维度校验;`l2_distance` / `cosine_distance` / `inner_product` 三个函数(自己写,不引第三方数学库) | 单测:维度不符、NaN/Inf、空向量、正常取值 |
+| 3 | **精确暴力检索(先不做图)**:`ORDER BY l2_distance(col,'[…]') LIMIT k` 全表算距离取 top-k;距离相等按主键升序;`exact` 模式即这条路 | 手打 SQL 验证;`EXPLAIN` 标"精确/暴力" |
+| 4 | **磁盘格式升级**:`format_version` 2→3、MANIFEST 增 `vec_indexes[]`、启动守卫(老目录拒绝启动并给清库提示);系统表 9 `sys_vec_indexes` + `SHOW VECTOR INDEXES` | 单测:老目录被拒;新目录正常;元数据 round-trip |
+| 5 | **图段文件编解码**:按 §5.2 布局写 `<seg>.hnsw`(魔数/版本/元信息/节点表/各层邻接/校验和);BE 侧实现 build/load/save;维度与度量来自 FE 下发的「定长 float32 槽 + 维度 + 度量操作码」。**BE 不许出现表名/列名/类型名的概念** | 单测:同一批数据 save→load→距离一致;截断文件被识别 |
+| 6 | **建图与生命周期**:segment 落盘后后台建图(不阻塞前台);写完 → fsync → 更新 MANIFEST 才可见;失败/中断删半成品;compaction 后重建受影响段;`REBUILD VECTOR INDEX` 显式重建;启动校验不匹配 → 标记待重建并退化为暴力 | 单测 + 手打:建图、强杀、重启、再查 |
+| 7 | **ANN 检索**:每段 top-k → 归并 → MVCC 过滤 → 不足 k 时 `ef` 翻倍(上限 `ef_max`);预算用尽按 `exact_fallback_rows` 回退暴力,否则返回不足并标 `partial`;结果自描述四字段(`approximate`/`ef_used`/`candidates_examined`/`partial`);`EXPLAIN` 增「向量检索」行 | 单测 + 手打:与 exact 对拍 Recall@10 |
+| 8 | **混合查询选路**:结构化谓词 + 向量 `ORDER BY`;路径 A(允许集下推,主键集合 ≤1 万优先、超了退布隆)/ 路径 B(候选扩展不写死倍数);按 K167 阈值选路;统计 stale 一律 B;两路结果逐行一致 | 单测 + 手打 5 种选择率对拍 |
+| 9 | **推理下推 `ai_embed`**:FE 侧 EmbedOp,按批(默认 1024)调 Endpoint;幂等键 `hash(模型版本+维度+规范化文本)`;LRU 缓存;超时/重试/熔断;失败整批不写、语句回滚;`ai_embed` 出现在 WHERE/GROUP BY/ORDER BY 报 1235;`SHOW AI STATS` | 单测:假端点(本地 stub)+ 维度不符 + 超时 + 缓存命中 |
+| 10 | **P6.1 三条挂账**:`SHOW INDEX FROM <表> FROM <库>` 双 FROM;`parallel_min_rows`(默认 50,000)扫描层阈值 + `EXPLAIN` 说明;FR-715/716 取证脚本(内存/分配对比) | 单测 + 手打 |
+| 11 | **验收脚本与 README**:`scripts/tests/p7-test.sh`(覆盖 SC-419~438,含 ★并发/★崩溃,独立端口与数据目录)、`scripts/tests/p7-recall.sh`(81 格召回矩阵)、README 的 P7 章节 | 脚本单跑一遍,贴真实输出 |
+
+> 顺序不可打乱:第 3 步的精确暴力是第 7 步的对拍基准;第 4/5 步的格式是第 6 步的前提。
+
+## 2. 硬约束(违反即返工)
+
+- **依赖红线**:BE 只允许 `google.golang.org/grpc`、`google.golang.org/protobuf`;FE 不得引入任何向量库/线性代数库(hNSW、faiss、EJML、ND4J 一律不行);**距离与图算法全部自己写**。
+- **边界不可穿透**:FE 不读写 BE 数据目录(INV-16);BE 不出现表名/列名/类型名/SQL;`proto/` 里也不许出现。
+- **先日志后数据**:写路径仍然 WAL → fsync → memtable → 返回 OK。
+- **段文件不可变**:图段一旦发布不许原地改;重建写新文件 + 原子更新 MANIFEST。
+- **图段构建只能在 BE**(FE 不能写数据目录);BE 只认「定长 float32 槽 + 维度 + 度量操作码」。
+- 改 `proto` 只用 `scripts/gen-proto.sh` 重生成两侧桩代码;只加字段,不改既有语义。
+- 门限一个都不许改;`specs/`、`docs/` 不许改(验收报告与读代码地图由核验方写);不 `git commit` / `git push`。
+
+## 3. 工作方式(踩过的坑,逐条遵守)
+
+- **禁止派子代理**,全部自己顺序做。
+- **禁止 `nohup` / `disown` / 裸 `&` 起服务** —— 之前因此把 bash 工具卡死过三次(各 1~2 小时)。要起服务只用仓库脚本(`scripts/start-be.sh --daemon`、`scripts/start-fe.sh --daemon|cli`、`scripts/tests/*.sh`);单条 bash 超过 90 秒没返回就换写法。
+- **IDE 会抢 `fe/target/classes`**:如果在 fed 启动时看到 `ClassNotFoundException: com.wangyu.tangdb.fed.Fed`,说明有人在用 IDE 编译,等 10 秒重试一次即可,不要改代码去"修"它。
+- 每个步骤做完立刻跑:①`cd fe && mvn.cmd compile` ②`cd fe && mvn.cmd test` ③`cd be && go build ./... && go vet ./... && go test ./...`。不要攒到最后。
+- 测试环境独占:任何时刻只跑一个脚本;起脚本前确认没有残留 `be.exe` / `tangdb.fed.Fed`。
+
+## 4. 不要做(超范围即返工)
+
+- 不做全文检索/倒排索引(P10)、不做大对象/多模态存储(P11)、不做空间类型(P12)、不做 text2sql/语义标签(P8)、不做自适应优化(P14)。
+- 不做向量量化压缩(除 float16 可选)、不做多向量列联合检索、不做分布式副本。
+- 不改门限、不改 `specs/`、不写 `docs/验收报告/*` 与 `docs/读代码地图/*`。
+- 不跑 `p2~p6.1-test.sh` 全套(那些由核验方统一跑)。
+
+## 5. 交付纪律
+
+- 每条 FR 都要能指出落点(文件 + 方法/行号);交付说明里逐条列出。
+- **测试结果必须真跑**:贴命令与真实回显;没跑的写"未验证",不许把"应该没问题"写成通过。
+- 卡住超过 30 分钟没有进展,就在交付说明里写清卡在哪、试过什么,并停下 —— 不要为了显得完成而降级实现或改断言。
+- 交付物:代码 + 单测 + `scripts/tests/p7-test.sh` + `scripts/tests/p7-recall.sh` + README 的 P7 章节。

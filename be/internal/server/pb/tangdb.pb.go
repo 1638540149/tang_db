@@ -996,6 +996,859 @@ func (x *AbortTxnResponse) GetMessage() string {
 	return ""
 }
 
+type VectorIndexDefinition struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	IndexId        uint64                 `protobuf:"varint,1,opt,name=index_id,json=indexId,proto3" json:"index_id,omitempty"`
+	TableId        uint64                 `protobuf:"varint,2,opt,name=table_id,json=tableId,proto3" json:"table_id,omitempty"`   // 仅用于 MANIFEST 记账,BE 不解释
+	StartKey       []byte                 `protobuf:"bytes,3,opt,name=start_key,json=startKey,proto3" json:"start_key,omitempty"` // 主键行的用户键范围 [start, end)
+	EndKey         []byte                 `protobuf:"bytes,4,opt,name=end_key,json=endKey,proto3" json:"end_key,omitempty"`
+	ColumnSlots    []byte                 `protobuf:"bytes,5,opt,name=column_slots,json=columnSlots,proto3" json:"column_slots,omitempty"` // 与 ScanRequest.column_slots 同一套编码
+	RowFrame       []byte                 `protobuf:"bytes,6,opt,name=row_frame,json=rowFrame,proto3" json:"row_frame,omitempty"`
+	VectorOrdinal  uint32                 `protobuf:"varint,7,opt,name=vector_ordinal,json=vectorOrdinal,proto3" json:"vector_ordinal,omitempty"` // 向量列在行里的序号
+	Dim            uint32                 `protobuf:"varint,8,opt,name=dim,proto3" json:"dim,omitempty"`
+	Metric         uint32                 `protobuf:"varint,9,opt,name=metric,proto3" json:"metric,omitempty"` // 0=L2 1=Cosine 2=InnerProduct
+	M              uint32                 `protobuf:"varint,10,opt,name=m,proto3" json:"m,omitempty"`
+	EfConstruction uint32                 `protobuf:"varint,11,opt,name=ef_construction,json=efConstruction,proto3" json:"ef_construction,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *VectorIndexDefinition) Reset() {
+	*x = VectorIndexDefinition{}
+	mi := &file_tangdb_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *VectorIndexDefinition) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*VectorIndexDefinition) ProtoMessage() {}
+
+func (x *VectorIndexDefinition) ProtoReflect() protoreflect.Message {
+	mi := &file_tangdb_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use VectorIndexDefinition.ProtoReflect.Descriptor instead.
+func (*VectorIndexDefinition) Descriptor() ([]byte, []int) {
+	return file_tangdb_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *VectorIndexDefinition) GetIndexId() uint64 {
+	if x != nil {
+		return x.IndexId
+	}
+	return 0
+}
+
+func (x *VectorIndexDefinition) GetTableId() uint64 {
+	if x != nil {
+		return x.TableId
+	}
+	return 0
+}
+
+func (x *VectorIndexDefinition) GetStartKey() []byte {
+	if x != nil {
+		return x.StartKey
+	}
+	return nil
+}
+
+func (x *VectorIndexDefinition) GetEndKey() []byte {
+	if x != nil {
+		return x.EndKey
+	}
+	return nil
+}
+
+func (x *VectorIndexDefinition) GetColumnSlots() []byte {
+	if x != nil {
+		return x.ColumnSlots
+	}
+	return nil
+}
+
+func (x *VectorIndexDefinition) GetRowFrame() []byte {
+	if x != nil {
+		return x.RowFrame
+	}
+	return nil
+}
+
+func (x *VectorIndexDefinition) GetVectorOrdinal() uint32 {
+	if x != nil {
+		return x.VectorOrdinal
+	}
+	return 0
+}
+
+func (x *VectorIndexDefinition) GetDim() uint32 {
+	if x != nil {
+		return x.Dim
+	}
+	return 0
+}
+
+func (x *VectorIndexDefinition) GetMetric() uint32 {
+	if x != nil {
+		return x.Metric
+	}
+	return 0
+}
+
+func (x *VectorIndexDefinition) GetM() uint32 {
+	if x != nil {
+		return x.M
+	}
+	return 0
+}
+
+func (x *VectorIndexDefinition) GetEfConstruction() uint32 {
+	if x != nil {
+		return x.EfConstruction
+	}
+	return 0
+}
+
+type RegisterVectorIndexRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Definition    *VectorIndexDefinition `protobuf:"bytes,1,opt,name=definition,proto3" json:"definition,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RegisterVectorIndexRequest) Reset() {
+	*x = RegisterVectorIndexRequest{}
+	mi := &file_tangdb_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RegisterVectorIndexRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RegisterVectorIndexRequest) ProtoMessage() {}
+
+func (x *RegisterVectorIndexRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_tangdb_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RegisterVectorIndexRequest.ProtoReflect.Descriptor instead.
+func (*RegisterVectorIndexRequest) Descriptor() ([]byte, []int) {
+	return file_tangdb_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *RegisterVectorIndexRequest) GetDefinition() *VectorIndexDefinition {
+	if x != nil {
+		return x.Definition
+	}
+	return nil
+}
+
+type RegisterVectorIndexResponse struct {
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	Status          StatusCode             `protobuf:"varint,1,opt,name=status,proto3,enum=tangdb.v1.StatusCode" json:"status,omitempty"`
+	Message         string                 `protobuf:"bytes,2,opt,name=message,proto3" json:"message,omitempty"`
+	PendingSegments uint32                 `protobuf:"varint,3,opt,name=pending_segments,json=pendingSegments,proto3" json:"pending_segments,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *RegisterVectorIndexResponse) Reset() {
+	*x = RegisterVectorIndexResponse{}
+	mi := &file_tangdb_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RegisterVectorIndexResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RegisterVectorIndexResponse) ProtoMessage() {}
+
+func (x *RegisterVectorIndexResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_tangdb_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RegisterVectorIndexResponse.ProtoReflect.Descriptor instead.
+func (*RegisterVectorIndexResponse) Descriptor() ([]byte, []int) {
+	return file_tangdb_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *RegisterVectorIndexResponse) GetStatus() StatusCode {
+	if x != nil {
+		return x.Status
+	}
+	return StatusCode_STATUS_UNSPECIFIED
+}
+
+func (x *RegisterVectorIndexResponse) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
+func (x *RegisterVectorIndexResponse) GetPendingSegments() uint32 {
+	if x != nil {
+		return x.PendingSegments
+	}
+	return 0
+}
+
+type DropVectorIndexRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	IndexId       uint64                 `protobuf:"varint,1,opt,name=index_id,json=indexId,proto3" json:"index_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DropVectorIndexRequest) Reset() {
+	*x = DropVectorIndexRequest{}
+	mi := &file_tangdb_proto_msgTypes[18]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DropVectorIndexRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DropVectorIndexRequest) ProtoMessage() {}
+
+func (x *DropVectorIndexRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_tangdb_proto_msgTypes[18]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DropVectorIndexRequest.ProtoReflect.Descriptor instead.
+func (*DropVectorIndexRequest) Descriptor() ([]byte, []int) {
+	return file_tangdb_proto_rawDescGZIP(), []int{18}
+}
+
+func (x *DropVectorIndexRequest) GetIndexId() uint64 {
+	if x != nil {
+		return x.IndexId
+	}
+	return 0
+}
+
+type DropVectorIndexResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Status        StatusCode             `protobuf:"varint,1,opt,name=status,proto3,enum=tangdb.v1.StatusCode" json:"status,omitempty"`
+	Message       string                 `protobuf:"bytes,2,opt,name=message,proto3" json:"message,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DropVectorIndexResponse) Reset() {
+	*x = DropVectorIndexResponse{}
+	mi := &file_tangdb_proto_msgTypes[19]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DropVectorIndexResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DropVectorIndexResponse) ProtoMessage() {}
+
+func (x *DropVectorIndexResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_tangdb_proto_msgTypes[19]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DropVectorIndexResponse.ProtoReflect.Descriptor instead.
+func (*DropVectorIndexResponse) Descriptor() ([]byte, []int) {
+	return file_tangdb_proto_rawDescGZIP(), []int{19}
+}
+
+func (x *DropVectorIndexResponse) GetStatus() StatusCode {
+	if x != nil {
+		return x.Status
+	}
+	return StatusCode_STATUS_UNSPECIFIED
+}
+
+func (x *DropVectorIndexResponse) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
+type SearchVectorIndexRequest struct {
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	IndexId  uint64                 `protobuf:"varint,1,opt,name=index_id,json=indexId,proto3" json:"index_id,omitempty"`
+	Query    []byte                 `protobuf:"bytes,2,opt,name=query,proto3" json:"query,omitempty"` // 定长 float32 小端(4 × dim)
+	Ef       uint32                 `protobuf:"varint,3,opt,name=ef,proto3" json:"ef,omitempty"`
+	K        uint32                 `protobuf:"varint,4,opt,name=k,proto3" json:"k,omitempty"`
+	Snapshot uint64                 `protobuf:"varint,5,opt,name=snapshot,proto3" json:"snapshot,omitempty"` // 0 = 最新已提交
+	// SPEC-P7.1 K181:开启五段计时(默认关闭,只在 SET vector_profile = ON 时为 true)
+	Profile bool `protobuf:"varint,6,opt,name=profile,proto3" json:"profile,omitempty"`
+	// SPEC-P7.1 K182:允许集(路径 A 下推)。keys=true 时是按 [u32 长度][key] 拼接的
+	// 主键集合;bloom=true 时是布隆过滤器位图。空 = 路径 B(不过滤)。
+	Allow         []byte `protobuf:"bytes,7,opt,name=allow,proto3" json:"allow,omitempty"`
+	AllowBloom    bool   `protobuf:"varint,8,opt,name=allow_bloom,json=allowBloom,proto3" json:"allow_bloom,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SearchVectorIndexRequest) Reset() {
+	*x = SearchVectorIndexRequest{}
+	mi := &file_tangdb_proto_msgTypes[20]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SearchVectorIndexRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SearchVectorIndexRequest) ProtoMessage() {}
+
+func (x *SearchVectorIndexRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_tangdb_proto_msgTypes[20]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SearchVectorIndexRequest.ProtoReflect.Descriptor instead.
+func (*SearchVectorIndexRequest) Descriptor() ([]byte, []int) {
+	return file_tangdb_proto_rawDescGZIP(), []int{20}
+}
+
+func (x *SearchVectorIndexRequest) GetIndexId() uint64 {
+	if x != nil {
+		return x.IndexId
+	}
+	return 0
+}
+
+func (x *SearchVectorIndexRequest) GetQuery() []byte {
+	if x != nil {
+		return x.Query
+	}
+	return nil
+}
+
+func (x *SearchVectorIndexRequest) GetEf() uint32 {
+	if x != nil {
+		return x.Ef
+	}
+	return 0
+}
+
+func (x *SearchVectorIndexRequest) GetK() uint32 {
+	if x != nil {
+		return x.K
+	}
+	return 0
+}
+
+func (x *SearchVectorIndexRequest) GetSnapshot() uint64 {
+	if x != nil {
+		return x.Snapshot
+	}
+	return 0
+}
+
+func (x *SearchVectorIndexRequest) GetProfile() bool {
+	if x != nil {
+		return x.Profile
+	}
+	return false
+}
+
+func (x *SearchVectorIndexRequest) GetAllow() []byte {
+	if x != nil {
+		return x.Allow
+	}
+	return nil
+}
+
+func (x *SearchVectorIndexRequest) GetAllowBloom() bool {
+	if x != nil {
+		return x.AllowBloom
+	}
+	return false
+}
+
+type VectorCandidate struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Key           []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"` // 用户键(不含版本段)
+	Distance      float32                `protobuf:"fixed32,2,opt,name=distance,proto3" json:"distance,omitempty"`
+	RowOrdinal    uint64                 `protobuf:"varint,3,opt,name=row_ordinal,json=rowOrdinal,proto3" json:"row_ordinal,omitempty"` // segment 内行序号(诊断用)
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *VectorCandidate) Reset() {
+	*x = VectorCandidate{}
+	mi := &file_tangdb_proto_msgTypes[21]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *VectorCandidate) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*VectorCandidate) ProtoMessage() {}
+
+func (x *VectorCandidate) ProtoReflect() protoreflect.Message {
+	mi := &file_tangdb_proto_msgTypes[21]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use VectorCandidate.ProtoReflect.Descriptor instead.
+func (*VectorCandidate) Descriptor() ([]byte, []int) {
+	return file_tangdb_proto_rawDescGZIP(), []int{21}
+}
+
+func (x *VectorCandidate) GetKey() []byte {
+	if x != nil {
+		return x.Key
+	}
+	return nil
+}
+
+func (x *VectorCandidate) GetDistance() float32 {
+	if x != nil {
+		return x.Distance
+	}
+	return 0
+}
+
+func (x *VectorCandidate) GetRowOrdinal() uint64 {
+	if x != nil {
+		return x.RowOrdinal
+	}
+	return 0
+}
+
+type SearchVectorIndexResponse struct {
+	state              protoimpl.MessageState `protogen:"open.v1"`
+	Status             StatusCode             `protobuf:"varint,1,opt,name=status,proto3,enum=tangdb.v1.StatusCode" json:"status,omitempty"`
+	Message            string                 `protobuf:"bytes,2,opt,name=message,proto3" json:"message,omitempty"`
+	Candidates         []*VectorCandidate     `protobuf:"bytes,3,rep,name=candidates,proto3" json:"candidates,omitempty"`
+	CandidatesExamined uint32                 `protobuf:"varint,4,opt,name=candidates_examined,json=candidatesExamined,proto3" json:"candidates_examined,omitempty"`
+	PendingSegments    uint32                 `protobuf:"varint,5,opt,name=pending_segments,json=pendingSegments,proto3" json:"pending_segments,omitempty"`
+	// SPEC-P7.1 K181:五段耗时(KEY=VALUE);未开启 profile 时为空
+	Profile       string `protobuf:"bytes,6,opt,name=profile,proto3" json:"profile,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SearchVectorIndexResponse) Reset() {
+	*x = SearchVectorIndexResponse{}
+	mi := &file_tangdb_proto_msgTypes[22]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SearchVectorIndexResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SearchVectorIndexResponse) ProtoMessage() {}
+
+func (x *SearchVectorIndexResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_tangdb_proto_msgTypes[22]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SearchVectorIndexResponse.ProtoReflect.Descriptor instead.
+func (*SearchVectorIndexResponse) Descriptor() ([]byte, []int) {
+	return file_tangdb_proto_rawDescGZIP(), []int{22}
+}
+
+func (x *SearchVectorIndexResponse) GetStatus() StatusCode {
+	if x != nil {
+		return x.Status
+	}
+	return StatusCode_STATUS_UNSPECIFIED
+}
+
+func (x *SearchVectorIndexResponse) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
+func (x *SearchVectorIndexResponse) GetCandidates() []*VectorCandidate {
+	if x != nil {
+		return x.Candidates
+	}
+	return nil
+}
+
+func (x *SearchVectorIndexResponse) GetCandidatesExamined() uint32 {
+	if x != nil {
+		return x.CandidatesExamined
+	}
+	return 0
+}
+
+func (x *SearchVectorIndexResponse) GetPendingSegments() uint32 {
+	if x != nil {
+		return x.PendingSegments
+	}
+	return 0
+}
+
+func (x *SearchVectorIndexResponse) GetProfile() string {
+	if x != nil {
+		return x.Profile
+	}
+	return ""
+}
+
+// 批量点查(SPEC-P7:ANN 候选回表用;只有 key 与快照,没有任何表/列语义)
+type BatchGetRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Keys          [][]byte               `protobuf:"bytes,1,rep,name=keys,proto3" json:"keys,omitempty"` // 用户键(不含版本段)
+	Snapshot      uint64                 `protobuf:"varint,2,opt,name=snapshot,proto3" json:"snapshot,omitempty"`
+	Profile       bool                   `protobuf:"varint,3,opt,name=profile,proto3" json:"profile,omitempty"` // SPEC-P7.1 K181:返回候选回表的分段耗时
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BatchGetRequest) Reset() {
+	*x = BatchGetRequest{}
+	mi := &file_tangdb_proto_msgTypes[23]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BatchGetRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BatchGetRequest) ProtoMessage() {}
+
+func (x *BatchGetRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_tangdb_proto_msgTypes[23]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BatchGetRequest.ProtoReflect.Descriptor instead.
+func (*BatchGetRequest) Descriptor() ([]byte, []int) {
+	return file_tangdb_proto_rawDescGZIP(), []int{23}
+}
+
+func (x *BatchGetRequest) GetKeys() [][]byte {
+	if x != nil {
+		return x.Keys
+	}
+	return nil
+}
+
+func (x *BatchGetRequest) GetSnapshot() uint64 {
+	if x != nil {
+		return x.Snapshot
+	}
+	return 0
+}
+
+func (x *BatchGetRequest) GetProfile() bool {
+	if x != nil {
+		return x.Profile
+	}
+	return false
+}
+
+type BatchGetResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Status        StatusCode             `protobuf:"varint,1,opt,name=status,proto3,enum=tangdb.v1.StatusCode" json:"status,omitempty"`
+	Message       string                 `protobuf:"bytes,2,opt,name=message,proto3" json:"message,omitempty"`
+	Rows          []*Kv                  `protobuf:"bytes,3,rep,name=rows,proto3" json:"rows,omitempty"`       // 不存在的键不出现
+	Profile       string                 `protobuf:"bytes,4,opt,name=profile,proto3" json:"profile,omitempty"` // SPEC-P7.1 K181:KEY=VALUE 文本;未开启时为空
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BatchGetResponse) Reset() {
+	*x = BatchGetResponse{}
+	mi := &file_tangdb_proto_msgTypes[24]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BatchGetResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BatchGetResponse) ProtoMessage() {}
+
+func (x *BatchGetResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_tangdb_proto_msgTypes[24]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BatchGetResponse.ProtoReflect.Descriptor instead.
+func (*BatchGetResponse) Descriptor() ([]byte, []int) {
+	return file_tangdb_proto_rawDescGZIP(), []int{24}
+}
+
+func (x *BatchGetResponse) GetStatus() StatusCode {
+	if x != nil {
+		return x.Status
+	}
+	return StatusCode_STATUS_UNSPECIFIED
+}
+
+func (x *BatchGetResponse) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
+func (x *BatchGetResponse) GetRows() []*Kv {
+	if x != nil {
+		return x.Rows
+	}
+	return nil
+}
+
+func (x *BatchGetResponse) GetProfile() string {
+	if x != nil {
+		return x.Profile
+	}
+	return ""
+}
+
+type VectorIndexStatusRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	IndexId       uint64                 `protobuf:"varint,1,opt,name=index_id,json=indexId,proto3" json:"index_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *VectorIndexStatusRequest) Reset() {
+	*x = VectorIndexStatusRequest{}
+	mi := &file_tangdb_proto_msgTypes[25]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *VectorIndexStatusRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*VectorIndexStatusRequest) ProtoMessage() {}
+
+func (x *VectorIndexStatusRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_tangdb_proto_msgTypes[25]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use VectorIndexStatusRequest.ProtoReflect.Descriptor instead.
+func (*VectorIndexStatusRequest) Descriptor() ([]byte, []int) {
+	return file_tangdb_proto_rawDescGZIP(), []int{25}
+}
+
+func (x *VectorIndexStatusRequest) GetIndexId() uint64 {
+	if x != nil {
+		return x.IndexId
+	}
+	return 0
+}
+
+type VectorIndexStatusResponse struct {
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	Status          StatusCode             `protobuf:"varint,1,opt,name=status,proto3,enum=tangdb.v1.StatusCode" json:"status,omitempty"`
+	Message         string                 `protobuf:"bytes,2,opt,name=message,proto3" json:"message,omitempty"`
+	SegmentCount    uint32                 `protobuf:"varint,3,opt,name=segment_count,json=segmentCount,proto3" json:"segment_count,omitempty"`
+	ReadySegments   uint32                 `protobuf:"varint,4,opt,name=ready_segments,json=readySegments,proto3" json:"ready_segments,omitempty"`
+	PendingSegments uint32                 `protobuf:"varint,5,opt,name=pending_segments,json=pendingSegments,proto3" json:"pending_segments,omitempty"`
+	NodeCount       uint64                 `protobuf:"varint,6,opt,name=node_count,json=nodeCount,proto3" json:"node_count,omitempty"`
+	GraphBytes      uint64                 `protobuf:"varint,7,opt,name=graph_bytes,json=graphBytes,proto3" json:"graph_bytes,omitempty"`
+	Metric          uint32                 `protobuf:"varint,8,opt,name=metric,proto3" json:"metric,omitempty"`
+	Dim             uint32                 `protobuf:"varint,9,opt,name=dim,proto3" json:"dim,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *VectorIndexStatusResponse) Reset() {
+	*x = VectorIndexStatusResponse{}
+	mi := &file_tangdb_proto_msgTypes[26]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *VectorIndexStatusResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*VectorIndexStatusResponse) ProtoMessage() {}
+
+func (x *VectorIndexStatusResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_tangdb_proto_msgTypes[26]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use VectorIndexStatusResponse.ProtoReflect.Descriptor instead.
+func (*VectorIndexStatusResponse) Descriptor() ([]byte, []int) {
+	return file_tangdb_proto_rawDescGZIP(), []int{26}
+}
+
+func (x *VectorIndexStatusResponse) GetStatus() StatusCode {
+	if x != nil {
+		return x.Status
+	}
+	return StatusCode_STATUS_UNSPECIFIED
+}
+
+func (x *VectorIndexStatusResponse) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
+func (x *VectorIndexStatusResponse) GetSegmentCount() uint32 {
+	if x != nil {
+		return x.SegmentCount
+	}
+	return 0
+}
+
+func (x *VectorIndexStatusResponse) GetReadySegments() uint32 {
+	if x != nil {
+		return x.ReadySegments
+	}
+	return 0
+}
+
+func (x *VectorIndexStatusResponse) GetPendingSegments() uint32 {
+	if x != nil {
+		return x.PendingSegments
+	}
+	return 0
+}
+
+func (x *VectorIndexStatusResponse) GetNodeCount() uint64 {
+	if x != nil {
+		return x.NodeCount
+	}
+	return 0
+}
+
+func (x *VectorIndexStatusResponse) GetGraphBytes() uint64 {
+	if x != nil {
+		return x.GraphBytes
+	}
+	return 0
+}
+
+func (x *VectorIndexStatusResponse) GetMetric() uint32 {
+	if x != nil {
+		return x.Metric
+	}
+	return 0
+}
+
+func (x *VectorIndexStatusResponse) GetDim() uint32 {
+	if x != nil {
+		return x.Dim
+	}
+	return 0
+}
+
 type RegisterBeRequest struct {
 	state                    protoimpl.MessageState `protogen:"open.v1"`
 	BeId                     string                 `protobuf:"bytes,1,opt,name=be_id,json=beId,proto3" json:"be_id,omitempty"`
@@ -1009,7 +1862,7 @@ type RegisterBeRequest struct {
 
 func (x *RegisterBeRequest) Reset() {
 	*x = RegisterBeRequest{}
-	mi := &file_tangdb_proto_msgTypes[15]
+	mi := &file_tangdb_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1021,7 +1874,7 @@ func (x *RegisterBeRequest) String() string {
 func (*RegisterBeRequest) ProtoMessage() {}
 
 func (x *RegisterBeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_tangdb_proto_msgTypes[15]
+	mi := &file_tangdb_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1034,7 +1887,7 @@ func (x *RegisterBeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RegisterBeRequest.ProtoReflect.Descriptor instead.
 func (*RegisterBeRequest) Descriptor() ([]byte, []int) {
-	return file_tangdb_proto_rawDescGZIP(), []int{15}
+	return file_tangdb_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *RegisterBeRequest) GetBeId() string {
@@ -1082,7 +1935,7 @@ type RegisterBeResponse struct {
 
 func (x *RegisterBeResponse) Reset() {
 	*x = RegisterBeResponse{}
-	mi := &file_tangdb_proto_msgTypes[16]
+	mi := &file_tangdb_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1094,7 +1947,7 @@ func (x *RegisterBeResponse) String() string {
 func (*RegisterBeResponse) ProtoMessage() {}
 
 func (x *RegisterBeResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_tangdb_proto_msgTypes[16]
+	mi := &file_tangdb_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1107,7 +1960,7 @@ func (x *RegisterBeResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RegisterBeResponse.ProtoReflect.Descriptor instead.
 func (*RegisterBeResponse) Descriptor() ([]byte, []int) {
-	return file_tangdb_proto_rawDescGZIP(), []int{16}
+	return file_tangdb_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *RegisterBeResponse) GetStatus() StatusCode {
@@ -1162,7 +2015,7 @@ type HeartbeatRequest struct {
 
 func (x *HeartbeatRequest) Reset() {
 	*x = HeartbeatRequest{}
-	mi := &file_tangdb_proto_msgTypes[17]
+	mi := &file_tangdb_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1174,7 +2027,7 @@ func (x *HeartbeatRequest) String() string {
 func (*HeartbeatRequest) ProtoMessage() {}
 
 func (x *HeartbeatRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_tangdb_proto_msgTypes[17]
+	mi := &file_tangdb_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1187,7 +2040,7 @@ func (x *HeartbeatRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HeartbeatRequest.ProtoReflect.Descriptor instead.
 func (*HeartbeatRequest) Descriptor() ([]byte, []int) {
-	return file_tangdb_proto_rawDescGZIP(), []int{17}
+	return file_tangdb_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *HeartbeatRequest) GetBeId() string {
@@ -1354,7 +2207,7 @@ type HeartbeatResponse struct {
 
 func (x *HeartbeatResponse) Reset() {
 	*x = HeartbeatResponse{}
-	mi := &file_tangdb_proto_msgTypes[18]
+	mi := &file_tangdb_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1366,7 +2219,7 @@ func (x *HeartbeatResponse) String() string {
 func (*HeartbeatResponse) ProtoMessage() {}
 
 func (x *HeartbeatResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_tangdb_proto_msgTypes[18]
+	mi := &file_tangdb_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1379,7 +2232,7 @@ func (x *HeartbeatResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HeartbeatResponse.ProtoReflect.Descriptor instead.
 func (*HeartbeatResponse) Descriptor() ([]byte, []int) {
-	return file_tangdb_proto_rawDescGZIP(), []int{18}
+	return file_tangdb_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *HeartbeatResponse) GetStatus() StatusCode {
@@ -1462,7 +2315,80 @@ const file_tangdb_proto_rawDesc = "" +
 	"\x06txn_id\x18\x01 \x01(\x04R\x05txnId\"[\n" +
 	"\x10AbortTxnResponse\x12-\n" +
 	"\x06status\x18\x01 \x01(\x0e2\x15.tangdb.v1.StatusCodeR\x06status\x12\x18\n" +
-	"\amessage\x18\x02 \x01(\tR\amessage\"\xd1\x01\n" +
+	"\amessage\x18\x02 \x01(\tR\amessage\"\xcb\x02\n" +
+	"\x15VectorIndexDefinition\x12\x19\n" +
+	"\bindex_id\x18\x01 \x01(\x04R\aindexId\x12\x19\n" +
+	"\btable_id\x18\x02 \x01(\x04R\atableId\x12\x1b\n" +
+	"\tstart_key\x18\x03 \x01(\fR\bstartKey\x12\x17\n" +
+	"\aend_key\x18\x04 \x01(\fR\x06endKey\x12!\n" +
+	"\fcolumn_slots\x18\x05 \x01(\fR\vcolumnSlots\x12\x1b\n" +
+	"\trow_frame\x18\x06 \x01(\fR\browFrame\x12%\n" +
+	"\x0evector_ordinal\x18\a \x01(\rR\rvectorOrdinal\x12\x10\n" +
+	"\x03dim\x18\b \x01(\rR\x03dim\x12\x16\n" +
+	"\x06metric\x18\t \x01(\rR\x06metric\x12\f\n" +
+	"\x01m\x18\n" +
+	" \x01(\rR\x01m\x12'\n" +
+	"\x0fef_construction\x18\v \x01(\rR\x0eefConstruction\"^\n" +
+	"\x1aRegisterVectorIndexRequest\x12@\n" +
+	"\n" +
+	"definition\x18\x01 \x01(\v2 .tangdb.v1.VectorIndexDefinitionR\n" +
+	"definition\"\x91\x01\n" +
+	"\x1bRegisterVectorIndexResponse\x12-\n" +
+	"\x06status\x18\x01 \x01(\x0e2\x15.tangdb.v1.StatusCodeR\x06status\x12\x18\n" +
+	"\amessage\x18\x02 \x01(\tR\amessage\x12)\n" +
+	"\x10pending_segments\x18\x03 \x01(\rR\x0fpendingSegments\"3\n" +
+	"\x16DropVectorIndexRequest\x12\x19\n" +
+	"\bindex_id\x18\x01 \x01(\x04R\aindexId\"b\n" +
+	"\x17DropVectorIndexResponse\x12-\n" +
+	"\x06status\x18\x01 \x01(\x0e2\x15.tangdb.v1.StatusCodeR\x06status\x12\x18\n" +
+	"\amessage\x18\x02 \x01(\tR\amessage\"\xd6\x01\n" +
+	"\x18SearchVectorIndexRequest\x12\x19\n" +
+	"\bindex_id\x18\x01 \x01(\x04R\aindexId\x12\x14\n" +
+	"\x05query\x18\x02 \x01(\fR\x05query\x12\x0e\n" +
+	"\x02ef\x18\x03 \x01(\rR\x02ef\x12\f\n" +
+	"\x01k\x18\x04 \x01(\rR\x01k\x12\x1a\n" +
+	"\bsnapshot\x18\x05 \x01(\x04R\bsnapshot\x12\x18\n" +
+	"\aprofile\x18\x06 \x01(\bR\aprofile\x12\x14\n" +
+	"\x05allow\x18\a \x01(\fR\x05allow\x12\x1f\n" +
+	"\vallow_bloom\x18\b \x01(\bR\n" +
+	"allowBloom\"`\n" +
+	"\x0fVectorCandidate\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\fR\x03key\x12\x1a\n" +
+	"\bdistance\x18\x02 \x01(\x02R\bdistance\x12\x1f\n" +
+	"\vrow_ordinal\x18\x03 \x01(\x04R\n" +
+	"rowOrdinal\"\x96\x02\n" +
+	"\x19SearchVectorIndexResponse\x12-\n" +
+	"\x06status\x18\x01 \x01(\x0e2\x15.tangdb.v1.StatusCodeR\x06status\x12\x18\n" +
+	"\amessage\x18\x02 \x01(\tR\amessage\x12:\n" +
+	"\n" +
+	"candidates\x18\x03 \x03(\v2\x1a.tangdb.v1.VectorCandidateR\n" +
+	"candidates\x12/\n" +
+	"\x13candidates_examined\x18\x04 \x01(\rR\x12candidatesExamined\x12)\n" +
+	"\x10pending_segments\x18\x05 \x01(\rR\x0fpendingSegments\x12\x18\n" +
+	"\aprofile\x18\x06 \x01(\tR\aprofile\"[\n" +
+	"\x0fBatchGetRequest\x12\x12\n" +
+	"\x04keys\x18\x01 \x03(\fR\x04keys\x12\x1a\n" +
+	"\bsnapshot\x18\x02 \x01(\x04R\bsnapshot\x12\x18\n" +
+	"\aprofile\x18\x03 \x01(\bR\aprofile\"\x98\x01\n" +
+	"\x10BatchGetResponse\x12-\n" +
+	"\x06status\x18\x01 \x01(\x0e2\x15.tangdb.v1.StatusCodeR\x06status\x12\x18\n" +
+	"\amessage\x18\x02 \x01(\tR\amessage\x12!\n" +
+	"\x04rows\x18\x03 \x03(\v2\r.tangdb.v1.KvR\x04rows\x12\x18\n" +
+	"\aprofile\x18\x04 \x01(\tR\aprofile\"5\n" +
+	"\x18VectorIndexStatusRequest\x12\x19\n" +
+	"\bindex_id\x18\x01 \x01(\x04R\aindexId\"\xc5\x02\n" +
+	"\x19VectorIndexStatusResponse\x12-\n" +
+	"\x06status\x18\x01 \x01(\x0e2\x15.tangdb.v1.StatusCodeR\x06status\x12\x18\n" +
+	"\amessage\x18\x02 \x01(\tR\amessage\x12#\n" +
+	"\rsegment_count\x18\x03 \x01(\rR\fsegmentCount\x12%\n" +
+	"\x0eready_segments\x18\x04 \x01(\rR\rreadySegments\x12)\n" +
+	"\x10pending_segments\x18\x05 \x01(\rR\x0fpendingSegments\x12\x1d\n" +
+	"\n" +
+	"node_count\x18\x06 \x01(\x04R\tnodeCount\x12\x1f\n" +
+	"\vgraph_bytes\x18\a \x01(\x04R\n" +
+	"graphBytes\x12\x16\n" +
+	"\x06metric\x18\b \x01(\rR\x06metric\x12\x10\n" +
+	"\x03dim\x18\t \x01(\rR\x03dim\"\xd1\x01\n" +
 	"\x11RegisterBeRequest\x12\x13\n" +
 	"\x05be_id\x18\x01 \x01(\tR\x04beId\x12\x1a\n" +
 	"\bendpoint\x18\x02 \x01(\tR\bendpoint\x12\x18\n" +
@@ -1508,7 +2434,7 @@ const file_tangdb_proto_rawDesc = "" +
 	"\tNOT_FOUND\x10\x02\x12\x14\n" +
 	"\x10INVALID_ARGUMENT\x10\x03\x12\f\n" +
 	"\bINTERNAL\x10\x04\x12\f\n" +
-	"\bCONFLICT\x10\x052\xb6\x03\n" +
+	"\bCONFLICT\x10\x052\xfb\x06\n" +
 	"\x06TangDb\x127\n" +
 	"\x04Ping\x12\x16.tangdb.v1.PingRequest\x1a\x17.tangdb.v1.PingResponse\x124\n" +
 	"\x03Put\x12\x15.tangdb.v1.PutRequest\x1a\x16.tangdb.v1.PutResponse\x124\n" +
@@ -1516,7 +2442,12 @@ const file_tangdb_proto_rawDesc = "" +
 	"\x04Scan\x12\x16.tangdb.v1.ScanRequest\x1a\x13.tangdb.v1.RowBatch0\x01\x12C\n" +
 	"\bBeginTxn\x12\x1a.tangdb.v1.BeginTxnRequest\x1a\x1b.tangdb.v1.BeginTxnResponse\x12F\n" +
 	"\tCommitTxn\x12\x1b.tangdb.v1.CommitTxnRequest\x1a\x1c.tangdb.v1.CommitTxnResponse\x12C\n" +
-	"\bAbortTxn\x12\x1a.tangdb.v1.AbortTxnRequest\x1a\x1b.tangdb.v1.AbortTxnResponse2\xa9\x01\n" +
+	"\bAbortTxn\x12\x1a.tangdb.v1.AbortTxnRequest\x1a\x1b.tangdb.v1.AbortTxnResponse\x12d\n" +
+	"\x13RegisterVectorIndex\x12%.tangdb.v1.RegisterVectorIndexRequest\x1a&.tangdb.v1.RegisterVectorIndexResponse\x12X\n" +
+	"\x0fDropVectorIndex\x12!.tangdb.v1.DropVectorIndexRequest\x1a\".tangdb.v1.DropVectorIndexResponse\x12^\n" +
+	"\x11SearchVectorIndex\x12#.tangdb.v1.SearchVectorIndexRequest\x1a$.tangdb.v1.SearchVectorIndexResponse\x12^\n" +
+	"\x11VectorIndexStatus\x12#.tangdb.v1.VectorIndexStatusRequest\x1a$.tangdb.v1.VectorIndexStatusResponse\x12C\n" +
+	"\bBatchGet\x12\x1a.tangdb.v1.BatchGetRequest\x1a\x1b.tangdb.v1.BatchGetResponse2\xa9\x01\n" +
 	"\x0eTangDbFrontend\x12I\n" +
 	"\n" +
 	"RegisterBe\x12\x1c.tangdb.v1.RegisterBeRequest\x1a\x1d.tangdb.v1.RegisterBeResponse\x12L\n" +
@@ -1536,28 +2467,40 @@ func file_tangdb_proto_rawDescGZIP() []byte {
 }
 
 var file_tangdb_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_tangdb_proto_msgTypes = make([]protoimpl.MessageInfo, 19)
+var file_tangdb_proto_msgTypes = make([]protoimpl.MessageInfo, 31)
 var file_tangdb_proto_goTypes = []any{
-	(StatusCode)(0),            // 0: tangdb.v1.StatusCode
-	(*PingRequest)(nil),        // 1: tangdb.v1.PingRequest
-	(*PingResponse)(nil),       // 2: tangdb.v1.PingResponse
-	(*PutRequest)(nil),         // 3: tangdb.v1.PutRequest
-	(*PutResponse)(nil),        // 4: tangdb.v1.PutResponse
-	(*GetRequest)(nil),         // 5: tangdb.v1.GetRequest
-	(*GetResponse)(nil),        // 6: tangdb.v1.GetResponse
-	(*Kv)(nil),                 // 7: tangdb.v1.Kv
-	(*ScanRequest)(nil),        // 8: tangdb.v1.ScanRequest
-	(*RowBatch)(nil),           // 9: tangdb.v1.RowBatch
-	(*BeginTxnRequest)(nil),    // 10: tangdb.v1.BeginTxnRequest
-	(*BeginTxnResponse)(nil),   // 11: tangdb.v1.BeginTxnResponse
-	(*CommitTxnRequest)(nil),   // 12: tangdb.v1.CommitTxnRequest
-	(*CommitTxnResponse)(nil),  // 13: tangdb.v1.CommitTxnResponse
-	(*AbortTxnRequest)(nil),    // 14: tangdb.v1.AbortTxnRequest
-	(*AbortTxnResponse)(nil),   // 15: tangdb.v1.AbortTxnResponse
-	(*RegisterBeRequest)(nil),  // 16: tangdb.v1.RegisterBeRequest
-	(*RegisterBeResponse)(nil), // 17: tangdb.v1.RegisterBeResponse
-	(*HeartbeatRequest)(nil),   // 18: tangdb.v1.HeartbeatRequest
-	(*HeartbeatResponse)(nil),  // 19: tangdb.v1.HeartbeatResponse
+	(StatusCode)(0),                     // 0: tangdb.v1.StatusCode
+	(*PingRequest)(nil),                 // 1: tangdb.v1.PingRequest
+	(*PingResponse)(nil),                // 2: tangdb.v1.PingResponse
+	(*PutRequest)(nil),                  // 3: tangdb.v1.PutRequest
+	(*PutResponse)(nil),                 // 4: tangdb.v1.PutResponse
+	(*GetRequest)(nil),                  // 5: tangdb.v1.GetRequest
+	(*GetResponse)(nil),                 // 6: tangdb.v1.GetResponse
+	(*Kv)(nil),                          // 7: tangdb.v1.Kv
+	(*ScanRequest)(nil),                 // 8: tangdb.v1.ScanRequest
+	(*RowBatch)(nil),                    // 9: tangdb.v1.RowBatch
+	(*BeginTxnRequest)(nil),             // 10: tangdb.v1.BeginTxnRequest
+	(*BeginTxnResponse)(nil),            // 11: tangdb.v1.BeginTxnResponse
+	(*CommitTxnRequest)(nil),            // 12: tangdb.v1.CommitTxnRequest
+	(*CommitTxnResponse)(nil),           // 13: tangdb.v1.CommitTxnResponse
+	(*AbortTxnRequest)(nil),             // 14: tangdb.v1.AbortTxnRequest
+	(*AbortTxnResponse)(nil),            // 15: tangdb.v1.AbortTxnResponse
+	(*VectorIndexDefinition)(nil),       // 16: tangdb.v1.VectorIndexDefinition
+	(*RegisterVectorIndexRequest)(nil),  // 17: tangdb.v1.RegisterVectorIndexRequest
+	(*RegisterVectorIndexResponse)(nil), // 18: tangdb.v1.RegisterVectorIndexResponse
+	(*DropVectorIndexRequest)(nil),      // 19: tangdb.v1.DropVectorIndexRequest
+	(*DropVectorIndexResponse)(nil),     // 20: tangdb.v1.DropVectorIndexResponse
+	(*SearchVectorIndexRequest)(nil),    // 21: tangdb.v1.SearchVectorIndexRequest
+	(*VectorCandidate)(nil),             // 22: tangdb.v1.VectorCandidate
+	(*SearchVectorIndexResponse)(nil),   // 23: tangdb.v1.SearchVectorIndexResponse
+	(*BatchGetRequest)(nil),             // 24: tangdb.v1.BatchGetRequest
+	(*BatchGetResponse)(nil),            // 25: tangdb.v1.BatchGetResponse
+	(*VectorIndexStatusRequest)(nil),    // 26: tangdb.v1.VectorIndexStatusRequest
+	(*VectorIndexStatusResponse)(nil),   // 27: tangdb.v1.VectorIndexStatusResponse
+	(*RegisterBeRequest)(nil),           // 28: tangdb.v1.RegisterBeRequest
+	(*RegisterBeResponse)(nil),          // 29: tangdb.v1.RegisterBeResponse
+	(*HeartbeatRequest)(nil),            // 30: tangdb.v1.HeartbeatRequest
+	(*HeartbeatResponse)(nil),           // 31: tangdb.v1.HeartbeatResponse
 }
 var file_tangdb_proto_depIdxs = []int32{
 	0,  // 0: tangdb.v1.PutResponse.status:type_name -> tangdb.v1.StatusCode
@@ -1568,31 +2511,49 @@ var file_tangdb_proto_depIdxs = []int32{
 	7,  // 5: tangdb.v1.CommitTxnRequest.writes:type_name -> tangdb.v1.Kv
 	0,  // 6: tangdb.v1.CommitTxnResponse.status:type_name -> tangdb.v1.StatusCode
 	0,  // 7: tangdb.v1.AbortTxnResponse.status:type_name -> tangdb.v1.StatusCode
-	0,  // 8: tangdb.v1.RegisterBeResponse.status:type_name -> tangdb.v1.StatusCode
-	0,  // 9: tangdb.v1.HeartbeatResponse.status:type_name -> tangdb.v1.StatusCode
-	1,  // 10: tangdb.v1.TangDb.Ping:input_type -> tangdb.v1.PingRequest
-	3,  // 11: tangdb.v1.TangDb.Put:input_type -> tangdb.v1.PutRequest
-	5,  // 12: tangdb.v1.TangDb.Get:input_type -> tangdb.v1.GetRequest
-	8,  // 13: tangdb.v1.TangDb.Scan:input_type -> tangdb.v1.ScanRequest
-	10, // 14: tangdb.v1.TangDb.BeginTxn:input_type -> tangdb.v1.BeginTxnRequest
-	12, // 15: tangdb.v1.TangDb.CommitTxn:input_type -> tangdb.v1.CommitTxnRequest
-	14, // 16: tangdb.v1.TangDb.AbortTxn:input_type -> tangdb.v1.AbortTxnRequest
-	16, // 17: tangdb.v1.TangDbFrontend.RegisterBe:input_type -> tangdb.v1.RegisterBeRequest
-	18, // 18: tangdb.v1.TangDbFrontend.ReportHeartbeat:input_type -> tangdb.v1.HeartbeatRequest
-	2,  // 19: tangdb.v1.TangDb.Ping:output_type -> tangdb.v1.PingResponse
-	4,  // 20: tangdb.v1.TangDb.Put:output_type -> tangdb.v1.PutResponse
-	6,  // 21: tangdb.v1.TangDb.Get:output_type -> tangdb.v1.GetResponse
-	9,  // 22: tangdb.v1.TangDb.Scan:output_type -> tangdb.v1.RowBatch
-	11, // 23: tangdb.v1.TangDb.BeginTxn:output_type -> tangdb.v1.BeginTxnResponse
-	13, // 24: tangdb.v1.TangDb.CommitTxn:output_type -> tangdb.v1.CommitTxnResponse
-	15, // 25: tangdb.v1.TangDb.AbortTxn:output_type -> tangdb.v1.AbortTxnResponse
-	17, // 26: tangdb.v1.TangDbFrontend.RegisterBe:output_type -> tangdb.v1.RegisterBeResponse
-	19, // 27: tangdb.v1.TangDbFrontend.ReportHeartbeat:output_type -> tangdb.v1.HeartbeatResponse
-	19, // [19:28] is the sub-list for method output_type
-	10, // [10:19] is the sub-list for method input_type
-	10, // [10:10] is the sub-list for extension type_name
-	10, // [10:10] is the sub-list for extension extendee
-	0,  // [0:10] is the sub-list for field type_name
+	16, // 8: tangdb.v1.RegisterVectorIndexRequest.definition:type_name -> tangdb.v1.VectorIndexDefinition
+	0,  // 9: tangdb.v1.RegisterVectorIndexResponse.status:type_name -> tangdb.v1.StatusCode
+	0,  // 10: tangdb.v1.DropVectorIndexResponse.status:type_name -> tangdb.v1.StatusCode
+	0,  // 11: tangdb.v1.SearchVectorIndexResponse.status:type_name -> tangdb.v1.StatusCode
+	22, // 12: tangdb.v1.SearchVectorIndexResponse.candidates:type_name -> tangdb.v1.VectorCandidate
+	0,  // 13: tangdb.v1.BatchGetResponse.status:type_name -> tangdb.v1.StatusCode
+	7,  // 14: tangdb.v1.BatchGetResponse.rows:type_name -> tangdb.v1.Kv
+	0,  // 15: tangdb.v1.VectorIndexStatusResponse.status:type_name -> tangdb.v1.StatusCode
+	0,  // 16: tangdb.v1.RegisterBeResponse.status:type_name -> tangdb.v1.StatusCode
+	0,  // 17: tangdb.v1.HeartbeatResponse.status:type_name -> tangdb.v1.StatusCode
+	1,  // 18: tangdb.v1.TangDb.Ping:input_type -> tangdb.v1.PingRequest
+	3,  // 19: tangdb.v1.TangDb.Put:input_type -> tangdb.v1.PutRequest
+	5,  // 20: tangdb.v1.TangDb.Get:input_type -> tangdb.v1.GetRequest
+	8,  // 21: tangdb.v1.TangDb.Scan:input_type -> tangdb.v1.ScanRequest
+	10, // 22: tangdb.v1.TangDb.BeginTxn:input_type -> tangdb.v1.BeginTxnRequest
+	12, // 23: tangdb.v1.TangDb.CommitTxn:input_type -> tangdb.v1.CommitTxnRequest
+	14, // 24: tangdb.v1.TangDb.AbortTxn:input_type -> tangdb.v1.AbortTxnRequest
+	17, // 25: tangdb.v1.TangDb.RegisterVectorIndex:input_type -> tangdb.v1.RegisterVectorIndexRequest
+	19, // 26: tangdb.v1.TangDb.DropVectorIndex:input_type -> tangdb.v1.DropVectorIndexRequest
+	21, // 27: tangdb.v1.TangDb.SearchVectorIndex:input_type -> tangdb.v1.SearchVectorIndexRequest
+	26, // 28: tangdb.v1.TangDb.VectorIndexStatus:input_type -> tangdb.v1.VectorIndexStatusRequest
+	24, // 29: tangdb.v1.TangDb.BatchGet:input_type -> tangdb.v1.BatchGetRequest
+	28, // 30: tangdb.v1.TangDbFrontend.RegisterBe:input_type -> tangdb.v1.RegisterBeRequest
+	30, // 31: tangdb.v1.TangDbFrontend.ReportHeartbeat:input_type -> tangdb.v1.HeartbeatRequest
+	2,  // 32: tangdb.v1.TangDb.Ping:output_type -> tangdb.v1.PingResponse
+	4,  // 33: tangdb.v1.TangDb.Put:output_type -> tangdb.v1.PutResponse
+	6,  // 34: tangdb.v1.TangDb.Get:output_type -> tangdb.v1.GetResponse
+	9,  // 35: tangdb.v1.TangDb.Scan:output_type -> tangdb.v1.RowBatch
+	11, // 36: tangdb.v1.TangDb.BeginTxn:output_type -> tangdb.v1.BeginTxnResponse
+	13, // 37: tangdb.v1.TangDb.CommitTxn:output_type -> tangdb.v1.CommitTxnResponse
+	15, // 38: tangdb.v1.TangDb.AbortTxn:output_type -> tangdb.v1.AbortTxnResponse
+	18, // 39: tangdb.v1.TangDb.RegisterVectorIndex:output_type -> tangdb.v1.RegisterVectorIndexResponse
+	20, // 40: tangdb.v1.TangDb.DropVectorIndex:output_type -> tangdb.v1.DropVectorIndexResponse
+	23, // 41: tangdb.v1.TangDb.SearchVectorIndex:output_type -> tangdb.v1.SearchVectorIndexResponse
+	27, // 42: tangdb.v1.TangDb.VectorIndexStatus:output_type -> tangdb.v1.VectorIndexStatusResponse
+	25, // 43: tangdb.v1.TangDb.BatchGet:output_type -> tangdb.v1.BatchGetResponse
+	29, // 44: tangdb.v1.TangDbFrontend.RegisterBe:output_type -> tangdb.v1.RegisterBeResponse
+	31, // 45: tangdb.v1.TangDbFrontend.ReportHeartbeat:output_type -> tangdb.v1.HeartbeatResponse
+	32, // [32:46] is the sub-list for method output_type
+	18, // [18:32] is the sub-list for method input_type
+	18, // [18:18] is the sub-list for extension type_name
+	18, // [18:18] is the sub-list for extension extendee
+	0,  // [0:18] is the sub-list for field type_name
 }
 
 func init() { file_tangdb_proto_init() }
@@ -1606,7 +2567,7 @@ func file_tangdb_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_tangdb_proto_rawDesc), len(file_tangdb_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   19,
+			NumMessages:   31,
 			NumExtensions: 0,
 			NumServices:   2,
 		},

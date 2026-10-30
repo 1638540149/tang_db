@@ -15,6 +15,7 @@ import com.wangyu.tangdb.storage.KeyValue;
 import com.wangyu.tangdb.storage.KvStore;
 import com.wangyu.tangdb.storage.RowCodec;
 import com.wangyu.tangdb.storage.TableMeta;
+import com.wangyu.tangdb.storage.VectorValues;
 import com.wangyu.tangdb.txn.ReadView;
 
 import java.nio.file.Path;
@@ -28,6 +29,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.logging.Logger;
 
 /**
  * P5/P6 查询引擎(SPEC-P6 B ~ G 组)。
@@ -43,15 +45,24 @@ import java.util.Set;
  */
 public final class QueryEngine {
 
+    private static final Logger LOG = Logger.getLogger(QueryEngine.class.getName());
+    /** SPEC-P7.1 边界 161:打点日志限流(并发 8 线程时不让日志成为瓶颈)。 */
+    private static final java.util.concurrent.atomic.AtomicLong PROFILE_LOG_AT =
+            new java.util.concurrent.atomic.AtomicLong();
+
     /** 运行参数(来自配置)。 */
     public record Options(String currentDatabase, int batchRows, long sortSpillBytes,
                           Path sortTmpDir, boolean vectorized,
                           com.wangyu.tangdb.planner.OptimizerConfig optimizer,
                           com.wangyu.tangdb.stats.StatsService stats,
                           com.wangyu.tangdb.execute.VirtualTables virtualTables,
-                          int parallelism, boolean pushdown, int scanBatchRows) {
+                          int parallelism, boolean pushdown, int scanBatchRows,
+                          P7Options p7) {
 
         public Options {
+            if (p7 == null) {
+                p7 = P7Options.defaults();
+            }
             if (optimizer == null) {
                 optimizer = com.wangyu.tangdb.planner.OptimizerConfig.defaults();
             }
@@ -64,6 +75,18 @@ public final class QueryEngine {
             if (scanBatchRows < 1) {
                 scanBatchRows = batchRows;
             }
+        }
+
+        /** P6.1 形态的 11 参构造(P7 配置取默认值)。 */
+        public Options(String currentDatabase, int batchRows, long sortSpillBytes,
+                       Path sortTmpDir, boolean vectorized,
+                       com.wangyu.tangdb.planner.OptimizerConfig optimizer,
+                       com.wangyu.tangdb.stats.StatsService stats,
+                       com.wangyu.tangdb.execute.VirtualTables virtualTables,
+                       int parallelism, boolean pushdown, int scanBatchRows) {
+            this(currentDatabase, batchRows, sortSpillBytes, sortTmpDir, vectorized, optimizer,
+                    stats, virtualTables, parallelism, pushdown, scanBatchRows,
+                    P7Options.defaults());
         }
 
         /** P6 之前形态的 7 参构造(虚拟表为空)。 */
@@ -98,13 +121,20 @@ public final class QueryEngine {
             return new Options(currentDatabase, batchRows, sortSpillBytes, sortTmpDir, vectorized,
                     optimizer, stats, tables == null
                     ? com.wangyu.tangdb.execute.VirtualTables.NONE : tables,
-                    parallelism, pushdown, scanBatchRows);
+                    parallelism, pushdown, scanBatchRows, p7);
         }
 
         /** 设置 SPEC-P6.1 的执行层参数(并行度 / 下推开关 / 扫描批)。 */
         public Options withExecution(int parallelism, boolean pushdown, int scanBatchRows) {
             return new Options(currentDatabase, batchRows, sortSpillBytes, sortTmpDir, vectorized,
-                    optimizer, stats, virtualTables, parallelism, pushdown, scanBatchRows);
+                    optimizer, stats, virtualTables, parallelism, pushdown, scanBatchRows, p7);
+        }
+
+        /** 设置 SPEC-P7 的向量检索参数(门限见 §5.4;会话开关 exact / path 也在里面)。 */
+        public Options withP7(P7Options options) {
+            return new Options(currentDatabase, batchRows, sortSpillBytes, sortTmpDir, vectorized,
+                    optimizer, stats, virtualTables, parallelism, pushdown, scanBatchRows,
+                    options == null ? P7Options.defaults() : options);
         }
 
         public static Options defaults(String database) {
@@ -115,7 +145,17 @@ public final class QueryEngine {
         public boolean cbo() {
             return optimizer.enabled();
         }
+
+        public P7Options p7() {
+            return p7;
+        }
     }
+
+    /** SPEC-P7 FR-753:LIMIT 缺省 10,上限 1,000。 */
+    private static final int DEFAULT_VECTOR_K = 10;
+    private static final int MAX_VECTOR_K = 1_000;
+    /** K168:允许集 ≤ 1 万用主键集合,超了退化为布隆过滤器。 */
+    private static final int ALLOW_LIST_KEY_LIMIT = 10_000;
 
     private final KvStore kv;
     private final Catalog catalog;
@@ -215,7 +255,7 @@ public final class QueryEngine {
         if (containsSubquery(body.where())) {
             return null; // 子查询要预求值,交给物化路径
         }
-        if (!view.isLatest()
+        if (!view.isLatest() || !view.supportsProjection()
                 || !(kv instanceof com.wangyu.tangdb.storage.CursoredStore cursored)) {
             return null;
         }
@@ -365,7 +405,14 @@ public final class QueryEngine {
     /** 行结果(单测 / 子查询复用)。 */
     public Relation run(Ast.QueryBody body) {
         if (body.from() == null) {
+            VectorExpression.validateUsage(body, null);
             return runWithoutFrom(body);
+        }
+        long planStart = System.nanoTime();
+        VectorPlan vector = vectorPlan(body);
+        if (vector != null) {
+            vector.planMs = (System.nanoTime() - planStart) / 1_000_000.0;
+            return runVector(vector, body);
         }
         FromPlan plan = buildFromPlan(body);
         Relation source = executeFromPlan(plan, body);
@@ -1043,7 +1090,8 @@ public final class QueryEngine {
                     new com.wangyu.tangdb.storage.ScanOptions(options.scanBatchRows(),
                             projection.mask(), projection.columnSlots(), projection.rowFrame(),
                             predicate, true);
-            List<KeyValue> projected = scanShards(start, end, scanLimit, scanOptions);
+            List<KeyValue> projected = scanShards(start, end, scanLimit, scanOptions,
+                    source.estimatedRows);
             // SPEC-P6.1 FR-716:解码复用缓冲(短值/数值装箱缓存),只保留每行一个结果数组。
             com.wangyu.tangdb.storage.ProjectedCodec.Decoder decoder =
                     new com.wangyu.tangdb.storage.ProjectedCodec.Decoder(table, projection);
@@ -1058,7 +1106,7 @@ public final class QueryEngine {
             return new Relation(source.schema, rows, source.estimatedRows, seq);
         }
 
-        List<KeyValue> kvs = scanShards(start, end, scanLimit, null);
+        List<KeyValue> kvs = scanShards(start, end, scanLimit, null, source.estimatedRows);
         for (KeyValue row : kvs) {
             if (KeyCodec.indexId(row.key()) != KeyCodec.INDEX_ID_PRIMARY) {
                 continue;
@@ -1099,10 +1147,15 @@ public final class QueryEngine {
      * </ul>
      */
     private List<KeyValue> scanShards(byte[] start, byte[] end, int limit,
-                                      com.wangyu.tangdb.storage.ScanOptions scanOptions) {
+                                      com.wangyu.tangdb.storage.ScanOptions scanOptions,
+                                      long estimatedRows) {
         int shards = this.options.parallelism();
+        // SPEC-P7 FR-784 / SC-435:扫描层并行阈值 —— 估算规模低于 parallel_min_rows 时不切分片,
+        // 免掉线程池 + N 次 RPC 的固定开销(小查询并行是负收益)。
+        boolean bigEnough = estimatedRows < 0
+                || estimatedRows >= options.p7().parallelMinRows();
         boolean canParallel = shards > 1 && limit <= 0 && view.isLatest()
-                && start != null && end != null && end.length > 0
+                && start != null && end != null && end.length > 0 && bigEnough
                 && kv instanceof com.wangyu.tangdb.storage.ProjectingStore;
         if (!canParallel) {
             return scanOptions == null ? view.scan(start, end, limit)
@@ -1211,7 +1264,7 @@ public final class QueryEngine {
      */
     private com.wangyu.tangdb.storage.ProjectedCodec.Plan projectionFor(SourcePlan source,
                                                                        TableMeta table) {
-        if (!options.pushdown() || table == null) {
+        if (!options.pushdown() || table == null || !view.supportsProjection()) {
             return null;
         }
         boolean[] needed = source.needed == null ? allColumns(table) : source.needed;
@@ -3150,6 +3203,665 @@ public final class QueryEngine {
     // ------------------------------------------------------------ EXPLAIN
 
     /** EXPLAIN 用的计划文本(与实际执行共用同一套估算与选择)。 */
+    // ============================================================ SPEC-P7:C/D 组向量检索
+
+    /**
+     * 一次向量检索的规划结果(EXPLAIN 与执行共用,FR-740 / FR-771 / FR-788)。
+     *
+     * <p>执行后回填四个自描述字段 {@code approximate / efUsed / candidatesExamined / partial}
+     * (FR-761),CLI 注释与 {@code WITH VECTOR INFO} 都从这里取。</p>
+     */
+    public static final class VectorPlan {
+        final TableMeta table;
+        final String qualifier;
+        final Column column;
+        final Ast.Func func;
+        final int metric;
+        final float[] queryVector;
+        final int limit;
+        final int offset;
+        final boolean hasLimit;
+        final Ast.Expr where;
+        final Ast.Expr pushedWhere;
+        String path = "exact";
+        String mode = "精确(暴力)";
+        String note = "";
+        double selectivity = -1;
+        boolean statsFresh;
+        long rowCount = -1;
+        String allowListSource;
+        int allowListSize = -1;
+        public int efUsed;
+        public int candidatesExamined;
+        public boolean approximate;
+        public boolean partial;
+        long millis;
+        /** SPEC-P7.1 K181:BE 五段耗时(KEY=VALUE);空表示未开启打点。 */
+        public String beProfile = "";
+        /** SPEC-P7.1 K181:FE 侧三段耗时(候选回表 / 解码 / 打分),单位毫秒。 */
+        double feFetchMs;
+        double feDecodeMs;
+        double feScoreMs;
+        /** 选路耗时(含"没有统计时数行数"的兜底扫描)。 */
+        double planMs;
+
+        /** 分段耗时一行(EXPLAIN 可选行 / 诊断输出共用,K181)。 */
+        public String profileLine() {
+            if (beProfile == null || beProfile.isEmpty()) {
+                return "";
+            }
+            return String.format(Locale.ROOT,
+                    "分段耗时: BE[%s] FE[plan=%.2fms fetch=%.2fms decode=%.2fms score=%.2fms]",
+                    beProfile, planMs, feFetchMs, feDecodeMs, feScoreMs);
+        }
+
+        VectorPlan(TableMeta table, String qualifier, Column column, Ast.Func func, int metric,
+                   float[] queryVector, int limit, boolean hasLimit, int offset,
+                   Ast.Expr where, Ast.Expr pushedWhere) {
+            this.table = table;
+            this.qualifier = qualifier;
+            this.column = column;
+            this.func = func;
+            this.metric = metric;
+            this.queryVector = queryVector;
+            this.limit = limit;
+            this.hasLimit = hasLimit;
+            this.offset = offset;
+            this.where = where;
+            this.pushedWhere = pushedWhere;
+        }
+
+        public boolean isExact() {
+            return !approximate;
+        }
+
+        /** EXPLAIN / CLI 注释共用的一行(FR-788)。 */
+        public String describeLine() {
+            return VectorExpression.describe(path, mode, efUsed, candidatesExamined, partial,
+                    selectivity, allowListSource);
+        }
+    }
+
+    /**
+     * 识别"向量 ORDER BY"并做选路(SPEC-P7 C/D 组)。
+     *
+     * @return null 表示不是可走向量检索的形态(调用方走普通排序路径)
+     */
+    private VectorPlan vectorPlan(Ast.QueryBody body) {
+        if (!body.from().joins().isEmpty()) {
+            VectorExpression.validateUsage(body, null);
+            return null;
+        }
+        Ast.FromItem item = body.from().first();
+        if (item == null || item.subquery() != null || isVirtual(item)) {
+            VectorExpression.validateUsage(body, null);
+            return null;
+        }
+        TableMeta table = tableOf(item);
+        VectorExpression.validateUsage(body, table);
+        Ast.Func func = VectorExpression.distanceOrderBy(body);
+        if (func == null) {
+            return null;
+        }
+        VectorExpression.QueryOperand operand = VectorExpression.queryOperand(func, table);
+        if (operand == null) {
+            // 两列之间算距离:没有"查询向量",退回普通全量排序(FR-735 允许两列)
+            return null;
+        }
+        if (!body.groupBy().isEmpty() || body.having() != null || body.distinct()) {
+            throw new SqlError(SqlError.ER_NOT_SUPPORTED_YET, "42000",
+                    "向量检索不支持 GROUP BY / HAVING / DISTINCT(先检索后聚合不在本期范围)");
+        }
+        Integer limit = body.limit();
+        if (limit != null && limit > MAX_VECTOR_K) {
+            throw new SqlError(SqlError.ER_NOT_SUPPORTED_YET, "42000",
+                    "向量检索的 LIMIT 上限是 " + MAX_VECTOR_K + "(实际 " + limit + ",FR-753)");
+        }
+        int k = limit == null ? DEFAULT_VECTOR_K : limit;
+        int offset = body.offset() == null ? 0 : body.offset();
+
+        VectorPlan plan = new VectorPlan(table, qualifierOf(item), operand.column(), func,
+                VectorExpression.metricOf(func), operand.vector(), k, limit != null, offset,
+                body.where(), pushedWhereFor(item, body.where(), table));
+
+        P7Options p7 = options.p7();
+        com.wangyu.tangdb.stats.TableStats tableStats = options.stats() == null ? null
+                : options.stats().tableStats(table);
+        plan.statsFresh = options.stats() != null && tableStats != null
+                && !options.stats().isStale(tableStats);
+        if (plan.statsFresh) {
+            plan.rowCount = Math.max(0, tableStats.rowCount());
+            if (body.where() != null) {
+                try {
+                    plan.selectivity = Math.min(1.0,
+                            Math.max(0.0, estimator.selectivity(body.where(), table)));
+                } catch (RuntimeException e) {
+                    plan.selectivity = -1;
+                }
+            } else {
+                plan.selectivity = 1.0;
+            }
+        } else {
+            plan.rowCount = liveRowCount(table);
+        }
+        com.wangyu.tangdb.storage.VectorIndexMeta vectorIndex = catalog.vectorIndexOnColumn(
+                table.id(), operand.column().name());
+
+        // ---- 精确 / 近似(FR-759 ~ FR-762)----
+        if (p7.vectorExact()) {
+            plan.path = "exact";
+            plan.mode = "精确(暴力,强制 exact)";
+            plan.note = "会话/exact 开关强制精确检索";
+            return plan;
+        }
+        // 图还没建完(BUILDING)也可以走 ANN:BE 会对没有图的段退化为暴力(FR-748),
+        // 所以这里只要求"索引存在且未删除"。
+        boolean annAvailable = vectorStore() != null && vectorIndex != null
+                && !vectorIndex.dropped();
+        if (plan.rowCount >= 0 && plan.rowCount < p7.vectorBruteforceRows()) {
+            plan.path = "exact";
+            plan.mode = "精确(暴力,小表)";
+            plan.note = "表行数 " + plan.rowCount + " < vector_bruteforce_rows="
+                    + p7.vectorBruteforceRows() + "(K175)";
+            return plan;
+        }
+        if (!annAvailable) {
+            plan.path = "exact";
+            plan.mode = "精确(暴力)";
+            plan.note = vectorIndex == null
+                    ? "该向量列没有向量索引 → 精确暴力"
+                    : "向量索引状态 " + vectorIndex.stateName() + " → 精确暴力";
+            return plan;
+        }
+
+        // ---- 混合查询选路 A / B(K167;统计 stale 一律 B)----
+        String forced = p7.vectorPath();
+        plan.efUsed = p7.vectorEfSearch();
+        if (body.where() == null) {
+            plan.path = "ann";
+            plan.mode = "近似";
+            plan.note = "无结构化谓词,走 ANN(每段 top-k → 归并)";
+            return plan;
+        }
+        if (P7Options.PATH_B.equals(forced)) {
+            plan.path = "B";
+            plan.mode = "近似";
+            plan.note = "会话强制路径 B(先检索后过滤)";
+            return plan;
+        }
+        if (P7Options.PATH_A.equals(forced)) {
+            plan.path = "A";
+            plan.mode = "近似";
+            plan.note = "会话强制路径 A(先过滤后检索)";
+            plan.allowListSource = "allow-list 主键集合(强制)";
+            return plan;
+        }
+        if (!plan.statsFresh) {
+            plan.path = "B";
+            plan.mode = "近似";
+            plan.note = "统计缺失/过期,不赌 → 退化路径 B(FR-767 / K167)";
+            return plan;
+        }
+        double sel = plan.selectivity < 0 ? 1.0 : plan.selectivity;
+        long allowRows = Math.round(plan.rowCount * sel);
+        if (sel <= 0.1 && allowRows <= plan.rowCount * p7.allowListMaxRatio()) {
+            plan.path = "A";
+            plan.mode = "近似";
+            plan.note = "选择率 " + String.format(Locale.ROOT, "%.4f", sel)
+                    + " ≤ 0.1,允许集 " + allowRows + " 行 → 路径 A(K167)";
+            plan.allowListSource = allowRows <= ALLOW_LIST_KEY_LIMIT
+                    ? "allow-list 主键集合(" + allowRows + " 行)"
+                    : "allow-list 布隆过滤器(允许集超 " + ALLOW_LIST_KEY_LIMIT + " 行,K182)";
+            return plan;
+        }
+        if (sel < 0.3 && allowRows <= plan.rowCount * p7.allowListMaxRatio()) {
+            // 0.1 ~ 0.3:比代价 —— 路径 A 要物化允许集(行数×选择率),路径 B 要候选扩展。
+            boolean aCheaper = allowRows <= Math.max(1, p7.vectorEfMax());
+            plan.path = aCheaper ? "A" : "B";
+            plan.mode = "近似";
+            plan.note = "选择率 " + String.format(Locale.ROOT, "%.4f", sel)
+                    + "(0.1~0.3):允许集 " + allowRows + " 行 vs ef_max=" + p7.vectorEfMax()
+                    + " → 路径 " + plan.path;
+            if (aCheaper) {
+                plan.allowListSource = allowRows <= ALLOW_LIST_KEY_LIMIT
+                        ? "allow-list 主键集合(" + allowRows + " 行)"
+                        : "allow-list 布隆过滤器(" + allowRows + " 行)";
+            }
+            return plan;
+        }
+        plan.path = "B";
+        plan.mode = "近似";
+        plan.note = "选择率 " + String.format(Locale.ROOT, "%.4f", sel)
+                + " > 0.3 或允许集过大 → 路径 B(K167 / FR-769)";
+        return plan;
+    }
+
+    /** 单表谓词里已下推的部分(路径 A 用它先扫出允许集)。 */
+    private Ast.Expr pushedWhereFor(Ast.FromItem item, Ast.Expr where, TableMeta table) {
+        if (where == null || table == null) {
+            return null;
+        }
+        String qualifier = qualifierOf(item).toLowerCase(Locale.ROOT);
+        List<Ast.Expr> conjuncts = new ArrayList<>();
+        flattenAnd(where, conjuncts);
+        List<Ast.Expr> usable = new ArrayList<>();
+        for (Ast.Expr conjunct : conjuncts) {
+            if (containsSubquery(conjunct)) {
+                continue;
+            }
+            Set<String> quals = qualifiersOf(conjunct);
+            if (quals.isEmpty() || (quals.size() == 1 && quals.contains(qualifier))) {
+                usable.add(conjunct);
+            }
+        }
+        return and(usable);
+    }
+
+    /**
+     * 表行数估计(选路用):有统计就用统计的 row_count —— 即使统计已过期,行数量级也还对;
+     * 完全没有统计时才有上限地数一遍(避免每次向量查询都扫 1 万行)。
+     */
+    private long liveRowCount(TableMeta table) {
+        if (options.stats() != null) {
+            com.wangyu.tangdb.stats.TableStats ts = options.stats().tableStats(table);
+            if (ts != null) {
+                return Math.max(0, ts.rowCount());
+            }
+        }
+        int cap = Math.max(options.p7().vectorBruteforceRows(),
+                options.p7().exactFallbackRows()) + 1;
+        int n = 0;
+        for (KeyValue kv : view.scan(KeyCodec.tableRangeStart(table.id()),
+                KeyCodec.tableRangeEnd(table.id()), cap)) {
+            if (KeyCodec.indexId(kv.key()) == KeyCodec.INDEX_ID_PRIMARY) {
+                n++;
+            }
+        }
+        return n;
+    }
+
+    /** 向量检索执行入口(精确 / ANN / 混合路径)。 */
+    private Relation runVector(VectorPlan plan, Ast.QueryBody body) {
+        long started = System.nanoTime();
+        Relation result;
+        try {
+            result = switch (plan.path) {
+                case "A" -> runVectorPathA(plan, body);
+                case "B", "ann" -> runVectorAnn(plan, body);
+                default -> runVectorExact(plan, body);
+            };
+        } finally {
+            plan.millis = (System.nanoTime() - started) / 1_000_000L;
+        }
+        lastVectorPlan = plan;
+        logVectorProfile(plan);
+        return result;
+    }
+
+    /**
+     * 向量索引 RPC 通道:真实 BE 客户端实现 {@link com.wangyu.tangdb.storage.VectorStore};
+     * 内存实现(单测)没有该能力 → 选路一律精确暴力。
+     */
+    private com.wangyu.tangdb.storage.VectorStore vectorStore() {
+        return kv instanceof com.wangyu.tangdb.storage.VectorStore store ? store : null;
+    }
+
+    /**
+     * SPEC-P7.1 K181:开启 {@code SET vector_profile = ON} 时把五段耗时写进 fed 日志。
+     *
+     * <p>限流 1 秒一条(边界 161):并发 8 线程时每秒最多一条日志,计时结果本身照常
+     * 保存在 {@link VectorPlan#beProfile} 里(程序化读取不受限流影响)。</p>
+     */
+    private static void logVectorProfile(VectorPlan plan) {
+        String line = plan == null ? "" : plan.profileLine();
+        if (line.isEmpty()) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        long last = PROFILE_LOG_AT.get();
+        if (now - last < 1000 || !PROFILE_LOG_AT.compareAndSet(last, now)) {
+            return;
+        }
+        LOG.info(line);
+    }
+
+    /** 最近一次向量检索的规划(供 CLI 注释 / WITH VECTOR INFO 读取,K164)。 */
+    private VectorPlan lastVectorPlan;
+
+    public VectorPlan lastVectorPlan() {
+        return lastVectorPlan;
+    }
+
+    /**
+     * 近似检索(SPEC-P7 C 组,FR-754 ~ FR-759):
+     *
+     * <pre>
+     * 每段 top-ef → 归并(MVCC 过滤在 BE)→ FE 回表 + 精确打分 + 结构化谓词过滤
+     *   → 不足 k 时 ef 翻倍(上限 ef_max)→ 仍不足:小表回退精确暴力,否则标 partial
+     * </pre>
+     *
+     * <p>距离打分与最终排序始终在 FE(精确可控);BE 只负责"图遍历 + 候选键"。
+     * 事务内(!isLatest)退回精确暴力,保证"读己之写"不被图段绕过。</p>
+     */
+    private Relation runVectorAnn(VectorPlan plan, Ast.QueryBody body) {
+        com.wangyu.tangdb.storage.VectorStore store = vectorStore();
+        com.wangyu.tangdb.storage.VectorIndexMeta index = catalog.vectorIndexOnColumn(
+                plan.table.id(), plan.column.name());
+        if (store == null || index == null || index.dropped()) {
+            return runVectorExact(plan, body);
+        }
+        if (!view.isLatest()) {
+            return runVectorExact(plan, body);
+        }
+        P7Options p7 = options.p7();
+        long snapshot = kv.snapshotPin();
+        ReadView pinned = com.wangyu.tangdb.txn.ReadViews.at(kv, snapshot);
+        try {
+            FromPlan fromPlan = buildFromPlan(body);
+            SourcePlan source = fromPlan.sqlOrder.get(0);
+            int need = plan.limit + plan.offset;
+            int ef = Math.max(1, Math.max(p7.vectorEfSearch(), plan.limit));
+            int efMax = Math.max(ef, p7.vectorEfMax());
+            List<ScoredRow> scored = new ArrayList<>();
+            int examined = 0;
+            boolean profile = p7.vectorProfile();
+            while (true) {
+                com.wangyu.tangdb.storage.VectorStore.VectorSearchResult result =
+                        store.searchVector(index.beId(),
+                                VectorValues.toBytes(plan.queryVector), ef,
+                                Math.max(plan.limit, 1), snapshot, null, false, profile);
+                if (profile && !result.profile().isEmpty()) {
+                    plan.beProfile = result.profile();
+                }
+                List<byte[]> keys = result.keys();
+                examined += keys.size(); // candidates_examined = 实际回表请求数(K180)
+                scored = fetchAndScore(pinned, keys, plan, source, body.where(), profile);
+                if (scored.size() >= need || ef >= efMax) {
+                    break;
+                }
+                ef = Math.min(efMax, ef * 2); // 可迭代候选扩展(FR-758,不写死倍数)
+            }
+            plan.efUsed = ef;
+            plan.candidatesExamined = examined;
+            plan.approximate = true;
+            if (scored.size() >= need) {
+                plan.partial = false;
+                return projectVectorResult(body, source, new Scored(scored, null));
+            }
+            // 预算用尽仍不足 k(FR-759 / K166)
+            boolean canFallback = plan.rowCount < 0
+                    || plan.rowCount <= p7.exactFallbackRows();
+            if (canFallback) {
+                return runVectorExact(plan, body); // 精确回退(approximate 会被置 false)
+            }
+            plan.partial = true;
+            return projectVectorResult(body, source, new Scored(scored, null));
+        } finally {
+            kv.snapshotUnpin(snapshot);
+        }
+    }
+
+    /**
+     * 回表 + 精确打分 + 谓词过滤(候选键来自 BE 的图段检索)。
+     *
+     * <p>SPEC-P7.1 K180:全部候选一次 {@code BatchGet} 取回,返回值与 keys 对齐,
+     * 全程不建 {@code map[string]} 中间结构;只对归并后的候选解码一次、打分一次。</p>
+     */
+    private List<ScoredRow> fetchAndScore(ReadView pinned, List<byte[]> keys, VectorPlan plan,
+                                          SourcePlan source, Ast.Expr where, boolean profile) {
+        long fetchStart = System.nanoTime();
+        List<byte[]> fetched;
+        if (kv instanceof com.wangyu.tangdb.storage.VectorStore store && !keys.isEmpty()) {
+            com.wangyu.tangdb.storage.VectorStore.BatchResult batch =
+                    store.batchGetOrdered(keys, pinned.snapshot(), profile);
+            fetched = batch.values();
+            if (profile && batch.profile() != null && !batch.profile().isEmpty()) {
+                plan.beProfile = (plan.beProfile == null || plan.beProfile.isEmpty())
+                        ? batch.profile() : plan.beProfile + " | " + batch.profile();
+            }
+        } else {
+            fetched = new ArrayList<>(keys.size());
+            for (byte[] key : keys) {
+                fetched.add(pinned.get(key));
+            }
+        }
+        if (profile) {
+            plan.feFetchMs += (System.nanoTime() - fetchStart) / 1_000_000.0;
+        }
+        long decodeStart = System.nanoTime();
+        List<Object[]> rows = new ArrayList<>(keys.size());
+        for (int i = 0; i < keys.size(); i++) {
+            byte[] raw = fetched.get(i);
+            if (raw == null || raw.length == 0) {
+                continue;
+            }
+            if (raw[0] == RowCodec.FORMAT_TOMBSTONE) {
+                continue;
+            }
+            RowCodec.Decoded decoded = source.needed == null
+                    ? RowCodec.decode(plan.table, raw)
+                    : RowCodec.decode(plan.table, raw, source.needed);
+            if (decoded.tombstone()) {
+                continue;
+            }
+            rows.add(decoded.values());
+        }
+        if (profile) {
+            plan.feDecodeMs += (System.nanoTime() - decodeStart) / 1_000_000.0;
+        }
+        long filterStart = System.nanoTime();
+        Relation relation = new Relation(source.schema, rows, rows.size(), null);
+        if (where != null) {
+            relation = filter(relation, where);
+        }
+        List<ScoredRow> scored = scoreRows(relation, plan).scored;
+        if (profile) {
+            plan.feScoreMs += (System.nanoTime() - filterStart) / 1_000_000.0;
+        }
+        return scored;
+    }
+
+    /**
+     * 精确暴力:全表算距离 → 按 (距离, 主键) 升序 → offset/limit(FR-755 / FR-760)。
+     */
+    private Relation runVectorExact(VectorPlan plan, Ast.QueryBody body) {
+        FromPlan fromPlan = buildFromPlan(body);
+        SourcePlan source = fromPlan.sqlOrder.get(0);
+        Relation scanned = materialize(source, body, 0);
+        Relation filtered = body.where() == null ? scanned : filter(scanned, body.where());
+        Scored scored = scoreRows(filtered, plan);
+        plan.candidatesExamined = scored.scored.size();
+        plan.approximate = false;
+        plan.efUsed = 0;
+        plan.partial = false;
+        return projectVectorResult(body, source, scored);
+    }
+
+    /**
+     * 路径 A(先过滤后检索,SPEC-P7.1 D 组 / FR-805 / K182)。
+     *
+     * <p>结构化谓词先物化成**允许集**(≤ 1 万主键用键集合,超了换布隆),然后把允许集
+     * 下推给 BE 的图检索 —— {@code Search} 在允许集内展开候选;FE 只对归并后的候选
+     * 回表与精确打分。允许集为空时直接返回 0 行,不发起图检索(边界 157)。</p>
+     *
+     * <p>候选不足 k 时退回"在允许集内精确打分"(结果与图内过滤逐行一致)——
+     * 允许集已物化,这一步是兜底而不是主路径。</p>
+     */
+    private Relation runVectorPathA(VectorPlan plan, Ast.QueryBody body) {
+        com.wangyu.tangdb.storage.VectorStore store = vectorStore();
+        com.wangyu.tangdb.storage.VectorIndexMeta index = catalog.vectorIndexOnColumn(
+                plan.table.id(), plan.column.name());
+        if (store == null || index == null || index.dropped() || !view.isLatest()) {
+            return runVectorPathAExact(plan, body, null);
+        }
+        FromPlan fromPlan = buildFromPlan(body);
+        SourcePlan source = fromPlan.sqlOrder.get(0);
+        Relation scanned = materialize(source, body, 0);
+        Relation filtered = body.where() == null ? scanned : filter(scanned, body.where());
+        plan.allowListSize = filtered.rows.size();
+        if (filtered.rows.isEmpty()) {
+            // FR-770 / 边界 157:过滤后 0 行 → 直接空集,不退化成全表 top-k
+            plan.candidatesExamined = 0;
+            plan.approximate = false;
+            plan.efUsed = 0;
+            plan.partial = false;
+            plan.allowListSource = "allow-list 空集(直接返回 0 行)";
+            return projectVectorResult(body, source, new Scored(new ArrayList<>(), filtered));
+        }
+        P7Options p7 = options.p7();
+        // 允许集编码:主键集合 / 布隆(K182),BE 只按字节匹配主键用户键
+        com.wangyu.tangdb.storage.AllowListCodec.Encoded allow =
+                com.wangyu.tangdb.storage.AllowListCodec.encode(primaryKeys(filtered, plan.table));
+        plan.allowListSource = (allow.bloom() ? "allow-list 布隆过滤器(" : "allow-list 主键集合(")
+                + allow.size() + " 行)";
+
+        long snapshot = kv.snapshotPin();
+        ReadView pinned = com.wangyu.tangdb.txn.ReadViews.at(kv, snapshot);
+        try {
+            int need = plan.limit + plan.offset;
+            int ef = Math.max(1, Math.max(p7.vectorEfSearch(), plan.limit));
+            int efMax = Math.max(ef, p7.vectorEfMax());
+            List<ScoredRow> scored = new ArrayList<>();
+            int examined = 0;
+            boolean profile = p7.vectorProfile();
+            while (true) {
+                com.wangyu.tangdb.storage.VectorStore.VectorSearchResult result =
+                        store.searchVector(index.beId(),
+                                VectorValues.toBytes(plan.queryVector), ef,
+                                Math.max(plan.limit, 1), snapshot,
+                                allow.bytes(), allow.bloom(), profile);
+                if (profile && !result.profile().isEmpty()) {
+                    plan.beProfile = result.profile();
+                }
+                List<byte[]> keys = result.keys();
+                examined += keys.size();
+                // 允许集已经把结构化谓词做完了,回表后不必再过滤(where=null)
+                scored = fetchAndScore(pinned, keys, plan, source, null, profile);
+                if (scored.size() >= need || ef >= efMax) {
+                    break;
+                }
+                ef = Math.min(efMax, ef * 2); // 允许集稀疏时扩展候选(FR-758)
+            }
+            plan.efUsed = ef;
+            plan.candidatesExamined = examined;
+            if (scored.size() >= need) {
+                // 图内允许集候选够用;距离已由 fetchAndScore 精确重算
+                plan.approximate = true;
+                plan.partial = false;
+                return projectVectorResult(body, source, new Scored(scored, null));
+            }
+            // 候选不足:允许集内精确打分兜底(结果与图内过滤逐行一致,召回 100%)
+            return runVectorPathAExact(plan, body, filtered);
+        } finally {
+            kv.snapshotUnpin(snapshot);
+        }
+    }
+
+    /** 路径 A 的兜底形态:在已物化的允许集内精确打分(无图 / 候选不足时用)。 */
+    private Relation runVectorPathAExact(VectorPlan plan, Ast.QueryBody body, Relation filtered) {
+        FromPlan fromPlan = buildFromPlan(body);
+        SourcePlan source = fromPlan.sqlOrder.get(0);
+        if (filtered == null) {
+            Relation scanned = materialize(source, body, 0);
+            filtered = body.where() == null ? scanned : filter(scanned, body.where());
+            plan.allowListSize = filtered.rows.size();
+            if (filtered.rows.isEmpty()) {
+                plan.candidatesExamined = 0;
+                plan.approximate = false;
+                plan.efUsed = 0;
+                plan.partial = false;
+                return projectVectorResult(body, source, new Scored(new ArrayList<>(), filtered));
+            }
+        }
+        Scored scored = scoreRows(filtered, plan);
+        if (!plan.approximate) {
+            plan.candidatesExamined = scored.scored.size();
+        }
+        plan.approximate = false;
+        plan.efUsed = 0;
+        plan.partial = false;
+        return projectVectorResult(body, source, scored);
+    }
+
+    /** 把已物化的行集合投影成 BE 认识的主键用户键(与图节点里的 key 同一套编码)。 */
+    private List<byte[]> primaryKeys(Relation relation, TableMeta table) {
+        Column pk = table.primaryKey();
+        List<byte[]> keys = new ArrayList<>(relation.rows.size());
+        if (pk == null) {
+            return keys;
+        }
+        int ordinal = pk.ordinal();
+        for (Object[] row : relation.rows) {
+            Object value = row[ordinal];
+            if (value == null) {
+                continue;
+            }
+            keys.add(KeyCodec.rowKey(table.id(), pk.type(), value));
+        }
+        return keys;
+    }
+
+    /** 一行及其距离。 */
+    private static final class ScoredRow {
+        final Object[] row;
+        final double distance;
+
+        ScoredRow(Object[] row, double distance) {
+            this.row = row;
+            this.distance = distance;
+        }
+    }
+
+    /** 打分后的行集合(rows 与 source relation 对齐,供投影复用)。 */
+    private static final class Scored {
+        final List<ScoredRow> scored;
+        final Relation source;
+
+        Scored(List<ScoredRow> scored, Relation source) {
+            this.scored = scored;
+            this.source = source;
+        }
+    }
+
+    private Scored scoreRows(Relation relation, VectorPlan plan) {
+        Column pk = plan.table.primaryKey();
+        int pkOrdinal = pk == null ? 0 : pk.ordinal();
+        int ordinal = plan.column.ordinal();
+        List<ScoredRow> out = new ArrayList<>(relation.rows.size());
+        for (Object[] row : relation.rows) {
+            Object raw = row[ordinal];
+            if (raw == null) {
+                continue; // NULL 向量不参与检索
+            }
+            float[] vec = (float[]) raw;
+            out.add(new ScoredRow(row, VectorValues.distance(plan.metric, vec, plan.queryVector)));
+        }
+        final int pkIndex = pkOrdinal;
+        out.sort((a, b) -> {
+            int cmp = Double.compare(a.distance, b.distance);
+            if (cmp != 0) {
+                return cmp;
+            }
+            // FR-755:距离相等按主键升序,保证同一快照下结果可复现
+            return ValueOps.compare(a.row[pkIndex], b.row[pkIndex]);
+        });
+        return new Scored(out, relation);
+    }
+
+    /** 按 (距离,主键) 排序结果做 offset/limit 与投影。 */
+    private Relation projectVectorResult(Ast.QueryBody body, SourcePlan source, Scored scored) {
+        int offset = body.offset() == null ? 0 : body.offset();
+        int from = Math.min(scored.scored.size(), Math.max(0, offset));
+        int want = body.limit() == null ? scored.scored.size() : body.limit();
+        int to = Math.min(scored.scored.size(), from + Math.max(0, want));
+        List<Object[]> kept = new ArrayList<>(Math.max(0, to - from));
+        for (int i = from; i < to; i++) {
+            kept.add(scored.scored.get(i).row);
+        }
+        Projection projected = project(kept, source.schema, body.items(), false, body, Map.of());
+        return new Relation(projected.schema, projected.rows);
+    }
+
     public List<String> explain(Ast.QueryBody body) {
         List<String> lines = new ArrayList<>();
         if (body.from() == null) {
@@ -3251,6 +3963,31 @@ public final class QueryEngine {
         if (totalColumns > 0) {
             lines.add("列: 读取 " + readColumns + " / 表 " + totalColumns + " 列");
         }
+        // SPEC-P7 FR-740 / FR-788:向量检索行(与执行共用同一份 VectorPlan)
+        VectorPlan vectorPlan = vectorPlan(body);
+        if (vectorPlan != null) {
+            lines.add(vectorPlan.describeLine());
+            lines.add("  选路依据: " + vectorPlan.note);
+            lines.add("  查询向量: 维度=" + vectorPlan.queryVector.length
+                    + ", 度量=" + VectorValues.metricName(vectorPlan.metric)
+                    + ", k=" + vectorPlan.limit
+                    + (vectorPlan.hasLimit ? "" : "(无 LIMIT,退化为全排序,边界 130)"));
+            lines.add("  结构化谓词: " + (vectorPlan.where == null ? "无"
+                    : ExprPrinter.print(vectorPlan.where)));
+        }
+        // SPEC-P7 FR-784:扫描层是否并行 + 原因(SC-435)
+        long scanRows = plan.estimatedRows;
+        int par = options.parallelism();
+        String scanParallel;
+        if (par <= 1) {
+            scanParallel = "未并行(并行度=" + par + ")";
+        } else if (scanRows >= 0 && scanRows < options.p7().parallelMinRows()) {
+            scanParallel = "未并行(估算 rows=" + scanRows + " < parallel_min_rows="
+                    + options.p7().parallelMinRows() + ",FR-784)";
+        } else {
+            scanParallel = "并行(并行度=" + par + ",估算 rows=" + scanRows + ")";
+        }
+        lines.add("扫描并行: " + scanParallel);
         // SPEC-P6.1 FR-719 / SC-414:新增"并行/批/下推"行(既有行不变)
         lines.add("并行/批/下推: 并行度=" + options.parallelism()
                 + ", 扫描批=" + options.scanBatchRows()
