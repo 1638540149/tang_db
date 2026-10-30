@@ -57,6 +57,15 @@ public final class SqlEngine {
     private com.wangyu.tangdb.query.P7Options p7 = com.wangyu.tangdb.query.P7Options.defaults();
     /** SPEC-P7 E 组:推理算子(未注入 = 端点未配置,使用 ai_embed 会明确报错)。 */
     private com.wangyu.tangdb.ai.AiService ai;
+    /** SPEC-P8 B 组:两条通道各自计数(边界 186,不串号)。 */
+    private com.wangyu.tangdb.metrics.Metrics mysqlMetrics =
+            com.wangyu.tangdb.metrics.Metrics.DISABLED;
+    private com.wangyu.tangdb.metrics.Metrics consoleMetrics =
+            com.wangyu.tangdb.metrics.Metrics.DISABLED;
+    /** SPEC-P8 C 组:慢查询日志与诊断建议(未注入 = 关闭)。 */
+    private com.wangyu.tangdb.slow.SlowQueryLog slowLog;
+    /** SPEC-P8 D 组:备份 / 恢复编排(未注入 = 相关语句报未启用)。 */
+    private com.wangyu.tangdb.backup.BackupService backups;
 
     public SqlEngine(KvStore kv, Catalog catalog, SessionManager sessions,
                      BackendRegistry backends, boolean heartbeatEnabled, String user) {
@@ -98,6 +107,86 @@ public final class SqlEngine {
         }
         this.ai = service;
         return this;
+    }
+
+    /** SPEC-P8:注入两条通道的指标登记表(FR-822 / 边界 186)。 */
+    public SqlEngine withMetrics(com.wangyu.tangdb.metrics.Metrics mysql,
+                                 com.wangyu.tangdb.metrics.Metrics console) {
+        this.mysqlMetrics = mysql == null ? com.wangyu.tangdb.metrics.Metrics.DISABLED : mysql;
+        this.consoleMetrics = console == null
+                ? com.wangyu.tangdb.metrics.Metrics.DISABLED : console;
+        return this;
+    }
+
+    /** SPEC-P8:注入慢查询日志(FR-831),并把"生成执行计划"的钩子接回同一计划入口。 */
+    public SqlEngine withSlowQueryLog(com.wangyu.tangdb.slow.SlowQueryLog log) {
+        this.slowLog = log;
+        if (log != null) {
+            log.setExplainer(this::explainText);
+        }
+        return this;
+    }
+
+    /** SPEC-P8:注入备份 / 恢复编排(FR-841 ~ FR-850)。 */
+    public SqlEngine withBackupService(com.wangyu.tangdb.backup.BackupService service) {
+        this.backups = service;
+        return this;
+    }
+
+    /** 备份 / 恢复编排(控制台状态区用)。 */
+    public com.wangyu.tangdb.backup.BackupService backupService() {
+        return backups;
+    }
+
+    /** 慢查询日志(控制台状态区 / 诊断用)。 */
+    public com.wangyu.tangdb.slow.SlowQueryLog slowQueryLog() {
+        return slowLog;
+    }
+
+    /**
+     * 生成一条语句的 EXPLAIN 文本(慢查询诊断用)。走同一个计划构造入口(与执行不分叉),
+     * 但用独立执行器,避免影响正在返回的语句的事务状态。
+     */
+    public String explainText(Session session, String sql) {
+        Executor fresh = executor(null);
+        if (session != null) {
+            try {
+                fresh.useDatabase(session.currentDatabase());
+            } catch (RuntimeException ignored) {
+                // 库已删除等:退回默认库
+            }
+        }
+        Result result = fresh.execute(Parser.parse("EXPLAIN " + sql));
+        if (result instanceof Result.Table table) {
+            StringBuilder sb = new StringBuilder();
+            for (Object[] row : table.rows()) {
+                for (Object value : row) {
+                    if (sb.length() > 0) {
+                        sb.append((char) 10);
+                    }
+                    sb.append(value == null ? "NULL" : String.valueOf(value));
+                }
+            }
+            return sb.toString();
+        }
+        if (result instanceof Result.Message message) {
+            return message.text();
+        }
+        return "";
+    }
+
+    /** 协议通道的指标表(控制台 /metrics 读它)。 */
+    public com.wangyu.tangdb.metrics.Metrics metrics() {
+        return mysqlMetrics;
+    }
+
+    /** 控制台通道的指标表。 */
+    public com.wangyu.tangdb.metrics.Metrics consoleMetrics() {
+        return consoleMetrics;
+    }
+
+    private com.wangyu.tangdb.metrics.Metrics metricsFor(Session session) {
+        return session != null && session.console() ? consoleMetrics : mysqlMetrics;
     }
 
     /** 当前执行层参数(启动日志与 EXPLAIN 用)。 */
@@ -194,7 +283,112 @@ public final class SqlEngine {
     /** 执行一条已经切好、去过头注释的语句(原单条路径,兼容层 + Parser + Executor 不改)。 */
     private Result executeOne(Session session, String statement) {
         String upper = statement.toUpperCase(Locale.ROOT);
+        long started = System.nanoTime();
+        com.wangyu.tangdb.metrics.Metrics metrics = metricsFor(session);
+        try {
+            Result result = executeOneInner(session, statement, upper);
+            if (result instanceof Result.StreamTable streaming) {
+                // 流式结果集:真正的扫描发生在协议层逐批取数时,所以耗时在 RowStream 关闭时结算
+                // (否则慢查询与延迟分位只会统计到"构造计划"的时间,SC-450 会漏记)。
+                RowStream timed = new TimedRowStream(streaming.stream(), session, statement,
+                        started, metrics);
+                return new Result.StreamTable(streaming.columns(), timed);
+            }
+            long millis = (System.nanoTime() - started) / 1_000_000L;
+            recordStatement(session, statement, upper, millis, result, 0L, metrics, null);
+            return result;
+        } catch (RuntimeException e) {
+            long millis = (System.nanoTime() - started) / 1_000_000L;
+            SqlError se = e instanceof SqlError error ? error : SqlError.from(e);
+            if (se.code() == SqlError.ER_LOCK_DEADLOCK) {
+                metrics.recordConflict();
+            } else if (se.code() == SqlError.ER_DUP_ENTRY) {
+                metrics.recordUniqueConflict();
+            }
+            recordStatement(session, statement, upper, millis, null, 0L, metrics, se);
+            throw e;
+        }
+    }
 
+    /** 统一记账:指标(FR-822)+ 慢查询(FR-831)。流式结果集在关闭时也走这里。 */
+    private void recordStatement(Session session, String statement, String upper, long millis,
+                                 Result result, long rows, com.wangyu.tangdb.metrics.Metrics metrics,
+                                 SqlError error) {
+        metrics.recordStatement(millis, error == null ? 0 : error.code());
+        if (error == null && upper.startsWith("COMMIT")) {
+            metrics.recordCommit(millis);
+        }
+        if (slowLog == null) {
+            return;
+        }
+        if (error != null) {
+            slowLog.record(session, statement, millis, 0L, error);
+        } else if (rows > 0) {
+            slowLog.record(session, statement, millis, rows, null);
+        } else {
+            slowLog.record(session, statement, millis, result, null);
+        }
+        if (millis >= slowLog.thresholdMs()) {
+            metrics.recordSlowQuery();
+        }
+    }
+
+    /** 给流式结果集加"关闭时结算耗时"的包装(FR-822 / FR-831)。 */
+    private final class TimedRowStream implements RowStream {
+        private final RowStream delegate;
+        private final Session session;
+        private final String statement;
+        private final long startedNanos;
+        private final com.wangyu.tangdb.metrics.Metrics metrics;
+        private long rows;
+        private boolean recorded;
+
+        TimedRowStream(RowStream delegate, Session session, String statement, long startedNanos,
+                       com.wangyu.tangdb.metrics.Metrics metrics) {
+            this.delegate = delegate;
+            this.session = session;
+            this.statement = statement;
+            this.startedNanos = startedNanos;
+            this.metrics = metrics;
+        }
+
+        @Override
+        public List<Object[]> nextBatch() {
+            List<Object[]> batch = delegate.nextBatch();
+            if (batch == null) {
+                finish(null);
+            } else {
+                rows += batch.size();
+            }
+            return batch;
+        }
+
+        @Override
+        public List<String> columns() {
+            return delegate.columns();
+        }
+
+        @Override
+        public void close() {
+            try {
+                delegate.close();
+            } finally {
+                finish(null);
+            }
+        }
+
+        private synchronized void finish(SqlError error) {
+            if (recorded) {
+                return;
+            }
+            recorded = true;
+            long millis = (System.nanoTime() - startedNanos) / 1_000_000L;
+            recordStatement(session, statement, statement.toUpperCase(Locale.ROOT), millis, null,
+                    rows, metrics, error);
+        }
+    }
+
+    private Result executeOneInner(Session session, String statement, String upper) {
         Result compat = handleCompat(session, statement, upper);
         if (compat != null) {
             return compat;
@@ -317,6 +511,19 @@ public final class SqlEngine {
         return i;
     }
 
+    /**
+     * 新建一个裸露的执行器(SPEC-P8 FR-862:控制台会话用它登记到独立会话表,
+     * 不占用 MySQL 连接额度)。参数在每次执行时由 {@link #executor(Session)} 补齐。
+     */
+    public Executor newExecutor() {
+        return new Executor(kv, catalog);
+    }
+
+    /** 当前库(控制台状态区显示用)。 */
+    public String currentDatabase(Session session) {
+        return executor(session).currentDatabase();
+    }
+
     /** 设置会话当前库(COM_INIT_DB / 握手 database),库不存在抛 1049(FR-436 / FR-446)。 */
     public void useDatabase(Session session, String database) {
         executor(session).useDatabase(database);
@@ -384,6 +591,53 @@ public final class SqlEngine {
         }
         if (upper.startsWith("SHOW BACKENDS")) {
             return showBackends();
+        }
+        // SPEC-P8 FR-824:SHOW METRICS [LIKE 'pattern'] —— 与 /metrics 同源同值。
+        if (upper.startsWith("SHOW METRICS")) {
+            return showMetrics(session, statement, upper);
+        }
+        // SPEC-P8 FR-833:慢查询查看(诊断建议与证据在同一行)。
+        if (upper.startsWith("SHOW SLOW QUER")) {
+            return showSlowQueries(statement, upper);
+        }
+        // SPEC-P8 FR-846:备份 / 恢复任务
+        if (upper.startsWith("SHOW BACKUP JOBS")) {
+            return showBackupJobs();
+        }
+        // SPEC-P8 FR-841 / FR-844:备份与恢复(解析在 FE 侧,执行在 BE 侧)
+        if (upper.startsWith("BACKUP ")) {
+            com.wangyu.tangdb.backup.BackupService.ParsedBackup parsed =
+                    com.wangyu.tangdb.backup.BackupService.parseBackup(statement);
+            if (parsed == null) {
+                throw new SqlError(SqlError.ER_SYNTAX_ERROR, "42000",
+                        "BACKUP 语法: BACKUP TO '<目录>' [INCREMENTAL FROM '<上次备份>'] [FORCE]");
+            }
+            if (backups == null) {
+                throw new SqlError(SqlError.ER_NOT_SUPPORTED_YET, "42000", "备份功能未启用");
+            }
+            try {
+                return new Result.Message(backups.backup(parsed.directory(),
+                        parsed.incrementalFrom(), parsed.force()));
+            } catch (RuntimeException e) {
+                throw SqlError.from(e);
+            }
+        }
+        if (upper.startsWith("RESTORE ")) {
+            com.wangyu.tangdb.backup.BackupService.ParsedRestore parsed =
+                    com.wangyu.tangdb.backup.BackupService.parseRestore(statement);
+            if (parsed == null) {
+                throw new SqlError(SqlError.ER_SYNTAX_ERROR, "42000",
+                        "RESTORE 语法: RESTORE FROM '<备份目录>' [TO '<目标目录>'] [FORCE]");
+            }
+            if (backups == null) {
+                throw new SqlError(SqlError.ER_NOT_SUPPORTED_YET, "42000", "备份功能未启用");
+            }
+            try {
+                return new Result.Message(backups.restore(parsed.source(), parsed.target(),
+                        parsed.force()));
+            } catch (RuntimeException e) {
+                throw SqlError.from(e);
+            }
         }
 
         // information_schema 虚拟表:走 Parser + MetaCommands(K92 / K94 / K98)。
@@ -554,6 +808,116 @@ public final class SqlEngine {
                 List.of("be_id", "endpoint", "version", "status", "last_heartbeat",
                         "memtable_bytes", "segment_count", "put_count", "get_count"),
                 rows);
+    }
+
+    // ------------------------------------------------------------ SHOW METRICS
+
+    /**
+     * {@code SHOW METRICS [LIKE 'pattern']}(FR-824):两列 metric/value,数据与
+     * {@code GET /metrics} 完全同一份({@link com.wangyu.tangdb.metrics.Metrics#snapshot()})。
+     */
+    private Result showMetrics(Session session, String statement, String upper) {
+        com.wangyu.tangdb.metrics.Metrics sink = metricsFor(session);
+        String like = null;
+        int idx = upper.indexOf("LIKE");
+        if (idx >= 0) {
+            like = unquote(statement.substring(idx + 4).trim());
+        }
+        List<Object[]> rows = new ArrayList<>();
+        for (com.wangyu.tangdb.metrics.Metrics.MetricPoint point : sink.snapshot()) {
+            if (like == null || sqlLike(point.name(), like)) {
+                rows.add(new Object[]{point.name(), point.valueText()});
+            }
+        }
+        return new Result.Table(List.of("metric", "value"), rows);
+    }
+
+    private static String unquote(String raw) {
+        String s = raw.trim();
+        if (s.startsWith("'") && s.endsWith("'") && s.length() >= 2) {
+            return s.substring(1, s.length() - 1);
+        }
+        return s;
+    }
+
+    /** SQL LIKE(只认 % 与 _)转正则匹配;大小写不敏感。 */
+    private static boolean sqlLike(String value, String pattern) {
+        StringBuilder regex = new StringBuilder();
+        for (char c : pattern.toCharArray()) {
+            switch (c) {
+                case '%' -> regex.append(".*");
+                case '_' -> regex.append('.');
+                default -> regex.append(java.util.regex.Pattern.quote(String.valueOf(c)));
+            }
+        }
+        return value.matches("(?i)" + regex);
+    }
+
+    // ------------------------------------------------------------ SHOW SLOW QUERIES
+
+    /** {@code SHOW SLOW QUERIES [LIMIT n]} / {@code SHOW SLOW QUERY <id>}(FR-833)。 */
+    private Result showSlowQueries(String statement, String upper) {
+        if (slowLog == null) {
+            throw new SqlError(SqlError.ER_NOT_SUPPORTED_YET, "42000",
+                    "慢查询记录未启用(slow_query_log = false)");
+        }
+        String rest = statement.substring(statement.toUpperCase(Locale.ROOT)
+                .indexOf("SHOW SLOW QUERY") + "SHOW SLOW QUERY".length()).trim();
+        // "QUERIES" 的后半截("IES")也落在这里,必须先判列表形态再判 id 形态。
+        boolean list = rest.toUpperCase(Locale.ROOT).startsWith("IES");
+        if (list) {
+            rest = rest.substring("IES".length()).trim();
+        }
+        if (!list) {
+            long id;
+            try {
+                id = Long.parseLong(rest.trim());
+            } catch (NumberFormatException e) {
+                throw new SqlError(SqlError.ER_SYNTAX_ERROR, "42000",
+                        "SHOW SLOW QUERY 需要一个数字 id: " + rest);
+            }
+            com.wangyu.tangdb.slow.SlowQueryLog.Entry entry = slowLog.find(id);
+            if (entry == null) {
+                return new Result.Table(com.wangyu.tangdb.slow.SlowQueryLog.COLUMNS,
+                        new ArrayList<>());
+            }
+            return new Result.Table(com.wangyu.tangdb.slow.SlowQueryLog.COLUMNS,
+                    List.<Object[]>of(entryRow(entry)));
+        }
+        int limit = 0;
+        java.util.regex.Matcher matcher = java.util.regex.Pattern
+                .compile("(?i)LIMIT\\s+(\\d+)").matcher(statement);
+        if (matcher.find()) {
+            limit = Integer.parseInt(matcher.group(1));
+        }
+        List<Object[]> rows = new ArrayList<>();
+        for (com.wangyu.tangdb.slow.SlowQueryLog.Entry entry : slowLog.recent(limit)) {
+            rows.add(entryRow(entry));
+        }
+        return new Result.Table(com.wangyu.tangdb.slow.SlowQueryLog.COLUMNS, rows);
+    }
+
+    private static Object[] entryRow(com.wangyu.tangdb.slow.SlowQueryLog.Entry entry) {
+        return new Object[]{entry.id(), entry.startTime(), entry.durationMs(),
+                entry.rowsScanned(), entry.rowsReturned(), entry.client(), entry.database(),
+                entry.tables(), entry.sqlText(), entry.fingerprint(), entry.planSummary(),
+                entry.advice()};
+    }
+
+    // ------------------------------------------------------------ SHOW BACKUP JOBS
+
+    /** {@code SHOW BACKUP JOBS}(FR-846):任务 id / 时间 / 状态 / 已复制 / 总字节。 */
+    private Result showBackupJobs() {
+        if (backups == null) {
+            throw new SqlError(SqlError.ER_NOT_SUPPORTED_YET, "42000", "备份功能未启用");
+        }
+        List<Object[]> rows = new ArrayList<>();
+        for (com.wangyu.tangdb.backup.BackupService.Job job : backups.jobs()) {
+            rows.add(new Object[]{job.jobId(), job.kind(), job.backupDir(), job.targetDir(),
+                    job.status(), job.startedAt(), job.finishedAt(), job.copiedBytes(),
+                    job.totalBytes(), job.incremental(), job.message()});
+        }
+        return new Result.Table(com.wangyu.tangdb.backup.BackupService.COLUMNS, rows);
     }
 
     // ------------------------------------------------------------ information_schema

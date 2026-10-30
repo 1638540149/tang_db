@@ -10,8 +10,13 @@ import com.wangyu.tangdb.execute.Executor;
  */
 public final class Session {
 
+    /** 会话通道(SPEC-P8 边界 186:控制台与 MySQL 指标独立计数,不串号)。 */
+    public static final String CHANNEL_MYSQL = "mysql";
+    public static final String CHANNEL_CONSOLE = "console";
+
     private final long id;
     private final String source;
+    private final String channel;
     private final Executor executor;
     private final long startTimeMillis;
     private volatile long lastActiveMillis;
@@ -19,8 +24,13 @@ public final class Session {
     private volatile boolean killed;
 
     public Session(long id, String source, Executor executor) {
+        this(id, source, executor, CHANNEL_MYSQL);
+    }
+
+    public Session(long id, String source, Executor executor, String channel) {
         this.id = id;
         this.source = source == null ? "" : source;
+        this.channel = channel == null ? CHANNEL_MYSQL : channel;
         this.executor = executor;
         this.startTimeMillis = System.currentTimeMillis();
         this.lastActiveMillis = startTimeMillis;
@@ -37,6 +47,15 @@ public final class Session {
 
     public Executor executor() {
         return executor;
+    }
+
+    /** 会话通道:mysql(协议端口)/ console(Web 控制台)。 */
+    public String channel() {
+        return channel;
+    }
+
+    public boolean console() {
+        return CHANNEL_CONSOLE.equals(channel);
     }
 
     public String currentDatabase() {

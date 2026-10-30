@@ -10,6 +10,7 @@ import com.wangyu.tangdb.protocol.mysql.NativePassword;
 import com.wangyu.tangdb.server.BackendRegistry;
 import com.wangyu.tangdb.server.FeGrpcServer;
 import com.wangyu.tangdb.server.FeStartupException;
+import com.wangyu.tangdb.session.Session;
 import com.wangyu.tangdb.session.SessionManager;
 import com.wangyu.tangdb.storage.StoreException;
 
@@ -38,13 +39,17 @@ public final class Fed implements AutoCloseable {
     private final SessionManager sessions;
     private final SqlEngine engine;
     private final MysqlServer mysqlServer;
+    private final com.wangyu.tangdb.metrics.Metrics metrics;
+    private final com.wangyu.tangdb.console.ConsoleServer consoleServer;
     private final Thread evictionThread;
     private final CountDownLatch shutdownLatch = new CountDownLatch(1);
     private volatile boolean closed;
 
     private Fed(FeConfig config, TangDbClient client, BackendRegistry registry,
                 FeGrpcServer heartbeatServer, SessionManager sessions, SqlEngine engine,
-                MysqlServer mysqlServer, Thread evictionThread) {
+                MysqlServer mysqlServer, Thread evictionThread,
+                com.wangyu.tangdb.metrics.Metrics metrics,
+                com.wangyu.tangdb.console.ConsoleServer consoleServer) {
         this.config = config;
         this.client = client;
         this.registry = registry;
@@ -53,6 +58,8 @@ public final class Fed implements AutoCloseable {
         this.engine = engine;
         this.mysqlServer = mysqlServer;
         this.evictionThread = evictionThread;
+        this.metrics = metrics;
+        this.consoleServer = consoleServer;
     }
 
     /** 完成全部启动步骤并返回运行中的 fed。失败抛异常(由 main 负责打印并退出)。 */
@@ -100,14 +107,35 @@ public final class Fed implements AutoCloseable {
         // K114:启动时清理上次崩溃残留的排序临时文件(FE 侧目录,不碰 BE 数据目录)。
         com.wangyu.tangdb.query.Sorter.cleanTempDir(
                 java.nio.file.Path.of(config.sortTmpDir()));
+        // SPEC-P8 B 组:两条通道各一张指标表(边界 186:控制台与 MySQL 独立计数)。
+        com.wangyu.tangdb.metrics.Metrics metrics =
+                new com.wangyu.tangdb.metrics.Metrics(config.p8().metricsEnabled());
+        com.wangyu.tangdb.metrics.Metrics consoleMetrics =
+                new com.wangyu.tangdb.metrics.Metrics(config.p8().metricsEnabled());
+        metrics.setActiveSessionsSupplier(sessions::size);
+        consoleMetrics.setActiveSessionsSupplier(
+                () -> (int) sessions.all().stream().filter(Session::console).count());
+        metrics.setBeSupplier(() -> beSnapshot(registry));
         SqlEngine engine = new SqlEngine(client, catalog, sessions, registry,
                 config.heartbeatEnabled(), config.user(), config.indexBackfillBatch(),
                 config.queryBatchRows(), config.sortSpillBytes(), config.sortTmpDir(),
                 config.optimizer())
                 .withExecution(config.queryParallelism(), config.pushdownEnabled(),
                         config.scanBatchRows())
+                .withMetrics(metrics, consoleMetrics)
                 // SPEC-P7 §5.4:E 组推理算子 + 向量检索门限
                 .withP7(config.p7(), new com.wangyu.tangdb.ai.AiService(config.ai()));
+        // SPEC-P8 C 组:慢查询日志(阈值内零落库;诊断建议走同一计划入口)。
+        com.wangyu.tangdb.slow.SlowQueryLog slowLog = new com.wangyu.tangdb.slow.SlowQueryLog(
+                client, catalog, engine.stats(), config.p8().slowQueryLog(),
+                config.p8().slowQueryThresholdMs(), config.p8().slowQueryMaxRows());
+        engine.withSlowQueryLog(slowLog);
+        // SPEC-P8 D 组:备份 / 恢复(备份在 BE 后台执行,恢复在 FE 后台线程执行)。
+        engine.withBackupService(new com.wangyu.tangdb.backup.BackupService(
+                client, catalog, engine.stats(), client, config.p8().backupDir()));
+        System.err.println("信息: P8 慢查询 slow_query_log=" + (slowLog.enabled() ? "on" : "off")
+                + " threshold_ms=" + config.p8().slowQueryThresholdMs()
+                + " max_rows=" + config.p8().slowQueryMaxRows());
         // FR-724:启动日志必须写明本次使用的期限与并行度。
         System.err.println("信息: P7 向量/推理配置 vector_m=" + config.p7().vectorM()
                 + " ef_construction=" + config.p7().vectorEfConstruction()
@@ -130,7 +158,8 @@ public final class Fed implements AutoCloseable {
         MysqlServer mysqlServer;
         try {
             mysqlServer = new MysqlServer(config.mysqlPort(), engine, sessions, client, catalog,
-                    config.user(), storedHash);
+                    config.user(), storedHash, config.p8().mysqlMaxConnections(),
+                    config.p8().mysqlWaitTimeout());
             mysqlServer.start();
         } catch (IOException e) {
             if (heartbeatServer != null) {
@@ -139,6 +168,28 @@ public final class Fed implements AutoCloseable {
             client.close();
             throw new FeStartupException("协议端口 " + config.mysqlPort() + " 无法监听(可能已被占用):"
                     + e.getMessage(), e);
+        }
+
+        // SPEC-P8 E 组:控制台 HTTP 服务(默认 8080;端口被占用即启动失败,边界 170)。
+        com.wangyu.tangdb.console.ConsoleServer consoleServer = null;
+        if (config.p8().consoleEnabled()) {
+            metrics.setVectorSupplier(
+                    new com.wangyu.tangdb.metrics.VectorMetricsSupplier(engine, catalog));
+            try {
+                consoleServer = new com.wangyu.tangdb.console.ConsoleServer(
+                        config.p8().consolePort(),
+                        java.nio.file.Path.of("console", "dist"), metrics);
+                consoleServer.withApi(new com.wangyu.tangdb.console.ConsoleApiImpl(config, engine,
+                        sessions, catalog, metrics, consoleMetrics));
+                consoleServer.start();
+            } catch (IOException e) {
+                if (heartbeatServer != null) {
+                    heartbeatServer.close();
+                }
+                client.close();
+                throw new FeStartupException("控制台端口 " + config.p8().consolePort()
+                        + " 无法监听(可能已被占用):" + e.getMessage(), e);
+            }
         }
 
         Thread evictionThread = null;
@@ -158,7 +209,7 @@ public final class Fed implements AutoCloseable {
         }
 
         return new Fed(config, client, registry, heartbeatServer, sessions, engine,
-                mysqlServer, evictionThread);
+                mysqlServer, evictionThread, metrics, consoleServer);
     }
 
     public int mysqlPort() {
@@ -167,6 +218,33 @@ public final class Fed implements AutoCloseable {
 
     public SessionManager sessions() {
         return sessions;
+    }
+
+    /** 协议通道指标表(控制台 /metrics 与 /api/status 用)。 */
+    public com.wangyu.tangdb.metrics.Metrics metrics() {
+        return metrics;
+    }
+
+    /** 把最近一次 BE 心跳折成指标快照(BE 离线时 alive=false)。 */
+    static com.wangyu.tangdb.metrics.Metrics.BeSnapshot beSnapshot(BackendRegistry registry) {
+        long now = System.currentTimeMillis();
+        for (BackendRegistry.Backend backend : registry.all()) {
+            com.wangyu.tangdb.proto.HeartbeatRequest hb = backend.lastHeartbeat();
+            if (hb == null) {
+                continue;
+            }
+            boolean alive = backend.available(now, registry.offlineCycles());
+            return new com.wangyu.tangdb.metrics.Metrics.BeSnapshot(alive,
+                    hb.getMemtableBytes(), hb.getMemtableCount(), hb.getImmutableMemtableCount(),
+                    hb.getSegmentCount(), hb.getSegmentBytes(), hb.getWalBytes(),
+                    hb.getCompactionCount(), hb.getCompactionMillis(),
+                    hb.getWalFsyncCount(), hb.getWalFsyncMillis(),
+                    hb.getGroupCommitAvgBatch(), hb.getPutCount(), hb.getGetCount(),
+                    hb.getScanCount(), hb.getVectorSegments(), hb.getVectorNodes(),
+                    hb.getVectorPendingSegments(), hb.getVectorSearches(),
+                    hb.getVectorAvgCandidates());
+        }
+        return com.wangyu.tangdb.metrics.Metrics.BeSnapshot.EMPTY;
     }
 
     public boolean isClosed() {
@@ -181,6 +259,9 @@ public final class Fed implements AutoCloseable {
         }
         closed = true;
         // ① 停止接受新连接
+        if (consoleServer != null) {
+            consoleServer.close();
+        }
         mysqlServer.close();
         // ② 等在途连接结束(上限 shutdown_grace_seconds)
         long deadline = System.currentTimeMillis() + config.shutdownGraceSeconds() * 1000L;

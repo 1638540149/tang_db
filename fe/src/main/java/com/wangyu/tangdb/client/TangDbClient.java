@@ -51,6 +51,7 @@ import java.util.concurrent.TimeUnit;
  * 所有失败都转换成带中文提示的 {@link ClientException}，调用方无需处理 gRPC 异常类型。</p>
  */
 public class TangDbClient implements AutoCloseable, KvStore, TransactionStore,
+        com.wangyu.tangdb.backup.BackupChannel,
         com.wangyu.tangdb.storage.ProjectingStore,
         com.wangyu.tangdb.storage.CursoredStore,
         com.wangyu.tangdb.storage.VectorStore {
@@ -701,6 +702,79 @@ public class TangDbClient implements AutoCloseable, KvStore, TransactionStore,
             message += ":" + detail;
         }
         return message;
+    }
+
+    // ------------------------------------------------------------ SPEC-P8 D 组:备份 / 恢复
+
+    @Override
+    public String startBackup(String backupDir, String incrementalFrom, long snapshotRows,
+                              boolean force) {
+        try {
+            com.wangyu.tangdb.proto.BackupResponse response =
+                    stubWithDeadline(bulkDeadlineSeconds).backup(
+                            com.wangyu.tangdb.proto.BackupRequest.newBuilder()
+                                    .setBackupDir(backupDir)
+                                    .setIncrementalFrom(incrementalFrom == null ? ""
+                                            : incrementalFrom)
+                                    .setSnapshotRows(snapshotRows)
+                                    .setForce(force)
+                                    .build());
+            if (response.getStatus() != StatusCode.OK) {
+                throw new StoreException(response.getMessage());
+            }
+            return response.getJobId();
+        } catch (StatusRuntimeException e) {
+            throw asStoreException(e);
+        }
+    }
+
+    @Override
+    public List<com.wangyu.tangdb.backup.BackupChannel.RemoteJob> remoteJobs(String jobId) {
+        try {
+            com.wangyu.tangdb.proto.BackupJobResponse response =
+                    stubWithDeadline(rpcDeadlineSeconds).backupJob(
+                            com.wangyu.tangdb.proto.BackupJobRequest.newBuilder()
+                                    .setJobId(jobId == null ? "" : jobId).build());
+            if (response.getStatus() == StatusCode.NOT_FOUND) {
+                return List.of();
+            }
+            if (response.getStatus() != StatusCode.OK) {
+                throw new StoreException(response.getMessage());
+            }
+            List<com.wangyu.tangdb.backup.BackupChannel.RemoteJob> jobs = new ArrayList<>();
+            for (com.wangyu.tangdb.proto.BackupJobInfo info : response.getJobsList()) {
+                jobs.add(new com.wangyu.tangdb.backup.BackupChannel.RemoteJob(
+                        info.getJobId(), info.getBackupDir(), info.getStatus(),
+                        info.getCopiedBytes(), info.getTotalBytes(), info.getMessage(),
+                        info.getIncremental(), info.getStartedUnixMillis(),
+                        info.getFinishedUnixMillis()));
+            }
+            return jobs;
+        } catch (StatusRuntimeException e) {
+            throw asStoreException(e);
+        }
+    }
+
+    @Override
+    public com.wangyu.tangdb.backup.BackupChannel.RestoreOutcome restore(String sourceDir,
+                                                                         String targetDir,
+                                                                         boolean force) {
+        try {
+            com.wangyu.tangdb.proto.RestoreResponse response =
+                    stubWithDeadline(bulkDeadlineSeconds).restore(
+                            com.wangyu.tangdb.proto.RestoreRequest.newBuilder()
+                                    .setSourceDir(sourceDir)
+                                    .setTargetDir(targetDir)
+                                    .setForce(force)
+                                    .build());
+            if (response.getStatus() != StatusCode.OK) {
+                throw new StoreException(response.getMessage());
+            }
+            return new com.wangyu.tangdb.backup.BackupChannel.RestoreOutcome(
+                    response.getFiles(), response.getBytes(), response.getMessage());
+        } catch (StatusRuntimeException e) {
+            throw asStoreException(e);
+        }
     }
 
     /**

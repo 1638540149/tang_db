@@ -33,10 +33,22 @@ public final class MysqlServer implements AutoCloseable {
     private final Catalog catalog;
     private final String user;
     private final byte[] storedHash;
+    /** SPEC-P8 FR-819:连接上限(默认 128)。 */
+    private final int maxConnections;
+    /** SPEC-P8 FR-819:协议侧空闲超时(秒,0 = 不断开)。 */
+    private final int waitTimeoutSeconds;
     private final Set<Socket> clients = ConcurrentHashMap.newKeySet();
 
     public MysqlServer(int port, SqlEngine engine, SessionManager sessions,
                        KvStore kv, Catalog catalog, String user, byte[] storedHash)
+            throws IOException {
+        this(port, engine, sessions, kv, catalog, user, storedHash, 128, 0);
+    }
+
+    /** SPEC-P8:带协议侧连接上限 / 空闲超时 / 指标钩子的构造(FR-819 / FR-822)。 */
+    public MysqlServer(int port, SqlEngine engine, SessionManager sessions,
+                       KvStore kv, Catalog catalog, String user, byte[] storedHash,
+                       int maxConnections, int waitTimeoutSeconds)
             throws IOException {
         this.port = port;
         this.engine = engine;
@@ -45,8 +57,20 @@ public final class MysqlServer implements AutoCloseable {
         this.catalog = catalog;
         this.user = user;
         this.storedHash = storedHash;
+        this.maxConnections = maxConnections > 0 ? maxConnections : 128;
+        this.waitTimeoutSeconds = Math.max(0, waitTimeoutSeconds);
         this.serverSocket = new ServerSocket(port);
         this.acceptThread = new Thread(this::acceptLoop, "mysql-accept");
+    }
+
+    public static final int ER_CON_COUNT_ERROR = 1040;
+
+    public int maxConnections() {
+        return maxConnections;
+    }
+
+    public int waitTimeoutSeconds() {
+        return waitTimeoutSeconds;
     }
 
     public void start() {
@@ -62,10 +86,23 @@ public final class MysqlServer implements AutoCloseable {
         while (!serverSocket.isClosed()) {
             try {
                 Socket socket = serverSocket.accept();
+                if (clients.size() >= maxConnections) {
+                    // 边界 167:超过上限拒绝新连接并给错误码,已有连接不受影响。
+                    rejectTooManyConnections(socket);
+                    continue;
+                }
                 long id = sessions.allocateId();
                 clients.add(socket);
+                if (waitTimeoutSeconds > 0) {
+                    try {
+                        socket.setSoTimeout(waitTimeoutSeconds * 1000);
+                    } catch (java.net.SocketException ignored) {
+                        // 设置失败不影响功能,只是不启用空闲超时。
+                    }
+                }
                 ConnectionHandler handler = new ConnectionHandler(
-                        socket, id, engine, sessions, kv, catalog, user, storedHash);
+                        socket, id, engine, sessions, kv, catalog, user, storedHash,
+                        waitTimeoutSeconds);
                 Thread thread = new Thread(() -> {
                     try {
                         handler.run();
@@ -89,6 +126,18 @@ public final class MysqlServer implements AutoCloseable {
     /** 当前在途连接数。 */
     public int activeConnections() {
         return clients.size();
+    }
+
+    /** 边界 167:超上限时按 MySQL 惯例在握手前回一个 ERR 包(1040)再断开。 */
+    private void rejectTooManyConnections(Socket socket) {
+        try (Socket ignored = socket) {
+            PacketIO io = new PacketIO(socket.getInputStream(), socket.getOutputStream());
+            io.setWriteSeq(0);
+            io.writePacket(ResultSetEncoder.errPacket(ER_CON_COUNT_ERROR, "08004",
+                    "Too many connections"));
+        } catch (IOException e) {
+            LOG.log(Level.FINE, "拒绝超额连接时写错误包失败", e);
+        }
     }
 
     /** 停止接受新连接(优雅退出第 ① 步)。 */

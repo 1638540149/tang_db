@@ -57,11 +57,16 @@ public final class SystemTables {
     public static final long SYS_COLUMN_STATS = 8;
     /** SPEC-P7 §5.3 / FR-741:向量索引元数据(段级状态在 BE MANIFEST)。 */
     public static final long SYS_VEC_INDEXES = 9;
+    /** SPEC-P8 §5.1 / FR-831:慢查询记录(表 ID 10)。 */
+    public static final long SYS_SLOW_QUERY = 10;
+    /** SPEC-P8 §5.1 / FR-846:备份 / 恢复任务(表 ID 11)。 */
+    public static final long SYS_BACKUP_JOBS = 11;
 
-    /** 系统表 ID 登记表(FR-426 / K70 / FR-473 / SPEC-P5 FR-614 / SPEC-P6 §5.1)。 */
+    /** 系统表 ID 登记表(FR-426 / K70 / FR-473 / SPEC-P5 FR-614 / SPEC-P6 §5.1 / SPEC-P8 §5.1)。 */
     public static final Set<Long> REGISTERED_IDS =
             Set.of(SYS_TABLES, SYS_COLUMNS, SYS_DATABASES, SYS_COUNTERS, SYS_INDEXES,
-                    SYS_IMPORT_STATE, SYS_TABLE_STATS, SYS_COLUMN_STATS, SYS_VEC_INDEXES);
+                    SYS_IMPORT_STATE, SYS_TABLE_STATS, SYS_COLUMN_STATS, SYS_VEC_INDEXES,
+                    SYS_SLOW_QUERY, SYS_BACKUP_JOBS);
 
     /** 预留区上界(6~63 预留给后续元数据族,当前未登记)。 */
     public static final long RESERVED_MAX_TABLE_ID = 63;
@@ -220,7 +225,77 @@ public final class SystemTables {
                     new Column("created_at", DataType.VARCHAR, 64, false, false, 10)),
             true);
 
+    /**
+     * SPEC-P8 §5.1 / FR-831:慢查询记录(表 ID 10)。
+     *
+     * <p>主键 {@code id} 单调递增,按时间淘汰最旧(FR-839);{@code sql_text} / {@code fingerprint}
+     * / {@code plan_summary} / {@code advice} 都是长文本(4KB 截断,边界 189)。</p>
+     */
+    public static final TableMeta SLOW_QUERY = new TableMeta(
+            SYS_SLOW_QUERY, "sys_slow_query", TableMeta.STATE_ACTIVE, "",
+            List.of(
+                    new Column("id", DataType.BIGINT, 0, false, true, 0),
+                    new Column("start_time", DataType.VARCHAR, 32, false, false, 1),
+                    new Column("duration_ms", DataType.BIGINT, 0, false, false, 2),
+                    new Column("rows_scanned", DataType.BIGINT, 0, false, false, 3),
+                    new Column("rows_returned", DataType.BIGINT, 0, false, false, 4),
+                    new Column("client", DataType.VARCHAR, 128, false, false, 5),
+                    new Column("db_name", DataType.VARCHAR, 64, false, false, 6),
+                    new Column("table_names", DataType.VARCHAR, 256, false, false, 7),
+                    new Column("sql_text", DataType.VARCHAR, MAX_VARCHAR, false, false, 8),
+                    new Column("fingerprint", DataType.VARCHAR, MAX_VARCHAR, false, false, 9),
+                    new Column("plan_summary", DataType.VARCHAR, MAX_VARCHAR, false, false, 10),
+                    new Column("advice", DataType.VARCHAR, MAX_VARCHAR, false, false, 11)),
+            true);
+
+    /** SPEC-P8 §5.1 / FR-846:备份 / 恢复任务(表 ID 11)。 */
+    public static final TableMeta BACKUP_JOBS = new TableMeta(
+            SYS_BACKUP_JOBS, "sys_backup_jobs", TableMeta.STATE_ACTIVE, "",
+            List.of(
+                    new Column("job_id", DataType.VARCHAR, 64, false, true, 0),
+                    new Column("kind", DataType.VARCHAR, 16, false, false, 1),
+                    new Column("backup_dir", DataType.VARCHAR, 1024, false, false, 2),
+                    new Column("target_dir", DataType.VARCHAR, 1024, false, false, 3),
+                    new Column("status", DataType.VARCHAR, 16, false, false, 4),
+                    new Column("started_at", DataType.VARCHAR, 32, false, false, 5),
+                    new Column("finished_at", DataType.VARCHAR, 32, true, false, 6),
+                    new Column("copied_bytes", DataType.BIGINT, 0, false, false, 7),
+                    new Column("total_bytes", DataType.BIGINT, 0, false, false, 8),
+                    new Column("incremental", DataType.BOOLEAN, 0, false, false, 9),
+                    new Column("message", DataType.VARCHAR, MAX_VARCHAR, true, false, 10)),
+            true);
+
     private SystemTables() {
+    }
+
+    /** sys_slow_query 的主键编码:id 的 BIGINT 保序编码。 */
+    public static byte[] slowQueryKey(long id) {
+        return KeyCodec.systemRowKey(SYS_SLOW_QUERY,
+                KeyCodec.encodePrimaryKey(DataType.BIGINT, id));
+    }
+
+    /** sys_slow_query 行(列顺序与 {@link #SLOW_QUERY} 一致)。 */
+    public static byte[] encodeSlowQueryRow(long id, String startTime, long durationMs,
+                                            long rowsScanned, long rowsReturned, String client,
+                                            String dbName, String tableNames, String sqlText,
+                                            String fingerprint, String planSummary, String advice) {
+        return RowCodec.encode(SLOW_QUERY, new Object[]{id, startTime, durationMs, rowsScanned,
+                rowsReturned, client, dbName, tableNames, sqlText, fingerprint, planSummary, advice});
+    }
+
+    /** sys_backup_jobs 的主键编码:job_id 的 VARCHAR 保序编码。 */
+    public static byte[] backupJobKey(String jobId) {
+        return KeyCodec.systemRowKey(SYS_BACKUP_JOBS,
+                KeyCodec.encodePrimaryKey(DataType.VARCHAR, jobId));
+    }
+
+    /** sys_backup_jobs 行(列顺序与 {@link #BACKUP_JOBS} 一致)。 */
+    public static byte[] encodeBackupJobRow(String jobId, String kind, String backupDir,
+                                            String targetDir, String status, String startedAt,
+                                            String finishedAt, long copiedBytes, long totalBytes,
+                                            boolean incremental, String message) {
+        return RowCodec.encode(BACKUP_JOBS, new Object[]{jobId, kind, backupDir, targetDir, status,
+                startedAt, finishedAt, copiedBytes, totalBytes, incremental, message});
     }
 
     /** sys_vec_indexes 的主键编码:table_id 4B 大端 + index_id 4B 大端。 */

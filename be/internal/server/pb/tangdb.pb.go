@@ -1849,6 +1849,474 @@ func (x *VectorIndexStatusResponse) GetDim() uint32 {
 	return 0
 }
 
+type BackupRequest struct {
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	BackupDir       string                 `protobuf:"bytes,1,opt,name=backup_dir,json=backupDir,proto3" json:"backup_dir,omitempty"`                   // 备份目标目录(必填)
+	IncrementalFrom string                 `protobuf:"bytes,2,opt,name=incremental_from,json=incrementalFrom,proto3" json:"incremental_from,omitempty"` // 增量父目录(空 = 全量)
+	SnapshotRows    uint64                 `protobuf:"varint,3,opt,name=snapshot_rows,json=snapshotRows,proto3" json:"snapshot_rows,omitempty"`         // 备份点行数(FE 统计口径,仅写入 BACKUP_META)
+	Force           bool                   `protobuf:"varint,4,opt,name=force,proto3" json:"force,omitempty"`                                           // 目标目录非空时是否覆盖
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *BackupRequest) Reset() {
+	*x = BackupRequest{}
+	mi := &file_tangdb_proto_msgTypes[27]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BackupRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BackupRequest) ProtoMessage() {}
+
+func (x *BackupRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_tangdb_proto_msgTypes[27]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BackupRequest.ProtoReflect.Descriptor instead.
+func (*BackupRequest) Descriptor() ([]byte, []int) {
+	return file_tangdb_proto_rawDescGZIP(), []int{27}
+}
+
+func (x *BackupRequest) GetBackupDir() string {
+	if x != nil {
+		return x.BackupDir
+	}
+	return ""
+}
+
+func (x *BackupRequest) GetIncrementalFrom() string {
+	if x != nil {
+		return x.IncrementalFrom
+	}
+	return ""
+}
+
+func (x *BackupRequest) GetSnapshotRows() uint64 {
+	if x != nil {
+		return x.SnapshotRows
+	}
+	return 0
+}
+
+func (x *BackupRequest) GetForce() bool {
+	if x != nil {
+		return x.Force
+	}
+	return false
+}
+
+type BackupResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Status        StatusCode             `protobuf:"varint,1,opt,name=status,proto3,enum=tangdb.v1.StatusCode" json:"status,omitempty"`
+	Message       string                 `protobuf:"bytes,2,opt,name=message,proto3" json:"message,omitempty"`
+	JobId         string                 `protobuf:"bytes,3,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BackupResponse) Reset() {
+	*x = BackupResponse{}
+	mi := &file_tangdb_proto_msgTypes[28]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BackupResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BackupResponse) ProtoMessage() {}
+
+func (x *BackupResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_tangdb_proto_msgTypes[28]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BackupResponse.ProtoReflect.Descriptor instead.
+func (*BackupResponse) Descriptor() ([]byte, []int) {
+	return file_tangdb_proto_rawDescGZIP(), []int{28}
+}
+
+func (x *BackupResponse) GetStatus() StatusCode {
+	if x != nil {
+		return x.Status
+	}
+	return StatusCode_STATUS_UNSPECIFIED
+}
+
+func (x *BackupResponse) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
+func (x *BackupResponse) GetJobId() string {
+	if x != nil {
+		return x.JobId
+	}
+	return ""
+}
+
+type BackupJobRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	JobId         string                 `protobuf:"bytes,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"` // 空 = 全部任务
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BackupJobRequest) Reset() {
+	*x = BackupJobRequest{}
+	mi := &file_tangdb_proto_msgTypes[29]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BackupJobRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BackupJobRequest) ProtoMessage() {}
+
+func (x *BackupJobRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_tangdb_proto_msgTypes[29]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BackupJobRequest.ProtoReflect.Descriptor instead.
+func (*BackupJobRequest) Descriptor() ([]byte, []int) {
+	return file_tangdb_proto_rawDescGZIP(), []int{29}
+}
+
+func (x *BackupJobRequest) GetJobId() string {
+	if x != nil {
+		return x.JobId
+	}
+	return ""
+}
+
+type BackupJobInfo struct {
+	state              protoimpl.MessageState `protogen:"open.v1"`
+	JobId              string                 `protobuf:"bytes,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
+	BackupDir          string                 `protobuf:"bytes,2,opt,name=backup_dir,json=backupDir,proto3" json:"backup_dir,omitempty"`
+	Status             string                 `protobuf:"bytes,3,opt,name=status,proto3" json:"status,omitempty"` // RUNNING / SUCCESS / FAILED / CANCELLED
+	CopiedBytes        uint64                 `protobuf:"varint,4,opt,name=copied_bytes,json=copiedBytes,proto3" json:"copied_bytes,omitempty"`
+	TotalBytes         uint64                 `protobuf:"varint,5,opt,name=total_bytes,json=totalBytes,proto3" json:"total_bytes,omitempty"`
+	Message            string                 `protobuf:"bytes,6,opt,name=message,proto3" json:"message,omitempty"`
+	Incremental        bool                   `protobuf:"varint,7,opt,name=incremental,proto3" json:"incremental,omitempty"`
+	StartedUnixMillis  int64                  `protobuf:"varint,8,opt,name=started_unix_millis,json=startedUnixMillis,proto3" json:"started_unix_millis,omitempty"`
+	FinishedUnixMillis int64                  `protobuf:"varint,9,opt,name=finished_unix_millis,json=finishedUnixMillis,proto3" json:"finished_unix_millis,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
+}
+
+func (x *BackupJobInfo) Reset() {
+	*x = BackupJobInfo{}
+	mi := &file_tangdb_proto_msgTypes[30]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BackupJobInfo) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BackupJobInfo) ProtoMessage() {}
+
+func (x *BackupJobInfo) ProtoReflect() protoreflect.Message {
+	mi := &file_tangdb_proto_msgTypes[30]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BackupJobInfo.ProtoReflect.Descriptor instead.
+func (*BackupJobInfo) Descriptor() ([]byte, []int) {
+	return file_tangdb_proto_rawDescGZIP(), []int{30}
+}
+
+func (x *BackupJobInfo) GetJobId() string {
+	if x != nil {
+		return x.JobId
+	}
+	return ""
+}
+
+func (x *BackupJobInfo) GetBackupDir() string {
+	if x != nil {
+		return x.BackupDir
+	}
+	return ""
+}
+
+func (x *BackupJobInfo) GetStatus() string {
+	if x != nil {
+		return x.Status
+	}
+	return ""
+}
+
+func (x *BackupJobInfo) GetCopiedBytes() uint64 {
+	if x != nil {
+		return x.CopiedBytes
+	}
+	return 0
+}
+
+func (x *BackupJobInfo) GetTotalBytes() uint64 {
+	if x != nil {
+		return x.TotalBytes
+	}
+	return 0
+}
+
+func (x *BackupJobInfo) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
+func (x *BackupJobInfo) GetIncremental() bool {
+	if x != nil {
+		return x.Incremental
+	}
+	return false
+}
+
+func (x *BackupJobInfo) GetStartedUnixMillis() int64 {
+	if x != nil {
+		return x.StartedUnixMillis
+	}
+	return 0
+}
+
+func (x *BackupJobInfo) GetFinishedUnixMillis() int64 {
+	if x != nil {
+		return x.FinishedUnixMillis
+	}
+	return 0
+}
+
+type BackupJobResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Status        StatusCode             `protobuf:"varint,1,opt,name=status,proto3,enum=tangdb.v1.StatusCode" json:"status,omitempty"`
+	Message       string                 `protobuf:"bytes,2,opt,name=message,proto3" json:"message,omitempty"`
+	Jobs          []*BackupJobInfo       `protobuf:"bytes,3,rep,name=jobs,proto3" json:"jobs,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BackupJobResponse) Reset() {
+	*x = BackupJobResponse{}
+	mi := &file_tangdb_proto_msgTypes[31]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BackupJobResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BackupJobResponse) ProtoMessage() {}
+
+func (x *BackupJobResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_tangdb_proto_msgTypes[31]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BackupJobResponse.ProtoReflect.Descriptor instead.
+func (*BackupJobResponse) Descriptor() ([]byte, []int) {
+	return file_tangdb_proto_rawDescGZIP(), []int{31}
+}
+
+func (x *BackupJobResponse) GetStatus() StatusCode {
+	if x != nil {
+		return x.Status
+	}
+	return StatusCode_STATUS_UNSPECIFIED
+}
+
+func (x *BackupJobResponse) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
+func (x *BackupJobResponse) GetJobs() []*BackupJobInfo {
+	if x != nil {
+		return x.Jobs
+	}
+	return nil
+}
+
+type RestoreRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	SourceDir     string                 `protobuf:"bytes,1,opt,name=source_dir,json=sourceDir,proto3" json:"source_dir,omitempty"` // 备份目录(必填)
+	TargetDir     string                 `protobuf:"bytes,2,opt,name=target_dir,json=targetDir,proto3" json:"target_dir,omitempty"` // 恢复目标目录(必填;必须为空或 force)
+	Force         bool                   `protobuf:"varint,3,opt,name=force,proto3" json:"force,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RestoreRequest) Reset() {
+	*x = RestoreRequest{}
+	mi := &file_tangdb_proto_msgTypes[32]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RestoreRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RestoreRequest) ProtoMessage() {}
+
+func (x *RestoreRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_tangdb_proto_msgTypes[32]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RestoreRequest.ProtoReflect.Descriptor instead.
+func (*RestoreRequest) Descriptor() ([]byte, []int) {
+	return file_tangdb_proto_rawDescGZIP(), []int{32}
+}
+
+func (x *RestoreRequest) GetSourceDir() string {
+	if x != nil {
+		return x.SourceDir
+	}
+	return ""
+}
+
+func (x *RestoreRequest) GetTargetDir() string {
+	if x != nil {
+		return x.TargetDir
+	}
+	return ""
+}
+
+func (x *RestoreRequest) GetForce() bool {
+	if x != nil {
+		return x.Force
+	}
+	return false
+}
+
+type RestoreResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Status        StatusCode             `protobuf:"varint,1,opt,name=status,proto3,enum=tangdb.v1.StatusCode" json:"status,omitempty"`
+	Message       string                 `protobuf:"bytes,2,opt,name=message,proto3" json:"message,omitempty"`
+	Files         uint64                 `protobuf:"varint,3,opt,name=files,proto3" json:"files,omitempty"`
+	Bytes         uint64                 `protobuf:"varint,4,opt,name=bytes,proto3" json:"bytes,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RestoreResponse) Reset() {
+	*x = RestoreResponse{}
+	mi := &file_tangdb_proto_msgTypes[33]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RestoreResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RestoreResponse) ProtoMessage() {}
+
+func (x *RestoreResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_tangdb_proto_msgTypes[33]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RestoreResponse.ProtoReflect.Descriptor instead.
+func (*RestoreResponse) Descriptor() ([]byte, []int) {
+	return file_tangdb_proto_rawDescGZIP(), []int{33}
+}
+
+func (x *RestoreResponse) GetStatus() StatusCode {
+	if x != nil {
+		return x.Status
+	}
+	return StatusCode_STATUS_UNSPECIFIED
+}
+
+func (x *RestoreResponse) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
+func (x *RestoreResponse) GetFiles() uint64 {
+	if x != nil {
+		return x.Files
+	}
+	return 0
+}
+
+func (x *RestoreResponse) GetBytes() uint64 {
+	if x != nil {
+		return x.Bytes
+	}
+	return 0
+}
+
 type RegisterBeRequest struct {
 	state                    protoimpl.MessageState `protogen:"open.v1"`
 	BeId                     string                 `protobuf:"bytes,1,opt,name=be_id,json=beId,proto3" json:"be_id,omitempty"`
@@ -1862,7 +2330,7 @@ type RegisterBeRequest struct {
 
 func (x *RegisterBeRequest) Reset() {
 	*x = RegisterBeRequest{}
-	mi := &file_tangdb_proto_msgTypes[27]
+	mi := &file_tangdb_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1874,7 +2342,7 @@ func (x *RegisterBeRequest) String() string {
 func (*RegisterBeRequest) ProtoMessage() {}
 
 func (x *RegisterBeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_tangdb_proto_msgTypes[27]
+	mi := &file_tangdb_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1887,7 +2355,7 @@ func (x *RegisterBeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RegisterBeRequest.ProtoReflect.Descriptor instead.
 func (*RegisterBeRequest) Descriptor() ([]byte, []int) {
-	return file_tangdb_proto_rawDescGZIP(), []int{27}
+	return file_tangdb_proto_rawDescGZIP(), []int{34}
 }
 
 func (x *RegisterBeRequest) GetBeId() string {
@@ -1935,7 +2403,7 @@ type RegisterBeResponse struct {
 
 func (x *RegisterBeResponse) Reset() {
 	*x = RegisterBeResponse{}
-	mi := &file_tangdb_proto_msgTypes[28]
+	mi := &file_tangdb_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1947,7 +2415,7 @@ func (x *RegisterBeResponse) String() string {
 func (*RegisterBeResponse) ProtoMessage() {}
 
 func (x *RegisterBeResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_tangdb_proto_msgTypes[28]
+	mi := &file_tangdb_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1960,7 +2428,7 @@ func (x *RegisterBeResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RegisterBeResponse.ProtoReflect.Descriptor instead.
 func (*RegisterBeResponse) Descriptor() ([]byte, []int) {
-	return file_tangdb_proto_rawDescGZIP(), []int{28}
+	return file_tangdb_proto_rawDescGZIP(), []int{35}
 }
 
 func (x *RegisterBeResponse) GetStatus() StatusCode {
@@ -2009,13 +2477,25 @@ type HeartbeatRequest struct {
 	// 被跳过的 chunk 数;SHOW SEGMENTS 展示用。只加字段,不改既有语义。
 	ChunksRead    uint64 `protobuf:"varint,60,opt,name=chunks_read,json=chunksRead,proto3" json:"chunks_read,omitempty"`
 	ChunksSkipped uint64 `protobuf:"varint,61,opt,name=chunks_skipped,json=chunksSkipped,proto3" json:"chunks_skipped,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// ---- SPEC-P8 B 组:运维指标(FR-827 / FR-828)。只加字段,语义不变。 ----
+	MemtableCount         uint64  `protobuf:"varint,70,opt,name=memtable_count,json=memtableCount,proto3" json:"memtable_count,omitempty"` // memtable 条目数
+	CompactionCount       uint64  `protobuf:"varint,71,opt,name=compaction_count,json=compactionCount,proto3" json:"compaction_count,omitempty"`
+	CompactionMillis      uint64  `protobuf:"varint,72,opt,name=compaction_millis,json=compactionMillis,proto3" json:"compaction_millis,omitempty"`
+	WalFsyncCount         uint64  `protobuf:"varint,73,opt,name=wal_fsync_count,json=walFsyncCount,proto3" json:"wal_fsync_count,omitempty"`
+	WalFsyncMillis        uint64  `protobuf:"varint,74,opt,name=wal_fsync_millis,json=walFsyncMillis,proto3" json:"wal_fsync_millis,omitempty"`
+	GroupCommitAvgBatch   float64 `protobuf:"fixed64,75,opt,name=group_commit_avg_batch,json=groupCommitAvgBatch,proto3" json:"group_commit_avg_batch,omitempty"`
+	VectorSegments        uint64  `protobuf:"varint,80,opt,name=vector_segments,json=vectorSegments,proto3" json:"vector_segments,omitempty"`
+	VectorNodes           uint64  `protobuf:"varint,81,opt,name=vector_nodes,json=vectorNodes,proto3" json:"vector_nodes,omitempty"`
+	VectorPendingSegments uint64  `protobuf:"varint,82,opt,name=vector_pending_segments,json=vectorPendingSegments,proto3" json:"vector_pending_segments,omitempty"`
+	VectorSearches        uint64  `protobuf:"varint,83,opt,name=vector_searches,json=vectorSearches,proto3" json:"vector_searches,omitempty"`
+	VectorAvgCandidates   float64 `protobuf:"fixed64,84,opt,name=vector_avg_candidates,json=vectorAvgCandidates,proto3" json:"vector_avg_candidates,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
 }
 
 func (x *HeartbeatRequest) Reset() {
 	*x = HeartbeatRequest{}
-	mi := &file_tangdb_proto_msgTypes[29]
+	mi := &file_tangdb_proto_msgTypes[36]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2027,7 +2507,7 @@ func (x *HeartbeatRequest) String() string {
 func (*HeartbeatRequest) ProtoMessage() {}
 
 func (x *HeartbeatRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_tangdb_proto_msgTypes[29]
+	mi := &file_tangdb_proto_msgTypes[36]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2040,7 +2520,7 @@ func (x *HeartbeatRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HeartbeatRequest.ProtoReflect.Descriptor instead.
 func (*HeartbeatRequest) Descriptor() ([]byte, []int) {
-	return file_tangdb_proto_rawDescGZIP(), []int{29}
+	return file_tangdb_proto_rawDescGZIP(), []int{36}
 }
 
 func (x *HeartbeatRequest) GetBeId() string {
@@ -2197,6 +2677,83 @@ func (x *HeartbeatRequest) GetChunksSkipped() uint64 {
 	return 0
 }
 
+func (x *HeartbeatRequest) GetMemtableCount() uint64 {
+	if x != nil {
+		return x.MemtableCount
+	}
+	return 0
+}
+
+func (x *HeartbeatRequest) GetCompactionCount() uint64 {
+	if x != nil {
+		return x.CompactionCount
+	}
+	return 0
+}
+
+func (x *HeartbeatRequest) GetCompactionMillis() uint64 {
+	if x != nil {
+		return x.CompactionMillis
+	}
+	return 0
+}
+
+func (x *HeartbeatRequest) GetWalFsyncCount() uint64 {
+	if x != nil {
+		return x.WalFsyncCount
+	}
+	return 0
+}
+
+func (x *HeartbeatRequest) GetWalFsyncMillis() uint64 {
+	if x != nil {
+		return x.WalFsyncMillis
+	}
+	return 0
+}
+
+func (x *HeartbeatRequest) GetGroupCommitAvgBatch() float64 {
+	if x != nil {
+		return x.GroupCommitAvgBatch
+	}
+	return 0
+}
+
+func (x *HeartbeatRequest) GetVectorSegments() uint64 {
+	if x != nil {
+		return x.VectorSegments
+	}
+	return 0
+}
+
+func (x *HeartbeatRequest) GetVectorNodes() uint64 {
+	if x != nil {
+		return x.VectorNodes
+	}
+	return 0
+}
+
+func (x *HeartbeatRequest) GetVectorPendingSegments() uint64 {
+	if x != nil {
+		return x.VectorPendingSegments
+	}
+	return 0
+}
+
+func (x *HeartbeatRequest) GetVectorSearches() uint64 {
+	if x != nil {
+		return x.VectorSearches
+	}
+	return 0
+}
+
+func (x *HeartbeatRequest) GetVectorAvgCandidates() float64 {
+	if x != nil {
+		return x.VectorAvgCandidates
+	}
+	return 0
+}
+
 type HeartbeatResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Status        StatusCode             `protobuf:"varint,1,opt,name=status,proto3,enum=tangdb.v1.StatusCode" json:"status,omitempty"`
@@ -2207,7 +2764,7 @@ type HeartbeatResponse struct {
 
 func (x *HeartbeatResponse) Reset() {
 	*x = HeartbeatResponse{}
-	mi := &file_tangdb_proto_msgTypes[30]
+	mi := &file_tangdb_proto_msgTypes[37]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2219,7 +2776,7 @@ func (x *HeartbeatResponse) String() string {
 func (*HeartbeatResponse) ProtoMessage() {}
 
 func (x *HeartbeatResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_tangdb_proto_msgTypes[30]
+	mi := &file_tangdb_proto_msgTypes[37]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2232,7 +2789,7 @@ func (x *HeartbeatResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HeartbeatResponse.ProtoReflect.Descriptor instead.
 func (*HeartbeatResponse) Descriptor() ([]byte, []int) {
-	return file_tangdb_proto_rawDescGZIP(), []int{30}
+	return file_tangdb_proto_rawDescGZIP(), []int{37}
 }
 
 func (x *HeartbeatResponse) GetStatus() StatusCode {
@@ -2388,7 +2945,46 @@ const file_tangdb_proto_rawDesc = "" +
 	"\vgraph_bytes\x18\a \x01(\x04R\n" +
 	"graphBytes\x12\x16\n" +
 	"\x06metric\x18\b \x01(\rR\x06metric\x12\x10\n" +
-	"\x03dim\x18\t \x01(\rR\x03dim\"\xd1\x01\n" +
+	"\x03dim\x18\t \x01(\rR\x03dim\"\x94\x01\n" +
+	"\rBackupRequest\x12\x1d\n" +
+	"\n" +
+	"backup_dir\x18\x01 \x01(\tR\tbackupDir\x12)\n" +
+	"\x10incremental_from\x18\x02 \x01(\tR\x0fincrementalFrom\x12#\n" +
+	"\rsnapshot_rows\x18\x03 \x01(\x04R\fsnapshotRows\x12\x14\n" +
+	"\x05force\x18\x04 \x01(\bR\x05force\"p\n" +
+	"\x0eBackupResponse\x12-\n" +
+	"\x06status\x18\x01 \x01(\x0e2\x15.tangdb.v1.StatusCodeR\x06status\x12\x18\n" +
+	"\amessage\x18\x02 \x01(\tR\amessage\x12\x15\n" +
+	"\x06job_id\x18\x03 \x01(\tR\x05jobId\")\n" +
+	"\x10BackupJobRequest\x12\x15\n" +
+	"\x06job_id\x18\x01 \x01(\tR\x05jobId\"\xbf\x02\n" +
+	"\rBackupJobInfo\x12\x15\n" +
+	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x12\x1d\n" +
+	"\n" +
+	"backup_dir\x18\x02 \x01(\tR\tbackupDir\x12\x16\n" +
+	"\x06status\x18\x03 \x01(\tR\x06status\x12!\n" +
+	"\fcopied_bytes\x18\x04 \x01(\x04R\vcopiedBytes\x12\x1f\n" +
+	"\vtotal_bytes\x18\x05 \x01(\x04R\n" +
+	"totalBytes\x12\x18\n" +
+	"\amessage\x18\x06 \x01(\tR\amessage\x12 \n" +
+	"\vincremental\x18\a \x01(\bR\vincremental\x12.\n" +
+	"\x13started_unix_millis\x18\b \x01(\x03R\x11startedUnixMillis\x120\n" +
+	"\x14finished_unix_millis\x18\t \x01(\x03R\x12finishedUnixMillis\"\x8a\x01\n" +
+	"\x11BackupJobResponse\x12-\n" +
+	"\x06status\x18\x01 \x01(\x0e2\x15.tangdb.v1.StatusCodeR\x06status\x12\x18\n" +
+	"\amessage\x18\x02 \x01(\tR\amessage\x12,\n" +
+	"\x04jobs\x18\x03 \x03(\v2\x18.tangdb.v1.BackupJobInfoR\x04jobs\"d\n" +
+	"\x0eRestoreRequest\x12\x1d\n" +
+	"\n" +
+	"source_dir\x18\x01 \x01(\tR\tsourceDir\x12\x1d\n" +
+	"\n" +
+	"target_dir\x18\x02 \x01(\tR\ttargetDir\x12\x14\n" +
+	"\x05force\x18\x03 \x01(\bR\x05force\"\x86\x01\n" +
+	"\x0fRestoreResponse\x12-\n" +
+	"\x06status\x18\x01 \x01(\x0e2\x15.tangdb.v1.StatusCodeR\x06status\x12\x18\n" +
+	"\amessage\x18\x02 \x01(\tR\amessage\x12\x14\n" +
+	"\x05files\x18\x03 \x01(\x04R\x05files\x12\x14\n" +
+	"\x05bytes\x18\x04 \x01(\x04R\x05bytes\"\xd1\x01\n" +
 	"\x11RegisterBeRequest\x12\x13\n" +
 	"\x05be_id\x18\x01 \x01(\tR\x04beId\x12\x1a\n" +
 	"\bendpoint\x18\x02 \x01(\tR\bendpoint\x12\x18\n" +
@@ -2397,7 +2993,8 @@ const file_tangdb_proto_rawDesc = "" +
 	"\x1aheartbeat_interval_seconds\x18\x05 \x01(\rR\x18heartbeatIntervalSeconds\"]\n" +
 	"\x12RegisterBeResponse\x12-\n" +
 	"\x06status\x18\x01 \x01(\x0e2\x15.tangdb.v1.StatusCodeR\x06status\x12\x18\n" +
-	"\amessage\x18\x02 \x01(\tR\amessage\"\xdf\x06\n" +
+	"\amessage\x18\x02 \x01(\tR\amessage\"\xc6\n" +
+	"\n" +
 	"\x10HeartbeatRequest\x12\x13\n" +
 	"\x05be_id\x18\x01 \x01(\tR\x04beId\x12\x1a\n" +
 	"\bendpoint\x18\x02 \x01(\tR\bendpoint\x12\x18\n" +
@@ -2423,7 +3020,18 @@ const file_tangdb_proto_rawDesc = "" +
 	"\x16last_fsync_unix_millis\x182 \x01(\x03R\x13lastFsyncUnixMillis\x12\x1f\n" +
 	"\vchunks_read\x18< \x01(\x04R\n" +
 	"chunksRead\x12%\n" +
-	"\x0echunks_skipped\x18= \x01(\x04R\rchunksSkipped\"\\\n" +
+	"\x0echunks_skipped\x18= \x01(\x04R\rchunksSkipped\x12%\n" +
+	"\x0ememtable_count\x18F \x01(\x04R\rmemtableCount\x12)\n" +
+	"\x10compaction_count\x18G \x01(\x04R\x0fcompactionCount\x12+\n" +
+	"\x11compaction_millis\x18H \x01(\x04R\x10compactionMillis\x12&\n" +
+	"\x0fwal_fsync_count\x18I \x01(\x04R\rwalFsyncCount\x12(\n" +
+	"\x10wal_fsync_millis\x18J \x01(\x04R\x0ewalFsyncMillis\x123\n" +
+	"\x16group_commit_avg_batch\x18K \x01(\x01R\x13groupCommitAvgBatch\x12'\n" +
+	"\x0fvector_segments\x18P \x01(\x04R\x0evectorSegments\x12!\n" +
+	"\fvector_nodes\x18Q \x01(\x04R\vvectorNodes\x126\n" +
+	"\x17vector_pending_segments\x18R \x01(\x04R\x15vectorPendingSegments\x12'\n" +
+	"\x0fvector_searches\x18S \x01(\x04R\x0evectorSearches\x122\n" +
+	"\x15vector_avg_candidates\x18T \x01(\x01R\x13vectorAvgCandidates\"\\\n" +
 	"\x11HeartbeatResponse\x12-\n" +
 	"\x06status\x18\x01 \x01(\x0e2\x15.tangdb.v1.StatusCodeR\x06status\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\tR\amessage*m\n" +
@@ -2434,7 +3042,7 @@ const file_tangdb_proto_rawDesc = "" +
 	"\tNOT_FOUND\x10\x02\x12\x14\n" +
 	"\x10INVALID_ARGUMENT\x10\x03\x12\f\n" +
 	"\bINTERNAL\x10\x04\x12\f\n" +
-	"\bCONFLICT\x10\x052\xfb\x06\n" +
+	"\bCONFLICT\x10\x052\xc4\b\n" +
 	"\x06TangDb\x127\n" +
 	"\x04Ping\x12\x16.tangdb.v1.PingRequest\x1a\x17.tangdb.v1.PingResponse\x124\n" +
 	"\x03Put\x12\x15.tangdb.v1.PutRequest\x1a\x16.tangdb.v1.PutResponse\x124\n" +
@@ -2447,7 +3055,10 @@ const file_tangdb_proto_rawDesc = "" +
 	"\x0fDropVectorIndex\x12!.tangdb.v1.DropVectorIndexRequest\x1a\".tangdb.v1.DropVectorIndexResponse\x12^\n" +
 	"\x11SearchVectorIndex\x12#.tangdb.v1.SearchVectorIndexRequest\x1a$.tangdb.v1.SearchVectorIndexResponse\x12^\n" +
 	"\x11VectorIndexStatus\x12#.tangdb.v1.VectorIndexStatusRequest\x1a$.tangdb.v1.VectorIndexStatusResponse\x12C\n" +
-	"\bBatchGet\x12\x1a.tangdb.v1.BatchGetRequest\x1a\x1b.tangdb.v1.BatchGetResponse2\xa9\x01\n" +
+	"\bBatchGet\x12\x1a.tangdb.v1.BatchGetRequest\x1a\x1b.tangdb.v1.BatchGetResponse\x12=\n" +
+	"\x06Backup\x12\x18.tangdb.v1.BackupRequest\x1a\x19.tangdb.v1.BackupResponse\x12F\n" +
+	"\tBackupJob\x12\x1b.tangdb.v1.BackupJobRequest\x1a\x1c.tangdb.v1.BackupJobResponse\x12@\n" +
+	"\aRestore\x12\x19.tangdb.v1.RestoreRequest\x1a\x1a.tangdb.v1.RestoreResponse2\xa9\x01\n" +
 	"\x0eTangDbFrontend\x12I\n" +
 	"\n" +
 	"RegisterBe\x12\x1c.tangdb.v1.RegisterBeRequest\x1a\x1d.tangdb.v1.RegisterBeResponse\x12L\n" +
@@ -2467,7 +3078,7 @@ func file_tangdb_proto_rawDescGZIP() []byte {
 }
 
 var file_tangdb_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_tangdb_proto_msgTypes = make([]protoimpl.MessageInfo, 31)
+var file_tangdb_proto_msgTypes = make([]protoimpl.MessageInfo, 38)
 var file_tangdb_proto_goTypes = []any{
 	(StatusCode)(0),                     // 0: tangdb.v1.StatusCode
 	(*PingRequest)(nil),                 // 1: tangdb.v1.PingRequest
@@ -2497,10 +3108,17 @@ var file_tangdb_proto_goTypes = []any{
 	(*BatchGetResponse)(nil),            // 25: tangdb.v1.BatchGetResponse
 	(*VectorIndexStatusRequest)(nil),    // 26: tangdb.v1.VectorIndexStatusRequest
 	(*VectorIndexStatusResponse)(nil),   // 27: tangdb.v1.VectorIndexStatusResponse
-	(*RegisterBeRequest)(nil),           // 28: tangdb.v1.RegisterBeRequest
-	(*RegisterBeResponse)(nil),          // 29: tangdb.v1.RegisterBeResponse
-	(*HeartbeatRequest)(nil),            // 30: tangdb.v1.HeartbeatRequest
-	(*HeartbeatResponse)(nil),           // 31: tangdb.v1.HeartbeatResponse
+	(*BackupRequest)(nil),               // 28: tangdb.v1.BackupRequest
+	(*BackupResponse)(nil),              // 29: tangdb.v1.BackupResponse
+	(*BackupJobRequest)(nil),            // 30: tangdb.v1.BackupJobRequest
+	(*BackupJobInfo)(nil),               // 31: tangdb.v1.BackupJobInfo
+	(*BackupJobResponse)(nil),           // 32: tangdb.v1.BackupJobResponse
+	(*RestoreRequest)(nil),              // 33: tangdb.v1.RestoreRequest
+	(*RestoreResponse)(nil),             // 34: tangdb.v1.RestoreResponse
+	(*RegisterBeRequest)(nil),           // 35: tangdb.v1.RegisterBeRequest
+	(*RegisterBeResponse)(nil),          // 36: tangdb.v1.RegisterBeResponse
+	(*HeartbeatRequest)(nil),            // 37: tangdb.v1.HeartbeatRequest
+	(*HeartbeatResponse)(nil),           // 38: tangdb.v1.HeartbeatResponse
 }
 var file_tangdb_proto_depIdxs = []int32{
 	0,  // 0: tangdb.v1.PutResponse.status:type_name -> tangdb.v1.StatusCode
@@ -2519,41 +3137,51 @@ var file_tangdb_proto_depIdxs = []int32{
 	0,  // 13: tangdb.v1.BatchGetResponse.status:type_name -> tangdb.v1.StatusCode
 	7,  // 14: tangdb.v1.BatchGetResponse.rows:type_name -> tangdb.v1.Kv
 	0,  // 15: tangdb.v1.VectorIndexStatusResponse.status:type_name -> tangdb.v1.StatusCode
-	0,  // 16: tangdb.v1.RegisterBeResponse.status:type_name -> tangdb.v1.StatusCode
-	0,  // 17: tangdb.v1.HeartbeatResponse.status:type_name -> tangdb.v1.StatusCode
-	1,  // 18: tangdb.v1.TangDb.Ping:input_type -> tangdb.v1.PingRequest
-	3,  // 19: tangdb.v1.TangDb.Put:input_type -> tangdb.v1.PutRequest
-	5,  // 20: tangdb.v1.TangDb.Get:input_type -> tangdb.v1.GetRequest
-	8,  // 21: tangdb.v1.TangDb.Scan:input_type -> tangdb.v1.ScanRequest
-	10, // 22: tangdb.v1.TangDb.BeginTxn:input_type -> tangdb.v1.BeginTxnRequest
-	12, // 23: tangdb.v1.TangDb.CommitTxn:input_type -> tangdb.v1.CommitTxnRequest
-	14, // 24: tangdb.v1.TangDb.AbortTxn:input_type -> tangdb.v1.AbortTxnRequest
-	17, // 25: tangdb.v1.TangDb.RegisterVectorIndex:input_type -> tangdb.v1.RegisterVectorIndexRequest
-	19, // 26: tangdb.v1.TangDb.DropVectorIndex:input_type -> tangdb.v1.DropVectorIndexRequest
-	21, // 27: tangdb.v1.TangDb.SearchVectorIndex:input_type -> tangdb.v1.SearchVectorIndexRequest
-	26, // 28: tangdb.v1.TangDb.VectorIndexStatus:input_type -> tangdb.v1.VectorIndexStatusRequest
-	24, // 29: tangdb.v1.TangDb.BatchGet:input_type -> tangdb.v1.BatchGetRequest
-	28, // 30: tangdb.v1.TangDbFrontend.RegisterBe:input_type -> tangdb.v1.RegisterBeRequest
-	30, // 31: tangdb.v1.TangDbFrontend.ReportHeartbeat:input_type -> tangdb.v1.HeartbeatRequest
-	2,  // 32: tangdb.v1.TangDb.Ping:output_type -> tangdb.v1.PingResponse
-	4,  // 33: tangdb.v1.TangDb.Put:output_type -> tangdb.v1.PutResponse
-	6,  // 34: tangdb.v1.TangDb.Get:output_type -> tangdb.v1.GetResponse
-	9,  // 35: tangdb.v1.TangDb.Scan:output_type -> tangdb.v1.RowBatch
-	11, // 36: tangdb.v1.TangDb.BeginTxn:output_type -> tangdb.v1.BeginTxnResponse
-	13, // 37: tangdb.v1.TangDb.CommitTxn:output_type -> tangdb.v1.CommitTxnResponse
-	15, // 38: tangdb.v1.TangDb.AbortTxn:output_type -> tangdb.v1.AbortTxnResponse
-	18, // 39: tangdb.v1.TangDb.RegisterVectorIndex:output_type -> tangdb.v1.RegisterVectorIndexResponse
-	20, // 40: tangdb.v1.TangDb.DropVectorIndex:output_type -> tangdb.v1.DropVectorIndexResponse
-	23, // 41: tangdb.v1.TangDb.SearchVectorIndex:output_type -> tangdb.v1.SearchVectorIndexResponse
-	27, // 42: tangdb.v1.TangDb.VectorIndexStatus:output_type -> tangdb.v1.VectorIndexStatusResponse
-	25, // 43: tangdb.v1.TangDb.BatchGet:output_type -> tangdb.v1.BatchGetResponse
-	29, // 44: tangdb.v1.TangDbFrontend.RegisterBe:output_type -> tangdb.v1.RegisterBeResponse
-	31, // 45: tangdb.v1.TangDbFrontend.ReportHeartbeat:output_type -> tangdb.v1.HeartbeatResponse
-	32, // [32:46] is the sub-list for method output_type
-	18, // [18:32] is the sub-list for method input_type
-	18, // [18:18] is the sub-list for extension type_name
-	18, // [18:18] is the sub-list for extension extendee
-	0,  // [0:18] is the sub-list for field type_name
+	0,  // 16: tangdb.v1.BackupResponse.status:type_name -> tangdb.v1.StatusCode
+	0,  // 17: tangdb.v1.BackupJobResponse.status:type_name -> tangdb.v1.StatusCode
+	31, // 18: tangdb.v1.BackupJobResponse.jobs:type_name -> tangdb.v1.BackupJobInfo
+	0,  // 19: tangdb.v1.RestoreResponse.status:type_name -> tangdb.v1.StatusCode
+	0,  // 20: tangdb.v1.RegisterBeResponse.status:type_name -> tangdb.v1.StatusCode
+	0,  // 21: tangdb.v1.HeartbeatResponse.status:type_name -> tangdb.v1.StatusCode
+	1,  // 22: tangdb.v1.TangDb.Ping:input_type -> tangdb.v1.PingRequest
+	3,  // 23: tangdb.v1.TangDb.Put:input_type -> tangdb.v1.PutRequest
+	5,  // 24: tangdb.v1.TangDb.Get:input_type -> tangdb.v1.GetRequest
+	8,  // 25: tangdb.v1.TangDb.Scan:input_type -> tangdb.v1.ScanRequest
+	10, // 26: tangdb.v1.TangDb.BeginTxn:input_type -> tangdb.v1.BeginTxnRequest
+	12, // 27: tangdb.v1.TangDb.CommitTxn:input_type -> tangdb.v1.CommitTxnRequest
+	14, // 28: tangdb.v1.TangDb.AbortTxn:input_type -> tangdb.v1.AbortTxnRequest
+	17, // 29: tangdb.v1.TangDb.RegisterVectorIndex:input_type -> tangdb.v1.RegisterVectorIndexRequest
+	19, // 30: tangdb.v1.TangDb.DropVectorIndex:input_type -> tangdb.v1.DropVectorIndexRequest
+	21, // 31: tangdb.v1.TangDb.SearchVectorIndex:input_type -> tangdb.v1.SearchVectorIndexRequest
+	26, // 32: tangdb.v1.TangDb.VectorIndexStatus:input_type -> tangdb.v1.VectorIndexStatusRequest
+	24, // 33: tangdb.v1.TangDb.BatchGet:input_type -> tangdb.v1.BatchGetRequest
+	28, // 34: tangdb.v1.TangDb.Backup:input_type -> tangdb.v1.BackupRequest
+	30, // 35: tangdb.v1.TangDb.BackupJob:input_type -> tangdb.v1.BackupJobRequest
+	33, // 36: tangdb.v1.TangDb.Restore:input_type -> tangdb.v1.RestoreRequest
+	35, // 37: tangdb.v1.TangDbFrontend.RegisterBe:input_type -> tangdb.v1.RegisterBeRequest
+	37, // 38: tangdb.v1.TangDbFrontend.ReportHeartbeat:input_type -> tangdb.v1.HeartbeatRequest
+	2,  // 39: tangdb.v1.TangDb.Ping:output_type -> tangdb.v1.PingResponse
+	4,  // 40: tangdb.v1.TangDb.Put:output_type -> tangdb.v1.PutResponse
+	6,  // 41: tangdb.v1.TangDb.Get:output_type -> tangdb.v1.GetResponse
+	9,  // 42: tangdb.v1.TangDb.Scan:output_type -> tangdb.v1.RowBatch
+	11, // 43: tangdb.v1.TangDb.BeginTxn:output_type -> tangdb.v1.BeginTxnResponse
+	13, // 44: tangdb.v1.TangDb.CommitTxn:output_type -> tangdb.v1.CommitTxnResponse
+	15, // 45: tangdb.v1.TangDb.AbortTxn:output_type -> tangdb.v1.AbortTxnResponse
+	18, // 46: tangdb.v1.TangDb.RegisterVectorIndex:output_type -> tangdb.v1.RegisterVectorIndexResponse
+	20, // 47: tangdb.v1.TangDb.DropVectorIndex:output_type -> tangdb.v1.DropVectorIndexResponse
+	23, // 48: tangdb.v1.TangDb.SearchVectorIndex:output_type -> tangdb.v1.SearchVectorIndexResponse
+	27, // 49: tangdb.v1.TangDb.VectorIndexStatus:output_type -> tangdb.v1.VectorIndexStatusResponse
+	25, // 50: tangdb.v1.TangDb.BatchGet:output_type -> tangdb.v1.BatchGetResponse
+	29, // 51: tangdb.v1.TangDb.Backup:output_type -> tangdb.v1.BackupResponse
+	32, // 52: tangdb.v1.TangDb.BackupJob:output_type -> tangdb.v1.BackupJobResponse
+	34, // 53: tangdb.v1.TangDb.Restore:output_type -> tangdb.v1.RestoreResponse
+	36, // 54: tangdb.v1.TangDbFrontend.RegisterBe:output_type -> tangdb.v1.RegisterBeResponse
+	38, // 55: tangdb.v1.TangDbFrontend.ReportHeartbeat:output_type -> tangdb.v1.HeartbeatResponse
+	39, // [39:56] is the sub-list for method output_type
+	22, // [22:39] is the sub-list for method input_type
+	22, // [22:22] is the sub-list for extension type_name
+	22, // [22:22] is the sub-list for extension extendee
+	0,  // [0:22] is the sub-list for field type_name
 }
 
 func init() { file_tangdb_proto_init() }
@@ -2567,7 +3195,7 @@ func file_tangdb_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_tangdb_proto_rawDesc), len(file_tangdb_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   31,
+			NumMessages:   38,
 			NumExtensions: 0,
 			NumServices:   2,
 		},

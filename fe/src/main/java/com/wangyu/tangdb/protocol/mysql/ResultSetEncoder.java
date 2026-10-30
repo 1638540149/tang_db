@@ -245,6 +245,23 @@ public final class ResultSetEncoder {
         return out.toByteArray();
     }
 
+    /** SPEC-P8 FR-813:COM_FIELD_LIST 用,按列名 + 协议类型直接产出 ColumnDefinition41。 */
+    public static byte[] columnDef(String name, int type) {
+        return columnDefPacket(new ColumnInfo(name, type));
+    }
+
+    /** 存储类型 → 协议类型码(FIELD_LIST / 列定义共用)。 */
+    public static int protocolType(com.wangyu.tangdb.storage.DataType type) {
+        return switch (type) {
+            case INT -> TYPE_LONG;
+            case BIGINT -> TYPE_LONGLONG;
+            case DOUBLE -> TYPE_DOUBLE;
+            case DATE -> TYPE_DATE;
+            case BOOLEAN -> TYPE_TINY;
+            case VARCHAR, JSON, VECTOR -> TYPE_VAR_STRING;
+        };
+    }
+
     private static byte[] columnDefPacket(ColumnInfo column) {
         ByteArrayOutputStream out = new ByteArrayOutputStream(64);
         writeLenencString(out, "def");

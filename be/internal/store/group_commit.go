@@ -65,6 +65,7 @@ func (e *Engine) waitDurableAndApply(seq uint64) error {
 
 	e.injectCrash(CrashFsyncMidGroup)
 
+	syncStart := time.Now()
 	if err := w.Sync(); err != nil {
 		// fsync 失败:这一组不能算提交成功,丢弃待应用队列并向所有等待者报错。
 		e.commitMu.Lock()
@@ -79,6 +80,8 @@ func (e *Engine) waitDurableAndApply(seq uint64) error {
 		e.groupMu.Unlock()
 		return fmt.Errorf("store: wal fsync: %w", err)
 	}
+	e.fsyncCount.Add(1)
+	e.fsyncMillis.Add(uint64(time.Since(syncStart).Milliseconds()))
 	e.lastFsyncMilli.Store(time.Now().UnixMilli())
 
 	// 边界 #110:fsync 已完成、还没回包时崩溃 —— 重启重放后这条事务可见(要么全在)。
@@ -86,6 +89,10 @@ func (e *Engine) waitDurableAndApply(seq uint64) error {
 	e.injectCrash(CrashFsyncAfterDone)
 
 	batch := e.takePending(target)
+	if len(batch) > 0 {
+		e.groupBatches.Add(1)
+		e.groupCommits.Add(uint64(len(batch)))
+	}
 	if err := e.applyBatch(batch); err != nil {
 		e.groupMu.Lock()
 		e.syncErr = err

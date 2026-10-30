@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"time"
 
 	"github.com/1638540149/tang_db/be/internal/manifest"
 	"github.com/1638540149/tang_db/be/internal/segment"
@@ -160,6 +161,11 @@ func segmentFileSize(path string) int64 {
 
 // runCompaction 执行一次合并。写入与 merge 在锁外进行;MANIFEST 原子切换在锁内。
 func (e *Engine) runCompaction(inputs []uint64, outLevel int) error {
+	startedAt := time.Now()
+	defer func() {
+		e.compactionCount.Add(1)
+		e.compactionMillis.Add(uint64(time.Since(startedAt).Milliseconds()))
+	}()
 	e.mu.RLock()
 	if e.closed {
 		e.mu.RUnlock()

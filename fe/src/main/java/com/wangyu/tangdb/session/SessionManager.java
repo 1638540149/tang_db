@@ -63,11 +63,16 @@ public final class SessionManager {
      * @throws SqlError 超过会话上限(1040)
      */
     public Session register(long id, String source, Executor executor) {
+        return register(id, source, executor, Session.CHANNEL_MYSQL);
+    }
+
+    /** SPEC-P8 FR-862:控制台会话走自己的会话表(与 MySQL 连接池额度隔离)。 */
+    public Session register(long id, String source, Executor executor, String channel) {
         if (sessions.size() >= maxSessions) {
             throw new SqlError(ER_CON_COUNT_ERROR, "08004",
                     "会话数已达上限 " + maxSessions + ",请稍后再试");
         }
-        Session session = new Session(id, source, executor);
+        Session session = new Session(id, source, executor, channel);
         sessions.put(id, session);
         return session;
     }

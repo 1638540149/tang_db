@@ -1066,6 +1066,9 @@ public final class Catalog {
         ensureTable(SystemTables.COLUMN_STATS);
         // SPEC-P7 §5.3:向量索引系统表(新目录 format_version=3 才有;老目录已在 BE 侧拒绝)。
         ensureTable(SystemTables.VEC_INDEXES);
+        // SPEC-P8 §5.1:慢查询(表 ID 10)与备份任务(表 ID 11)幂等补齐,next_table_id 下限不变。
+        ensureTable(SystemTables.SLOW_QUERY);
+        ensureTable(SystemTables.BACKUP_JOBS);
         if (kv.get(SystemTables.counterKey(SystemTables.COUNTER_NEXT_TABLE_ID)) == null) {
             kv.put(SystemTables.counterKey(SystemTables.COUNTER_NEXT_TABLE_ID),
                     SystemTables.encodeCounterRow(SystemTables.COUNTER_NEXT_TABLE_ID,

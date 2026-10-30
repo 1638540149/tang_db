@@ -40,6 +40,8 @@ public final class ConnectionHandler implements Runnable {
     private final Catalog catalog;
     private final String user;
     private final byte[] storedHash;
+    /** SPEC-P8 FR-819:空闲超时秒数(0 = 不断开);socket 已由 MysqlServer 设好 SO_TIMEOUT。 */
+    private final int waitTimeoutSeconds;
 
     private PacketIO io;
     private Session session;
@@ -52,6 +54,12 @@ public final class ConnectionHandler implements Runnable {
     public ConnectionHandler(Socket socket, long connectionId, SqlEngine engine,
                              SessionManager sessions, KvStore kv, Catalog catalog,
                              String user, byte[] storedHash) {
+        this(socket, connectionId, engine, sessions, kv, catalog, user, storedHash, 0);
+    }
+
+    public ConnectionHandler(Socket socket, long connectionId, SqlEngine engine,
+                             SessionManager sessions, KvStore kv, Catalog catalog,
+                             String user, byte[] storedHash, int waitTimeoutSeconds) {
         this.socket = socket;
         this.connectionId = connectionId;
         this.engine = engine;
@@ -60,6 +68,7 @@ public final class ConnectionHandler implements Runnable {
         this.catalog = catalog;
         this.user = user == null ? "" : user;
         this.storedHash = storedHash;
+        this.waitTimeoutSeconds = Math.max(0, waitTimeoutSeconds);
     }
 
     @Override
@@ -188,6 +197,11 @@ public final class ConnectionHandler implements Runnable {
             byte[] packet;
             try {
                 packet = io.readPacket();
+            } catch (java.net.SocketTimeoutException e) {
+                // 边界 168:mysql_wait_timeout > 0 时空闲到期断开,并留下日志。
+                LOG.log(Level.INFO, "连接空闲超时断开 connection_id={0} wait_timeout={1}s",
+                        new Object[]{connectionId, waitTimeoutSeconds});
+                return;
             } catch (IOException e) {
                 return; // 客户端断开
             }
@@ -204,13 +218,42 @@ public final class ConnectionHandler implements Runnable {
                 case Protocol.COM_PING -> io.writePacket(ResultSetEncoder.okPacket(0, 0, statusFlags(), 0));
                 case Protocol.COM_QUERY -> handleQuery(args);
                 case Protocol.COM_INIT_DB -> handleInitDb(args);
+                case Protocol.COM_FIELD_LIST -> handleFieldList(args);
                 case Protocol.COM_STMT_PREPARE, Protocol.COM_STMT_EXECUTE, Protocol.COM_STMT_CLOSE ->
+                        // FR-814 / 边界 166:明确报错并保持连接,绝不静默断连。
                         io.writePacket(ResultSetEncoder.errPacket(SqlError.ER_UNSUPPORTED_PS, "HY000",
-                                "不支持服务端预编译,请使用 useServerPrepStmts=false"));
+                                "本期未实现二进制预处理协议,请用文本协议"
+                                        + "(useServerPrepStmts=false)"));
                 default -> io.writePacket(ResultSetEncoder.errPacket(SqlError.ER_NOT_SUPPORTED_YET, "42000",
                         "不支持的协议命令: " + command));
             }
         }
+    }
+
+    /**
+     * COM_FIELD_LIST(FR-813):按表定义回列定义包 + EOF;表不存在回 1146。
+     * 只依赖 catalog,不生成 SQL、不经过执行层。
+     */
+    private void handleFieldList(byte[] args) throws IOException {
+        int nul = 0;
+        while (nul < args.length && args[nul] != 0) {
+            nul++;
+        }
+        String tableName = new String(args, 0, nul, StandardCharsets.UTF_8).trim();
+        String database = session == null ? null : session.currentDatabase();
+        com.wangyu.tangdb.storage.TableMeta table;
+        try {
+            table = catalog.require(database, tableName);
+        } catch (RuntimeException e) {
+            SqlError se = SqlError.from(e);
+            io.writePacket(ResultSetEncoder.errPacket(se.code(), se.sqlState(), se.getMessage()));
+            return;
+        }
+        for (com.wangyu.tangdb.storage.Column column : table.columns()) {
+            io.writePacket(ResultSetEncoder.columnDef(column.name(),
+                    ResultSetEncoder.protocolType(column.type())));
+        }
+        io.writePacket(ResultSetEncoder.eofPacket(0, statusFlags()));
     }
 
     private void handleInitDb(byte[] args) throws IOException {

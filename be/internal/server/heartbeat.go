@@ -90,6 +90,18 @@ func BuildHeartbeat(beID, endpoint, version string, interval time.Duration, star
 		LastFsyncUnixMillis:      st.LastFsyncUnixMilli,
 		ChunksRead:               st.ChunksRead,
 		ChunksSkipped:            st.ChunksSkipped,
+		// ---- SPEC-P8 B 组:运维指标 ----
+		MemtableCount:           st.MemTableCount,
+		CompactionCount:         st.CompactionCount,
+		CompactionMillis:        st.CompactionMillis,
+		WalFsyncCount:           st.FSyncCount,
+		WalFsyncMillis:          st.FSyncMillis,
+		GroupCommitAvgBatch:     st.GroupCommitAvgBatch,
+		VectorSegments:          st.VectorSegments,
+		VectorNodes:             st.VectorNodes,
+		VectorPendingSegments:   st.VectorPending,
+		VectorSearches:          st.VectorSearches,
+		VectorAvgCandidates:     st.VectorAvgCandidates,
 	}
 }
 

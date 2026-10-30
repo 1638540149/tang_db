@@ -282,6 +282,62 @@ service TangDb {
   rpc VectorIndexStatus(VectorIndexStatusRequest) returns (VectorIndexStatusResponse);
   // ANN 候选回表:一次取多行,避免逐候选一次 RPC(向量检索时延的关键)
   rpc BatchGet(BatchGetRequest) returns (BatchGetResponse);
+  // ---- SPEC-P8 D 组:在线备份 / 恢复(FR-841 ~ FR-850)----
+  rpc Backup     (BackupRequest)      returns (BackupResponse);
+  rpc BackupJob  (BackupJobRequest)   returns (BackupJobResponse);
+  rpc Restore    (RestoreRequest)     returns (RestoreResponse);
+}
+
+// ---------------------------------------------------------------- SPEC-P8:备份与恢复
+//
+// 契约只含目录与数字:BE 不理解表/列/SQL(边界铁律);快照行数由 FE 按统计信息给出。
+
+message BackupRequest {
+  string backup_dir       = 1;  // 备份目标目录(必填)
+  string incremental_from = 2;  // 增量父目录(空 = 全量)
+  uint64 snapshot_rows    = 3;  // 备份点行数(FE 统计口径,仅写入 BACKUP_META)
+  bool   force            = 4;  // 目标目录非空时是否覆盖
+}
+
+message BackupResponse {
+  StatusCode status  = 1;
+  string     message = 2;
+  string     job_id  = 3;
+}
+
+message BackupJobRequest {
+  string job_id = 1;  // 空 = 全部任务
+}
+
+message BackupJobInfo {
+  string job_id       = 1;
+  string backup_dir   = 2;
+  string status       = 3;  // RUNNING / SUCCESS / FAILED / CANCELLED
+  uint64 copied_bytes = 4;
+  uint64 total_bytes  = 5;
+  string message      = 6;
+  bool   incremental  = 7;
+  int64  started_unix_millis = 8;
+  int64  finished_unix_millis = 9;
+}
+
+message BackupJobResponse {
+  StatusCode status  = 1;
+  string     message = 2;
+  repeated BackupJobInfo jobs = 3;
+}
+
+message RestoreRequest {
+  string source_dir = 1;  // 备份目录(必填)
+  string target_dir = 2;  // 恢复目标目录(必填;必须为空或 force)
+  bool   force      = 3;
+}
+
+message RestoreResponse {
+  StatusCode status  = 1;
+  string     message = 2;
+  uint64 files       = 3;
+  uint64 bytes       = 4;
 }
 
 // ---------------------------------------------------------------- BE → FE:注册与心跳
@@ -338,6 +394,19 @@ message HeartbeatRequest {
   // 被跳过的 chunk 数;SHOW SEGMENTS 展示用。只加字段,不改既有语义。
   uint64 chunks_read        = 60;
   uint64 chunks_skipped     = 61;
+
+  // ---- SPEC-P8 B 组:运维指标(FR-827 / FR-828)。只加字段,语义不变。 ----
+  uint64 memtable_count      = 70;  // memtable 条目数
+  uint64 compaction_count    = 71;
+  uint64 compaction_millis   = 72;
+  uint64 wal_fsync_count     = 73;
+  uint64 wal_fsync_millis    = 74;
+  double group_commit_avg_batch = 75;
+  uint64 vector_segments         = 80;
+  uint64 vector_nodes            = 81;
+  uint64 vector_pending_segments = 82;
+  uint64 vector_searches         = 83;
+  double vector_avg_candidates   = 84;
 }
 
 message HeartbeatResponse {

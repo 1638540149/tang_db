@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/1638540149/tang_db/be/internal/backup"
 	"github.com/1638540149/tang_db/be/internal/exec"
 	"github.com/1638540149/tang_db/be/internal/server/pb"
 	"github.com/1638540149/tang_db/be/internal/store"
@@ -29,6 +30,8 @@ const (
 type TangDbServer struct {
 	pb.UnimplementedTangDbServer
 	engine *store.Engine
+	// SPEC-P8 D 组:在线备份 / 恢复任务(进程内)。
+	backups *backup.Manager
 
 	// 事务句柄:BE 只发号与释放,不保存写集(写集在 FE 内存,FR-319)。
 	txnMu     sync.Mutex
@@ -39,8 +42,9 @@ type TangDbServer struct {
 // NewTangDbServer 创建 gRPC 服务实例。
 func NewTangDbServer(engine *store.Engine) *TangDbServer {
 	return &TangDbServer{
-		engine: engine,
-		txns:   make(map[uint64]uint64),
+		engine:  engine,
+		backups: backup.NewManager(engine),
+		txns:    make(map[uint64]uint64),
 	}
 }
 
@@ -442,4 +446,74 @@ func grpcError(err error) error {
 		return status.Error(codes.Canceled, "请求已取消")
 	}
 	return status.Error(codes.Internal, err.Error())
+}
+
+// ---------------------------------------------------------------- SPEC-P8:备份 / 恢复
+
+// Backup 启动一次后台备份(FR-841 / FR-847),立即返回任务 id。
+func (s *TangDbServer) Backup(ctx context.Context, req *pb.BackupRequest) (*pb.BackupResponse, error) {
+	job, err := s.backups.Start(req.GetBackupDir(), req.GetIncrementalFrom(),
+		req.GetSnapshotRows(), req.GetForce())
+	if err != nil {
+		return &pb.BackupResponse{
+			Status:  pb.StatusCode_INVALID_ARGUMENT,
+			Message: err.Error(),
+		}, nil
+	}
+	return &pb.BackupResponse{
+		Status:  pb.StatusCode_OK,
+		Message: "备份任务已启动",
+		JobId:   job.ID,
+	}, nil
+}
+
+// BackupJob 查任务状态;id 为空返回全部(FR-846)。
+func (s *TangDbServer) BackupJob(ctx context.Context, req *pb.BackupJobRequest) (*pb.BackupJobResponse, error) {
+	if req.GetJobId() == "" {
+		resp := &pb.BackupJobResponse{Status: pb.StatusCode_OK}
+		for _, job := range s.backups.Jobs() {
+			resp.Jobs = append(resp.Jobs, backupJobInfo(job))
+		}
+		return resp, nil
+	}
+	job, ok := s.backups.Job(req.GetJobId())
+	if !ok {
+		// BE 重启后任务表为空:FE 据此把历史 RUNNING 标成 CANCELLED(边界 182)。
+		return &pb.BackupJobResponse{
+			Status:  pb.StatusCode_NOT_FOUND,
+			Message: "任务不存在(BE 可能已重启)",
+		}, nil
+	}
+	return &pb.BackupJobResponse{Status: pb.StatusCode_OK, Jobs: []*pb.BackupJobInfo{backupJobInfo(job)}}, nil
+}
+
+// Restore 把备份目录恢复成一个可直接启动的数据目录(FR-844)。
+func (s *TangDbServer) Restore(ctx context.Context, req *pb.RestoreRequest) (*pb.RestoreResponse, error) {
+	result, err := s.backups.Restore(req.GetSourceDir(), req.GetTargetDir(), req.GetForce())
+	if err != nil {
+		return &pb.RestoreResponse{
+			Status:  pb.StatusCode_INVALID_ARGUMENT,
+			Message: err.Error(),
+		}, nil
+	}
+	return &pb.RestoreResponse{
+		Status:  pb.StatusCode_OK,
+		Message: "恢复完成,可直接用该目录启动 BE",
+		Files:   result.Files,
+		Bytes:   result.Bytes,
+	}, nil
+}
+
+func backupJobInfo(job backup.Job) *pb.BackupJobInfo {
+	return &pb.BackupJobInfo{
+		JobId:               job.ID,
+		BackupDir:           job.Dir,
+		Status:              job.Status,
+		CopiedBytes:         uint64(job.CopiedBytes),
+		TotalBytes:          uint64(job.TotalBytes),
+		Message:             job.Message,
+		Incremental:         job.Incremental,
+		StartedUnixMillis:   job.StartedMilli,
+		FinishedUnixMillis:  job.FinishedMilli,
+	}
 }

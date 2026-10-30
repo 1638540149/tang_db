@@ -851,7 +851,33 @@ func (e *Engine) SearchVectorIndex(indexID uint64, query []byte, ef, k int,
 		timings.Candidates = len(out)
 		timings.Allow = allowInfo
 	}
+	e.vecSearchCount.Add(1)
+	if examined > 0 {
+		e.vecCandidates.Add(uint64(examined))
+	}
 	return out, examined, timings, nil
+}
+
+// vectorStatusTotals 汇总全部向量索引的图段数 / 节点数 / 待重建段数(SPEC-P8 FR-828)。
+func (e *Engine) vectorStatusTotals() (segments, nodes, pending uint64) {
+	e.vec.mu.Lock()
+	defer e.vec.mu.Unlock()
+	for _, bySeg := range e.vec.ready {
+		segments += uint64(len(bySeg))
+	}
+	for _, bySeg := range e.vec.pending {
+		pending += uint64(len(bySeg))
+	}
+	for _, bySeg := range e.vec.ready {
+		for _, rt := range bySeg {
+			rt.mu.RLock()
+			if rt.graph != nil {
+				nodes += uint64(rt.graph.NodeCount())
+			}
+			rt.mu.RUnlock()
+		}
+	}
+	return segments, nodes, pending
 }
 
 // mergeCandidates 做跨段归并:同一用户键在多个段/内存里出现时只保留最小距离。

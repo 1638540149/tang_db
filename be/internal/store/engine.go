@@ -179,6 +179,15 @@ type Engine struct {
 
 	putCount       atomic.Uint64
 	getCount       atomic.Uint64
+	// ---- SPEC-P8 B 组:心跳上报的运维指标(FR-827 / FR-828)----
+	compactionCount  atomic.Uint64
+	compactionMillis atomic.Uint64
+	fsyncCount       atomic.Uint64
+	fsyncMillis      atomic.Uint64
+	groupBatches     atomic.Uint64
+	groupCommits     atomic.Uint64
+	vecSearchCount   atomic.Uint64
+	vecCandidates    atomic.Uint64
 	scanCount      atomic.Uint64
 	putErrCount    atomic.Uint64
 	getErrCount    atomic.Uint64
@@ -908,13 +917,29 @@ type Status struct {
 	// SPEC-P6.1 FR-706:chunk 解码 / 跳过计数(SHOW SEGMENTS)。
 	ChunksRead    uint64
 	ChunksSkipped uint64
+	// ---- SPEC-P8 FR-827 / FR-828 ----
+	MemTableCount     uint64
+	CompactionCount   uint64
+	CompactionMillis  uint64
+	FSyncCount        uint64
+	FSyncMillis       uint64
+	GroupCommitAvgBatch float64
+	VectorSegments    uint64
+	VectorNodes       uint64
+	VectorPending     uint64
+	VectorSearches    uint64
+	VectorAvgCandidates float64
 }
 
 // Status 采集当前状态。
 func (e *Engine) Status() Status {
 	e.mu.RLock()
 	memBytes := e.mem.ApproximateSize()
+	memCount := e.mem.Len()
 	immCount := len(e.imm)
+	for _, m := range e.imm {
+		memCount += m.Len()
+	}
 	segCount := len(e.handles)
 	dataDir := e.dataDir
 	e.mu.RUnlock()
@@ -933,7 +958,20 @@ func (e *Engine) Status() Status {
 		LastFsyncUnixMilli: e.lastFsyncMilli.Load(),
 		SegmentBytes:       dirSize(e.sstDir),
 		WALBytes:           dirSize(e.walDir),
+		MemTableCount:      uint64(memCount),
+		CompactionCount:    e.compactionCount.Load(),
+		CompactionMillis:   e.compactionMillis.Load(),
+		FSyncCount:         e.fsyncCount.Load(),
+		FSyncMillis:        e.fsyncMillis.Load(),
 	}
+	if batches := e.groupBatches.Load(); batches > 0 {
+		st.GroupCommitAvgBatch = float64(e.groupCommits.Load()) / float64(batches)
+	}
+	if searches := e.vecSearchCount.Load(); searches > 0 {
+		st.VectorSearches = searches
+		st.VectorAvgCandidates = float64(e.vecCandidates.Load()) / float64(searches)
+	}
+	st.VectorSegments, st.VectorNodes, st.VectorPending = e.vectorStatusTotals()
 	st.DiskTotalBytes, st.DiskAvailableBytes = diskUsage(dataDir)
 
 	e.mu.RLock()
@@ -966,6 +1004,52 @@ func dirSize(dir string) uint64 {
 
 // WalName 暴露给外部测试使用。
 func WalName(n uint64) string { return wal.WalName(n) }
+
+// PinSegments 为备份/导出等"按文件复制"的使用方持有若干 segment 的引用,
+// 防止 compaction 在复制期间把旧文件删掉(边界 178:备份期间 compaction 正常)。
+//
+// 返回的 release 必须调用(可重复调用);调用方应在 SnapshotManifest 之后立刻 pin,
+// 且 pin 与快照之间不得有别的 MANIFEST 切换(由调用方顺序保证:先 snapshot 再 pin)。
+func (e *Engine) PinSegments(nums []uint64) (func(), error) {
+	e.mu.RLock()
+	held := make([]*segHandle, 0, len(nums))
+	release := func() {
+		for _, h := range held {
+			e.releaseHandle(h, true)
+		}
+	}
+	for _, num := range nums {
+		h, ok := e.handles[num]
+		if !ok {
+			e.mu.RUnlock()
+			release()
+			return nil, fmt.Errorf("store: segment %d 已不在当前视图", num)
+		}
+		h.refs.Add(1)
+		held = append(held, h)
+	}
+	e.mu.RUnlock()
+	var once sync.Once
+	return func() { once.Do(release) }, nil
+}
+
+// SnapshotManifest 返回当前 MANIFEST 的深拷贝(SPEC-P8 FR-841:备份点)。
+//
+// 调用方应先 ForceFlushAll,这样快照里的 segment 集合就是"备份开始时的全量数据";
+// 之后的写入产生的段不在快照里,自然不进本次备份(FR-842)。
+func (e *Engine) SnapshotManifest() (*manifest.Manifest, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if e.closed {
+		return nil, errors.New("store: 引擎已关闭")
+	}
+	cp := *e.state
+	cp.Segments = append([]uint64(nil), e.state.Segments...)
+	cp.Levels = cloneLevels(e.state.Levels)
+	cp.VecIndexes = append([]manifest.VecIndexEntry(nil), e.state.VecIndexes...)
+	cp.VecDefs = append([]manifest.VecDefEntry(nil), e.state.VecDefs...)
+	return &cp, nil
+}
 
 // ---------------------------------------------------------------- 内部:视图与引用计数
 

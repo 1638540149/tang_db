@@ -52,7 +52,7 @@ flowchart LR
 | **P5** | 分析引擎 | 列式 segment、向量化执行、聚合、JOIN、子查询 |
 | **P6** | 优化器 | 统计信息、CBO、谓词下推、连接顺序 |
 | **P7** | AI 能力 | `VECTOR` 类型、HNSW 分段图、混合查询、推理下推 |
-| **P8** | 生产化 | MySQL 协议兼容、监控、慢查询、备份恢复 |
+| **P8** | 生产化 | MySQL 协议收口、监控指标、慢查询诊断、在线备份恢复、Web 控制台 |
 
 每期都能独立跑起来、独立演示;上一期没跑通,下一期不开工。
 
@@ -1082,11 +1082,193 @@ bash scripts/tests/p7-test.sh                 # SC-419~438 + P7.1 分段耗时 /
 - 没做:**量化压缩**(未排期)、把距离计算搬到 BE(K161 分工不变)、允许集下推到**高层**图遍历
   (过滤发生在收集端,与"允许集内展开"结果一致)。
 
+### P8 生产化:协议收口 / 监控 / 慢查询 / 备份恢复 / Web 控制台
+
+前七期把"引擎能力"做完了;P8 做的是**让别人也能用**:外部客户端连得上、状态看得见、
+慢了自己能说清原因、数据能备份能恢复、还有浏览器界面。技术栈按所有者要求写死:
+控制台前端 **Vue 3 + Element Plus + Vite**,后端 **JDK 内置 `com.sun.net.httpserver`**,
+**没有引入任何 Java Web 框架或监控库**(依赖红线不变)。
+
+**① 协议收口(A 组)**
+
+- 支持的命令:握手/认证(`mysql_native_password`)、`COM_QUERY`、`COM_PING`、`COM_INIT_DB`、
+  `COM_QUIT`、`COM_FIELD_LIST`;其余命令回明确错误包(不断连);
+- `COM_STMT_PREPARE / EXECUTE / CLOSE` 回 `1295` + "本期未实现二进制预处理协议,请用文本协议",
+  连接保持(下一条 `SELECT 1` 照常);
+- 图形客户端探测清单 **41 条**固化成脚本断言(逐条 `CODE=0`):`SHOW TABLE STATUS` /
+  `SHOW COLLATION` / `SHOW CHARSET` / `SHOW VARIABLES LIKE` / `SELECT @@xxx` /
+  `SHOW INDEX` / `SHOW CREATE TABLE` / `information_schema` 的 `COLLATIONS` / `CHARACTER_SETS` /
+  `ENGINES` / `ROUTINES`(后四张 P4 已补齐,本期纳入验收);
+- 连接与认证可配:`mysql_max_connections`(默认 128,超限回 `1040`)、
+  `mysql_wait_timeout`(默认 0 = 不断开;>0 时空闲到期断开并落日志)、
+  `mysql_ssl`(**默认 false;置 true 直接启动失败并说明未实现 TLS**,不静默降级);
+- 协议层记录每条语句的结果码与耗时(失败语句也记),供监控与慢查询使用(FR-822)。
+
+**② 监控指标(B 组)**
+
+两个通道,**同一份数据**:`GET /metrics`(Prometheus 文本,`# HELP` / `# TYPE`)与
+`SHOW METRICS [LIKE '...']`(两列 `metric` / `value`)。延迟分位用 1 分钟滑动窗口直方图
+(每秒一个槽、29 档桶),窗口内没有请求时返回 0。
+
+| 指标名 | 类型 | 含义 |
+|---|---|---|
+| `fe_uptime_seconds` | gauge | FE 运行时长 |
+| `fe_query_count` | counter | 语句执行总次数 |
+| `fe_query_qps` | gauge | QPS(1 分钟窗口平均) |
+| `fe_query_latency_p50_ms` / `p95` / `p99` | gauge | 查询延迟分位(1 分钟窗口) |
+| `fe_query_error_count` | counter | 失败语句总数 |
+| `fe_query_error_code_count{code="..."}` | counter | 按错误码统计(如 1062 / 1213 / 1146) |
+| `fe_session_active_count` | gauge | 活跃会话数 |
+| `fe_slow_query_count` | counter | 慢查询记录数 |
+| `fe_txn_commit_count` | counter | 事务提交次数 |
+| `fe_txn_conflict_count` | counter | 写写冲突(1213) |
+| `fe_txn_unique_conflict_count` | counter | 唯一冲突(1062) |
+| `fe_txn_commit_avg_ms` | gauge | 事务平均提交耗时 |
+| `be_alive` | gauge | BE 是否在线(1/0) |
+| `be_memtable_bytes` / `be_memtable_entries` / `be_memtable_immutable_count` | gauge | memtable 字节 / 条目 / 不可变队列长度 |
+| `be_segment_count` / `be_segment_bytes` / `be_wal_bytes` | gauge | segment 数与字节、WAL 字节 |
+| `be_compaction_count` / `be_compaction_avg_ms` | counter / gauge | compaction 次数与平均耗时 |
+| `be_wal_fsync_count` / `be_wal_fsync_avg_ms` | counter / gauge | WAL fsync 次数与平均耗时 |
+| `be_group_commit_avg_batch` | gauge | group commit 平均批量 |
+| `be_put_count` / `be_get_count` / `be_scan_count` | counter | BE 读写量 |
+| `be_vector_segment_count` / `be_vector_node_count` / `be_vector_pending_segment_count` | gauge | 向量图段汇总 |
+| `be_vector_search_count` / `be_vector_avg_candidates` | counter / gauge | 向量检索次数与平均候选数 |
+| `be_vector_index_*{index="..."}` | gauge | 单索引的段数 / 节点数 / 待重建段数 / 状态 |
+| `fe_vector_search_count` / `fe_vector_avg_candidates` | counter / gauge | FE 侧向量检索计数 |
+
+BE 侧指标经**心跳**上报(proto `HeartbeatRequest` 只加字段,不改既有语义);
+`metrics_enabled = false` 时不采集不计时,`/metrics` 返回空文本、`SHOW METRICS` 返回空集。
+
+**③ 慢查询与诊断(C 组)**
+
+- 超过 `slow_query_threshold_ms`(默认 200)的语句落系统表 **10 `sys_slow_query`**
+  (id / 开始时间 / 耗时 / 扫描行 / 返回行 / 客户端 / 库 / 涉及表 / SQL 摘要 / 指纹 / 计划摘要 / 建议);
+  阈值设为 0 等价于关闭;表上限 `slow_query_max_rows`(默认 10000),超出按时间淘汰最旧;
+- SQL 摘要截断到 **4KB 并保留首尾**(中间 `...`);指纹 = 去字面量(`?`)、折叠空白后的规范化文本;
+- 诊断建议**纯规则 + 必须带证据**(不调用任何模型,同输入同输出):
+  ①计划摘要(`EXPLAIN` 的访问路径行)②无索引谓词列 ③候选索引 + 估算收益 ④统计是否过期;
+  证据是可直接核对的数字(计划行 / 统计行数 / 实际返回行数 / 现有索引清单);
+  拿不到证据时输出"证据不足",**已存在的索引与主键列不再建议**;
+- 查看:`SHOW SLOW QUERIES [LIMIT n]`、`SHOW SLOW QUERY <id>`;
+- 开销:阈值内的语句只多一次 `nanoTime()` 与一次比较,不落库、不生成计划;流式结果集的耗时
+  在 `RowStream` 关闭时结算(否则只统计到"构造计划"的时间,SC-450 会漏记)。
+
+**④ 备份与恢复(D 组)**
+
+```sql
+BACKUP TO '<目录>' [FORCE]                                  -- 全量在线备份
+BACKUP TO '<目录>' INCREMENTAL FROM '<上次备份>' [FORCE]     -- 增量
+RESTORE FROM '<备份目录>' [TO '<目标目录>'] [FORCE]          -- 恢复成可直接启动的数据目录
+SHOW BACKUP JOBS;                                          -- 任务 id / 时间 / 状态 / 已复制 / 总字节
+```
+
+- 一致性:先 **checkpoint**(封 memtable、刷完 immutable),再按当时的 MANIFEST **复制**
+  MANIFEST + 全部 segment + 图段 + WAL 尾部;**备份期间不锁写**(备份点之后的新写入不进本次备份);
+- `BACKUP_META` **最后写**(`.tmp` + fsync + rename):目录里有它才算完整备份;
+  中途失败 / 强杀 → 目录没有 `BACKUP_META`,`RESTORE` 直接拒绝;
+- 备份目录结构固定(可整体搬走):`BACKUP_META` + `manifest/CURRENT,MANIFEST-*` +
+  `sst/<seg>.seg,<seg>-<idx>.hnsw` + `wal/*.wal`;
+- `BACKUP_META` 是 JSON:库版本、`format_version`、时间、快照行数、父备份、文件清单 + 每个文件的
+  `bytes` / `sha256`;`RESTORE` 逐文件校验和,`format_version` 不匹配直接失败;
+- 增量:只复制父备份没有的 segment(segment 不可变,同名即同内容),其余记在 `inherited` 里;
+  恢复时沿 parent 链补齐文件,因此增量目录可以独立恢复,总字节远小于全量;
+- 恢复目标必须**不存在 / 空目录**,或显式 `FORCE`;恢复先写临时目录,成功后整体 rename,
+  中途失败不留半恢复目录;不允许恢复到 BE 正在使用的数据目录;
+- 备份在 BE 后台执行、恢复在 FE 后台线程执行,前台可继续查询;BE 重启后旧任务在 BE 侧消失,
+  `SHOW BACKUP JOBS` 会把仍标 `RUNNING` 的任务改判为 `CANCELLED`(状态始终可见);
+- 任务状态落系统表 **11 `sys_backup_jobs`**(id / 类型 / 目录 / 状态 / 时间 / 字节 / 增量 / 说明)。
+
+**⑤ Web 控制台(E 组)**
+
+- 技术栈:**Vue 3 + Element Plus + Vite**;源码在 `console/`,构建产物 `console/dist/` 入库,
+  由 FE 的内置 HTTP 服务直接托管(同一端口上 `/`、`/metrics`、`/api/*`);
+- 四块内容:左侧**库 → 表 → 列/索引**树(点表出 `SHOW CREATE TABLE` 的 DDL)、
+  上方 **SQL 输入**(多语句、`Ctrl+Enter` 执行、`Ctrl+Shift+Enter` 计划)、
+  右下**结果表格**(分页 100 行/页、列排序、NULL 显示为 `NULL`、一键复制 CSV、超 1 万行提示加 `LIMIT`)、
+  右**自身状态**(BE 存活 / memtable / segment 数与字节 / QPS / P50/P95/P99 / 慢查询 Top10 / 向量索引);
+- 登录沿用 MySQL 账号(`user` / `password`),token 是 FE 内存态(24 字节随机串,8 小时空闲过期),
+  请求头 `X-Console-Token` 或 `Authorization: Bearer`;登录失败限速(30 秒内 5 次 → 429);
+- **写操作(DML/DDL/BACKUP/RESTORE)必须前端二次确认**:服务端对未带 `confirm=true` 的写请求回
+  `409 + confirm_required`,确认后执行并写审计(`tmp/console-audit.log`);
+- 错误展示错误码 + 文案 + 会话 id(便于对齐服务端日志);控制台会话登记在独立会话表(上限 8),
+  不占用 MySQL 连接额度,两条通道的指标独立计数;
+- 所有请求走同一个 `SqlEngine`(FR-861),不新增第二个 SQL 入口。
+
+```bash
+cd console && npm install && npm run build      # 产物 console/dist(已在仓库里)
+curl -s http://127.0.0.1:8080/metrics | head    # 指标
+curl -s http://127.0.0.1:8080/ | head           # 控制台页面
+```
+
+**⑥ 新增配置(`config/fe.conf`,非法值启动失败并指出行号)**
+
+| 配置 | 默认 | 说明 |
+|---|---|---|
+| `mysql_max_connections` | `128` | 协议连接上限(超限回 1040) |
+| `mysql_wait_timeout` | `0` | 协议空闲超时(秒,0 = 不断开) |
+| `mysql_ssl` | `false` | 置 `true` 启动失败并说明未实现 TLS |
+| `console_enabled` / `console_port` | `true` / `8080` | 控制台 HTTP 服务 |
+| `metrics_enabled` | `true` | 指标采集总开关 |
+| `slow_query_log` / `slow_query_threshold_ms` | `true` / `200` | 慢查询开关与阈值(0 = 关闭) |
+| `slow_query_max_rows` | `10000` | 慢查询表上限(超出淘汰最旧) |
+| `backup_dir` | 空 | 默认备份根目录(脚本/控制台可以显式给目录) |
+
+**⑦ 一键验收与实测口径**
+
+```bash
+bash scripts/tests/p8-test.sh                       # SC-446 ~ SC-465(完整跑约 6 分钟)
+P8_ROWS=100000 P8_JMETER_SECONDS=60 bash scripts/tests/p8-test.sh
+P8_REGRESSION=1 bash scripts/tests/p8-test.sh       # 追加跑 p3/p4/p5/p6/p6.1/p7 回归
+```
+
+端口固定 **BE 9960 / MySQL 9966 / 心跳 9971 / 控制台 8080**(被占用时脚本自动改 18080 并记录),
+数据目录 `tmp/p8-test/data`,脚本只杀自己起的 `tmp/p8-test/be.exe` 与带该目录配置的 `fed`。
+压测计划在 `scripts/tests/jmeter/p8-load.jmx`(8 线程、读/写各半,JDBC 走 mysql-connector-j)。
+
+本机实测(Windows 11 / 16 核 / Go 1.27 / Java 17,数据 10 万 + 10 万行):
+
+| 项 | 门限 | 实测 | 结论 |
+|---|---|---|---|
+| 图形客户端探测清单(41 条) | 全 `CODE=0` | 41/41 | 达标 |
+| `/metrics` 与 `SHOW METRICS` | 数值一致 | `be_memtable_bytes` / `be_segment_count` / `be_segment_bytes` / `be_alive` 逐一相同 | 达标 |
+| QPS 与 JMeter 偏差 | ≤10% | **0.11%**(JMeter 552.65 / FE 553.75) | 达标 |
+| JMeter 8 线程 60s | 错误率 ≤0.1% | QPS 552.65 / P50 13ms / P95 24ms / P99 32ms / 错误率 **0.006%** | 达标 |
+| 慢查询耗时误差 | ≤20% | 实测 534ms / 记录 497ms(6.9%) | 达标 |
+| 诊断建议 | 无索引列 + 候选索引 + 计划证据 | 三者齐全;建索引后改为"已有索引 … 不再建议" | 达标 |
+| ★ 备份中强杀 | 原库完整 / 无 `BACKUP_META` / `RESTORE` 拒绝 | 满足 | 达标 |
+| ★ 备份期间写入 | 成功率 100%,恢复 = 备份点 | 153 次写入 0 失败;恢复后 `COUNT(*)`/`SUM(amount)` = 备份点 | 达标 |
+| 备份 → 删数据目录 → 恢复 | 行数与 checksum 一致 | 一致 | 达标 |
+| 增量备份 | 可恢复;字节 < 全量 | 全量 63,505,250B / 增量 10,824B | 达标 |
+| 控制台 API 冒烟 | 5 个接口 200 + 结构正确 | 全部 200 | 达标 |
+| 控制台状态一致 | 与 `SHOW METRICS` 一致 | memtable / segment 逐值相同 | 达标 |
+| 写确认 | 未确认拒绝、确认生效并审计 | 409 + `confirm_required`;确认后生效,审计有两条 | 达标 |
+| 协议错误不断连 | 1295 后仍可查询 | 满足 | 达标 |
+| 指标开销 | 关闭后 QPS 差异 ≤5% | 4.60%(3 轮交替各 10s 最好值) | 达标 |
+| 备份不阻塞 | 写入 P99 ≤1.5× | 1.31×(42ms / 32ms) | 达标 |
+| 依赖红线 | 无 Web/监控框架 | FE 无 Spring/Javalin/Vert.x/Prometheus;前端仅 vue / element-plus / vite | 达标 |
+
+**⑧ 本期明确没做 / 口径说明(如实记录)**
+
+- **TLS 不做**:`mysql_ssl=true` 启动即失败(`K197`)。官方 `mysql` 客户端容器连通(SC-446)在
+  本机 **Docker 守护进程未运行**时无法执行,脚本写 `[NOTE]` 而不是通过;协议路径本身由
+  SC-447 / SC-459 用自研协议客户端覆盖。
+- **二进制预处理协议不做**:`COM_STMT_*` 只回明确错误;
+- **慢查询的 AI 诊断不做**:建议是确定性规则,模型不参与正确性判断;
+- **备份不阻塞写** 的实现口径是"checkpoint + 复制不可变文件":checkpoint 期间会短暂阻塞刷盘,
+  复制阶段完全不阻塞;`SC-462` 用写入 P99 对比给出实测比值;
+- **增量备份** 依赖父备份目录仍在(恢复时沿 parent 链补文件);父目录被删时**备份**退化为全量
+  并在任务消息里说明,但**恢复**会明确失败(不会静默给出残缺数据);
+- **`RESTORE` 不覆盖正在运行的数据目录**:目标必须是另一个空目录,恢复后用该目录启动 BE
+  (在线原地恢复不在本期);
+- **控制台**只做单账号、基础 SQL 编辑;补全/格式化、多用户/RBAC 归 P13;
+- **`p8-test.sh` 里的既有回归**(SC-464)默认不跑(所有者要求"先测通 P8 自身功能");
+  要跑加 `P8_REGRESSION=1`。
+
 ## 状态
 
 **P1(基座)、P2(表与 SQL)、P2.1(SQL 兼容性补齐)、P3(事务与 MVCC)、P3.5(常驻 FE + 多库 + MySQL 协议)、
 P4(索引)、P5(分析引擎)、P6(优化器)、P6.1(执行层性能)、P7(AI 能力:向量类型 / 分段 HNSW / 混合查询 / 推理下推)、
-P7.1(向量检索时延与并发退化:分段打点 / 常驻缓存 / 候选批量回表 / 段级并行 / 路径 A 允许集下推)均已实现。**
+P7.1(向量检索时延与并发退化)、P8(生产化:协议收口 / 监控 / 慢查询诊断 / 备份恢复 / Web 控制台)均已实现。**
 
 P4 带来什么:
 

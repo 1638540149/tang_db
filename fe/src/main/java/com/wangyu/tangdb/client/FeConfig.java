@@ -104,6 +104,46 @@ public final class FeConfig {
     private com.wangyu.tangdb.query.P7Options p7 = com.wangyu.tangdb.query.P7Options.defaults();
     private com.wangyu.tangdb.ai.AiService.Config ai = com.wangyu.tangdb.ai.AiService.Config.disabled();
 
+    // ---- SPEC-P8 §5.3(协议 / 监控 / 慢查询 / 备份 / 控制台) ----
+    private P8 p8 = P8.defaults();
+
+    /** SPEC-P8 §5.3 的十项配置。 */
+    public record P8(int mysqlMaxConnections, int mysqlWaitTimeout, boolean mysqlSsl,
+                     boolean consoleEnabled, int consolePort,
+                     boolean metricsEnabled,
+                     boolean slowQueryLog, int slowQueryThresholdMs, int slowQueryMaxRows,
+                     String backupDir) {
+
+        public static P8 defaults() {
+            return new P8(128, 0, false, true, 8080, true, true, 200, 10_000, "");
+        }
+    }
+
+    /** 分配 SPEC-P8 配置(只由 {@link #parse(String)} 与 {@link #withP8(P8)} 调用)。 */
+    void applyP8(P8 settings) {
+        if (settings != null) {
+            this.p8 = settings;
+        }
+    }
+
+    /** SPEC-P8 §5.3:协议 / 监控 / 慢查询 / 备份 / 控制台配置。 */
+    public P8 p8() {
+        return p8;
+    }
+
+    /** 程序化覆盖 P8 配置(测试与开关对拍用)。 */
+    public FeConfig withP8(P8 settings) {
+        FeConfig copy = new FeConfig(beHost, bePort, heartbeatListenPort, beOfflineCycles,
+                heartbeatEnabled, mode, mysqlPort, sessionMax, sessionIdleTimeout,
+                shutdownGraceSeconds, user, password, indexBackfillBatch, queryBatchRows,
+                sortSpillBytes, sortTmpDir, csvImportBatchRows, optimizer,
+                queryParallelism, pushdownEnabled, scanBatchRows, rpcDeadlineSeconds,
+                rpcBulkDeadlineSeconds, rpcScanDeadlineSeconds);
+        copy.applyP7(p7, ai);
+        copy.applyP8(settings == null ? p8 : settings);
+        return copy;
+    }
+
     /** 分配 SPEC-P7 的向量/推理参数(只由 {@link #parse(String)} 调用)。 */
     void applyP7(com.wangyu.tangdb.query.P7Options options,
                  com.wangyu.tangdb.ai.AiService.Config aiConfig) {
@@ -415,6 +455,15 @@ public final class FeConfig {
         int aiCacheEntries = d.ai.cacheEntries();
         int aiMaxRetries = d.ai.maxRetries();
         int aiBreakerBatches = d.ai.breakerBatches();
+        int mysqlMaxConnections = d.p8.mysqlMaxConnections();
+        int mysqlWaitTimeout = d.p8.mysqlWaitTimeout();
+        boolean consoleEnabled = d.p8.consoleEnabled();
+        int consolePort = d.p8.consolePort();
+        boolean metricsEnabled = d.p8.metricsEnabled();
+        boolean slowQueryLog = d.p8.slowQueryLog();
+        int slowQueryThresholdMs = d.p8.slowQueryThresholdMs();
+        int slowQueryMaxRows = d.p8.slowQueryMaxRows();
+        String backupDir = d.p8.backupDir();
 
         for (int i = 0; i < lines.size(); i++) {
             String line = lines.get(i);
@@ -526,6 +575,29 @@ public final class FeConfig {
                 case "ai_max_retries" -> aiMaxRetries = parseInt(key, value, path, i + 1, 0, 10);
                 case "ai_breaker_batches" ->
                         aiBreakerBatches = parseInt(key, value, path, i + 1, 1, 1000);
+                // ---- SPEC-P8 §5.3 ----
+                case "mysql_max_connections" ->
+                        mysqlMaxConnections = parseInt(key, value, path, i + 1, 1, 1_000_000);
+                case "mysql_wait_timeout" ->
+                        mysqlWaitTimeout = parseInt(key, value, path, i + 1, 0, 1_000_000);
+                case "mysql_ssl" -> {
+                    boolean ssl = parseBoolean(key, value, path, i + 1);
+                    if (ssl) {
+                        // 边界 169 / K197:不静默降级,启动即失败并说明未实现。
+                        throw new IllegalArgumentException(path + " 第 " + (i + 1)
+                                + " 行 mysql_ssl = true:本期未实现 TLS(边界 169 / K197),"
+                                + "请改为 false 或删除该项");
+                    }
+                }
+                case "console_enabled" -> consoleEnabled = parseBoolean(key, value, path, i + 1);
+                case "console_port" -> consolePort = parseInt(key, value, path, i + 1, 1, 65535);
+                case "metrics_enabled" -> metricsEnabled = parseBoolean(key, value, path, i + 1);
+                case "slow_query_log" -> slowQueryLog = parseBoolean(key, value, path, i + 1);
+                case "slow_query_threshold_ms" ->
+                        slowQueryThresholdMs = parseInt(key, value, path, i + 1, 0, 3_600_000);
+                case "slow_query_max_rows" ->
+                        slowQueryMaxRows = parseInt(key, value, path, i + 1, 1, 10_000_000);
+                case "backup_dir" -> backupDir = value;
                 default -> throw new IllegalArgumentException(
                         path + " 第 " + (i + 1) + " 行未知配置项: " + key);
             }
@@ -546,6 +618,9 @@ public final class FeConfig {
                         com.wangyu.tangdb.query.P7Options.PATH_AUTO, false, false),
                 new com.wangyu.tangdb.ai.AiService.Config(aiEndpoint, aiModel, aiDim, aiTimeoutMs,
                         aiBatchRows, aiCacheEntries, aiMaxRetries, aiBreakerBatches));
+        config.applyP8(new P8(mysqlMaxConnections, mysqlWaitTimeout, false,
+                consoleEnabled, consolePort, metricsEnabled, slowQueryLog, slowQueryThresholdMs,
+                slowQueryMaxRows, backupDir));
         return config;
     }
 

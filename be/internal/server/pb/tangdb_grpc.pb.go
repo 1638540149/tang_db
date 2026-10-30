@@ -48,6 +48,9 @@ const (
 	TangDb_SearchVectorIndex_FullMethodName   = "/tangdb.v1.TangDb/SearchVectorIndex"
 	TangDb_VectorIndexStatus_FullMethodName   = "/tangdb.v1.TangDb/VectorIndexStatus"
 	TangDb_BatchGet_FullMethodName            = "/tangdb.v1.TangDb/BatchGet"
+	TangDb_Backup_FullMethodName              = "/tangdb.v1.TangDb/Backup"
+	TangDb_BackupJob_FullMethodName           = "/tangdb.v1.TangDb/BackupJob"
+	TangDb_Restore_FullMethodName             = "/tangdb.v1.TangDb/Restore"
 )
 
 // TangDbClient is the client API for TangDb service.
@@ -75,6 +78,10 @@ type TangDbClient interface {
 	VectorIndexStatus(ctx context.Context, in *VectorIndexStatusRequest, opts ...grpc.CallOption) (*VectorIndexStatusResponse, error)
 	// ANN 候选回表:一次取多行,避免逐候选一次 RPC(向量检索时延的关键)
 	BatchGet(ctx context.Context, in *BatchGetRequest, opts ...grpc.CallOption) (*BatchGetResponse, error)
+	// ---- SPEC-P8 D 组:在线备份 / 恢复(FR-841 ~ FR-850)----
+	Backup(ctx context.Context, in *BackupRequest, opts ...grpc.CallOption) (*BackupResponse, error)
+	BackupJob(ctx context.Context, in *BackupJobRequest, opts ...grpc.CallOption) (*BackupJobResponse, error)
+	Restore(ctx context.Context, in *RestoreRequest, opts ...grpc.CallOption) (*RestoreResponse, error)
 }
 
 type tangDbClient struct {
@@ -214,6 +221,36 @@ func (c *tangDbClient) BatchGet(ctx context.Context, in *BatchGetRequest, opts .
 	return out, nil
 }
 
+func (c *tangDbClient) Backup(ctx context.Context, in *BackupRequest, opts ...grpc.CallOption) (*BackupResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(BackupResponse)
+	err := c.cc.Invoke(ctx, TangDb_Backup_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *tangDbClient) BackupJob(ctx context.Context, in *BackupJobRequest, opts ...grpc.CallOption) (*BackupJobResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(BackupJobResponse)
+	err := c.cc.Invoke(ctx, TangDb_BackupJob_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *tangDbClient) Restore(ctx context.Context, in *RestoreRequest, opts ...grpc.CallOption) (*RestoreResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RestoreResponse)
+	err := c.cc.Invoke(ctx, TangDb_Restore_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // TangDbServer is the server API for TangDb service.
 // All implementations must embed UnimplementedTangDbServer
 // for forward compatibility.
@@ -239,6 +276,10 @@ type TangDbServer interface {
 	VectorIndexStatus(context.Context, *VectorIndexStatusRequest) (*VectorIndexStatusResponse, error)
 	// ANN 候选回表:一次取多行,避免逐候选一次 RPC(向量检索时延的关键)
 	BatchGet(context.Context, *BatchGetRequest) (*BatchGetResponse, error)
+	// ---- SPEC-P8 D 组:在线备份 / 恢复(FR-841 ~ FR-850)----
+	Backup(context.Context, *BackupRequest) (*BackupResponse, error)
+	BackupJob(context.Context, *BackupJobRequest) (*BackupJobResponse, error)
+	Restore(context.Context, *RestoreRequest) (*RestoreResponse, error)
 	mustEmbedUnimplementedTangDbServer()
 }
 
@@ -284,6 +325,15 @@ func (UnimplementedTangDbServer) VectorIndexStatus(context.Context, *VectorIndex
 }
 func (UnimplementedTangDbServer) BatchGet(context.Context, *BatchGetRequest) (*BatchGetResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method BatchGet not implemented")
+}
+func (UnimplementedTangDbServer) Backup(context.Context, *BackupRequest) (*BackupResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Backup not implemented")
+}
+func (UnimplementedTangDbServer) BackupJob(context.Context, *BackupJobRequest) (*BackupJobResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method BackupJob not implemented")
+}
+func (UnimplementedTangDbServer) Restore(context.Context, *RestoreRequest) (*RestoreResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Restore not implemented")
 }
 func (UnimplementedTangDbServer) mustEmbedUnimplementedTangDbServer() {}
 func (UnimplementedTangDbServer) testEmbeddedByValue()                {}
@@ -515,6 +565,60 @@ func _TangDb_BatchGet_Handler(srv interface{}, ctx context.Context, dec func(int
 	return interceptor(ctx, in, info, handler)
 }
 
+func _TangDb_Backup_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(BackupRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TangDbServer).Backup(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: TangDb_Backup_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TangDbServer).Backup(ctx, req.(*BackupRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _TangDb_BackupJob_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(BackupJobRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TangDbServer).BackupJob(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: TangDb_BackupJob_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TangDbServer).BackupJob(ctx, req.(*BackupJobRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _TangDb_Restore_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RestoreRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TangDbServer).Restore(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: TangDb_Restore_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TangDbServer).Restore(ctx, req.(*RestoreRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // TangDb_ServiceDesc is the grpc.ServiceDesc for TangDb service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -565,6 +669,18 @@ var TangDb_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "BatchGet",
 			Handler:    _TangDb_BatchGet_Handler,
+		},
+		{
+			MethodName: "Backup",
+			Handler:    _TangDb_Backup_Handler,
+		},
+		{
+			MethodName: "BackupJob",
+			Handler:    _TangDb_BackupJob_Handler,
+		},
+		{
+			MethodName: "Restore",
+			Handler:    _TangDb_Restore_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

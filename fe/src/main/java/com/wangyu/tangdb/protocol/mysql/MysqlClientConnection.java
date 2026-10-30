@@ -208,6 +208,31 @@ public final class MysqlClientConnection implements AutoCloseable {
         }
     }
 
+    /**
+     * SPEC-P8:发送任意命令的原始载荷(协议探测用:COM_STMT_* / COM_FIELD_LIST 等),
+     * 返回服务端首包原文,由调用方自行解释。
+     */
+    public byte[] rawCommand(int command, byte[] args) throws IOException {
+        writeCommand(command, args);
+        return io.readPacket();
+    }
+
+    /** 只发包不读回(配合 {@link #readRawPacket()} 读多包响应,如 COM_FIELD_LIST)。 */
+    public void writeCommand(int command, byte[] args) throws IOException {
+        ByteArrayOutputStream out = new ByteArrayOutputStream(8);
+        out.write(command);
+        if (args != null) {
+            out.writeBytes(args);
+        }
+        io.setWriteSeq(0);
+        io.writePacket(out.toByteArray());
+    }
+
+    /** 读一个原始协议包(COM_FIELD_LIST 的多包响应等)。 */
+    public byte[] readRawPacket() throws IOException {
+        return io.readPacket();
+    }
+
     /** COM_PING:探活。 */
     public void ping() throws IOException {
         ByteArrayOutputStream out = new ByteArrayOutputStream(2);

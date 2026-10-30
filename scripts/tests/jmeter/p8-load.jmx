@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  SPEC-P8 FR-864 / SC-460:8 线程混合负载压测计划(JMeter 5.6.3)。
+
+  用法(脚本里已经封装好):
+    jmeter -n -t p8-load.jmx \
+      -Juser.classpath=<mysql-connector-j.jar> \
+      -Jhost=127.0.0.1 -Jport=9966 -Jdb=default -Juser=root -Jpassword=p8test \
+      -Jthreads=8 -Jduration=60 -l result.jtl
+
+  负载:每个迭代 1 条点查 SELECT + 1 条 UPDATE(读/写各半),全程不建新行,
+  因此可以反复跑而不改变表规模。
+-->
+<jmeterTestPlan version="1.2" properties="5.0" jmeter="5.6.3">
+  <hashTree>
+    <TestPlan guiclass="TestPlanGui" testclass="TestPlan" testname="tang_db P8 mixed load" enabled="true">
+      <stringProp name="TestPlan.comments">SPEC-P8 FR-864:8 线程 60 秒混合负载,输出 QPS / P95 / P99 / 错误率</stringProp>
+      <boolProp name="TestPlan.functional_mode">false</boolProp>
+      <boolProp name="TestPlan.serialize_threadgroups">false</boolProp>
+      <elementProp name="TestPlan.user_defined_variables" elementType="Arguments" guiclass="ArgumentsPanel" testclass="Arguments" testname="User Defined Variables" enabled="true">
+        <collectionProp name="Arguments.arguments"/>
+      </elementProp>
+      <stringProp name="TestPlan.user_define_classpath"></stringProp>
+    </TestPlan>
+    <hashTree>
+      <JDBCDataSource guiclass="TestBeanGUI" testclass="JDBCDataSource" testname="tang_db JDBC pool" enabled="true">
+        <boolProp name="autocommit">true</boolProp>
+        <stringProp name="checkQuery">SELECT 1</stringProp>
+        <stringProp name="connectionAge">5000</stringProp>
+        <stringProp name="dataSource">tangPool</stringProp>
+        <stringProp name="dbUrl">jdbc:mysql://${__P(host,127.0.0.1)}:${__P(port,9966)}/${__P(db,default)}?useSSL=false&amp;allowPublicKeyRetrieval=true&amp;useServerPrepStmts=false&amp;characterEncoding=utf8&amp;serverTimezone=Asia/Shanghai&amp;connectTimeout=5000&amp;socketTimeout=60000</stringProp>
+        <stringProp name="driver">com.mysql.cj.jdbc.Driver</stringProp>
+        <boolProp name="keepAlive">true</boolProp>
+        <stringProp name="password">${__P(password,tangdb)}</stringProp>
+        <stringProp name="poolMax">0</stringProp>
+        <stringProp name="timeout">10000</stringProp>
+        <stringProp name="transactionIsolation">DEFAULT</stringProp>
+        <stringProp name="trimInterval">60000</stringProp>
+        <stringProp name="username">${__P(user,root)}</stringProp>
+        <boolProp name="preinit">true</boolProp>
+        <stringProp name="initQuery"></stringProp>
+        <stringProp name="connectionProperties"></stringProp>
+      </JDBCDataSource>
+      <hashTree/>
+      <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup" testname="Concurrent JDBC users" enabled="true">
+        <stringProp name="ThreadGroup.on_sample_error">continue</stringProp>
+        <elementProp name="ThreadGroup.main_controller" elementType="LoopController" guiclass="LoopControlPanel" testclass="LoopController" testname="Run until duration expires" enabled="true">
+          <boolProp name="LoopController.continue_forever">true</boolProp>
+          <stringProp name="LoopController.loops">-1</stringProp>
+        </elementProp>
+        <stringProp name="ThreadGroup.num_threads">${__P(threads,8)}</stringProp>
+        <stringProp name="ThreadGroup.ramp_time">${__P(ramp,2)}</stringProp>
+        <boolProp name="ThreadGroup.scheduler">true</boolProp>
+        <stringProp name="ThreadGroup.duration">${__P(duration,60)}</stringProp>
+        <stringProp name="ThreadGroup.delay">0</stringProp>
+        <stringProp name="ThreadGroup.same_user_on_next_iteration">true</stringProp>
+      </ThreadGroup>
+      <hashTree>
+        <JDBCSampler guiclass="TestBeanGUI" testclass="JDBCSampler" testname="p8 select point" enabled="true">
+          <stringProp name="dataSource">tangPool</stringProp>
+          <stringProp name="query">SELECT id, city, amount FROM p8_load WHERE id = ${__Random(1,${__P(rows,50000)},)}</stringProp>
+          <stringProp name="queryType">Select Statement</stringProp>
+          <stringProp name="queryTimeout">10</stringProp>
+          <stringProp name="resultSetHandler">Store as String</stringProp>
+          <stringProp name="resultSetMaxRows"></stringProp>
+          <stringProp name="queryArguments"></stringProp>
+          <stringProp name="queryArgumentsTypes"></stringProp>
+          <stringProp name="variableNames"></stringProp>
+          <stringProp name="resultVariable"></stringProp>
+        </JDBCSampler>
+        <hashTree/>
+        <JDBCSampler guiclass="TestBeanGUI" testclass="JDBCSampler" testname="p8 update point" enabled="true">
+          <stringProp name="dataSource">tangPool</stringProp>
+          <stringProp name="query">UPDATE p8_load SET amount = 7 WHERE id = ${__Random(1,${__P(rows,50000)},)}</stringProp>
+          <stringProp name="queryType">Update Statement</stringProp>
+          <stringProp name="queryTimeout">10</stringProp>
+          <stringProp name="resultSetHandler">Store as String</stringProp>
+          <stringProp name="resultSetMaxRows"></stringProp>
+          <stringProp name="queryArguments"></stringProp>
+          <stringProp name="queryArgumentsTypes"></stringProp>
+          <stringProp name="variableNames"></stringProp>
+          <stringProp name="resultVariable"></stringProp>
+        </JDBCSampler>
+        <hashTree/>
+      </hashTree>
+    </hashTree>
+  </hashTree>
+</jmeterTestPlan>
