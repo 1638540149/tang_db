@@ -16,7 +16,7 @@
 | SPEC-P7 | P7 | AI 能力:`VECTOR(n)` 类型 + 分段 HNSW 图段(随 LSM 演进)+ 向量/混合检索与选路 + `ai_embed` 推理下推;认领 P6.1 三条挂账(`SHOW INDEX` 双 FROM、扫描层并行阈值、流式/解码复用取证) | **Approved** | 0.1a | 2026-10-29 |
 | SPEC-P7.1 | P7.1(补丁) | **向量检索时延与并发退化**:固定开销剖析与消除 + 候选批量回表 + 并发临界区收敛 + 路径 A 走图内允许集;**不动磁盘格式与语义,门限不改** | **Approved** | 0.1a | 2026-10-29 |
 | SPEC-P8 | P8 | 生产化:协议收口 + 监控指标(`/metrics`/`SHOW METRICS`)+ 慢查询与诊断建议 + 备份恢复 + **Web 控制台(Vue 3 + Element Plus,Vite;后端 JDK 内置 HttpServer)** | **Approved** | 0.1a | 2026-10-30 |
-| SPEC-P10 | P10 | 全文检索:**自研倒排索引**(词典/postings/跳表/压缩,随 segment 落盘、随 compaction 重建、崩溃不重建)+ BM25 打分 + `MATCH` 谓词 + 关键词/向量/结构化**三路融合**(RRF);执行顺序 P8 → P10 → P9 | Draft | 0.1 | 2026-10-30 |
+| SPEC-P10 | P10 | 全文检索:**自研倒排索引**(词典/postings/跳表/压缩,随 segment 落盘、随 compaction 重建、崩溃不重建)+ BM25 打分 + `MATCH` 谓词 + 关键词/向量/结构化**三路融合**(RRF);执行顺序 P8 → P10 → P9 | **Approved** | 0.1a | 2026-10-30 |
 
 ## 状态说明
 
